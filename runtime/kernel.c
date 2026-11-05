@@ -38,7 +38,7 @@
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400            // "current thread object" at TLR+0x1F8 (d2r-mobile thread.c)
 #define TLS_SIZE 0x2000
-#define MAIN_STACK 0x100000ull           // main.npdm META+0x1C (OOT 1.0.0 and 1.1.0)
+#define MAIN_STACK 0x100000ull           // main.npdm META+0x1C (OoT 1.1.1, as MP4)
 #define MAIN_PRIO 44                     // META+0xE
 #define MAIN_CORE 0                      // META+0xF
 #define FIBER_MAX 1024

@@ -10,7 +10,8 @@ Extraction writes the package's ExeFS to build/extracted/v<version>/exefs and it
 which tools/romfs_index.py indexes like an extracted Switch 1 RomFS. --romfs-loose writes loose files to romfs_files/
 instead. nup.json beside them records the package (title id, version, kind, title name, display version) and every
 loose file's path, size and SHA-256. The NPDM from the package's metadata goes to exefs/main.npdm when the
-ExeFS tree lacks one. The default package is the highest-versioned update, else the base.
+ExeFS tree lacks one, and extraction-manifest.json beside the trees carries each ExeFS file's SHA-256 for
+tools/build_game.py. The default package is the highest-versioned update, else the base.
 
 Switch 2 modules whose segments are ZBIC (NSO flag bit 7) are rewritten as plain NSOs, which recomp/nso.py reads, by
 toolchain/zbic/nso_unzbic (tools/build_zbic.py); the module as stored goes to exefs-zbic/, and each rewritten
@@ -251,6 +252,24 @@ def unzbic_exefs(exefs):
         print(f'exefs/{path.name}: ZBIC decompressed, segment hashes verified (stored module in exefs-zbic/)')
 
 
+def write_exefs_manifest(out, pkg, src):
+    """build/extracted/<version>/extraction-manifest.json as tools/extract_exefs.py writes it and tools/build_game.py
+    reads it: the SHA-256 of every ExeFS file as it lies on disk (the plain NSO for a ZBIC module, which the runtime
+    verifies at start), with the package's identity."""
+    files = []
+    for path in sorted((out / 'exefs').iterdir()):
+        if path.is_file():
+            files.append({'name': path.name, 'size': path.stat().st_size,
+                          'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    manifest = {'source': str(Path(src).resolve()), 'source_size': os.path.getsize(src), 'container': 'nup',
+                'title_id': pkg['title_id'], 'version': pkg['version'], 'kind': pkg['kind'],
+                'display_version': pkg['meta'].get('display_version'),
+                'integrity': 'NUP TOC SHA-256 and every file\'s SHA-256 verified; ZBIC modules rewritten as plain '
+                             'NSOs and their segment hashes verified',
+                'files': files}
+    (out / 'extraction-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+
+
 def load_config(path):
     with open(path, 'rb') as f:
         return tomllib.load(f)
@@ -344,6 +363,7 @@ def main():
                 (out / 'exefs' / 'main.npdm').write_bytes(npdm)
                 print('exefs/main.npdm written from the package metadata')
             unzbic_exefs(out / 'exefs')
+            write_exefs_manifest(out, pkg, src)
         # A partial run keeps the other tree's entries of an earlier manifest.
         old = out / 'nup.json'
         if (args.exefs_only or args.romfs_only) and old.is_file():

@@ -15,7 +15,7 @@ recompiled only when it, a header it includes or its flags change.
 
 Every runtime/*.c is compiled. build/<version>/modules.c carries the layout, the linked function tables, the
 expected SHA-256 of each ExeFS file (from build/extracted/<version>/extraction-manifest.json, written by
-tools/extract_exefs.py, unless --expected names a file) and the default game paths
+tools/extract_nup.py, unless --expected names a file) and the default game paths
 (--exefs, --romfs, --profile), which oot.exe uses unless its own command line names others. tools/romfs_index.py
 writes build/<version>/romfs-index.bin and romfs_config.h from the RomFS directory's index.json (runtime/romfs.c reads
 the index next to oot.exe).
@@ -103,7 +103,7 @@ TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # Display version of each build version name (the update's version number, as extract_exefs.py names the folder).
 DEFAULT_VERSION = 'v131072'
-DISPLAY_VERSIONS = {'v0': '1.0.0', 'v131072': '1.1.0'}
+DISPLAY_VERSIONS = {'v131072': '1.1.1'}
 
 GiB = 1 << 30
 # Peak commit of one compile, TotK 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -634,7 +634,7 @@ def main():
     else:
         expected = extracted / 'extraction-manifest.json'
         if not expected.is_file():
-            sys.exit(f'{expected} not found: run tools/extract_exefs.py for {args.version}, or pass --expected')
+            sys.exit(f'{expected} not found: run tools/extract_nup.py for {args.version}, or pass --expected')
         hashes = {f['name']: f['sha256'] for f in json.loads(expected.read_text())['files']}
     global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:

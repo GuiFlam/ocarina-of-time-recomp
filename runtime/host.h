@@ -186,7 +186,7 @@ typedef struct { const char *file, *sha256; } RtFileHash;
 extern const RtFileHash rt_exefs_sha256[];                 // tools/data/expected-<version>.json "exefs_sha256"
 extern const int rt_exefs_sha256_count;
 extern const char rt_default_exefs[], rt_default_romfs[], rt_default_profile[];
-extern const int rt_game_version;                          // the game build: 100 (1.0.0) or 110 (1.1.0), build_game.py
+extern const int rt_game_version;                          // the game build: 111 (1.1.1), build_game.py
 extern const char rt_port_version[];                       // VERSION at the build's root: 0.1.0, 0.1.0+973c626 in a release
 // TotK's switch between its 1.2.1 SDK and 1.4.3's SDK 20.5; this game's SDK 19.3 is of the newer generation, so the
 // 1.4.3 paths apply to every version of it (the swkbd argument sizes, the IPC probe's SDK set-up).

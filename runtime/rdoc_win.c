@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/rdoc_win.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/rdoc_win.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the capture path template gets its backslash (MP4 wrote "\mp4", an unknown escape).
 // From fe3h-pc-recomp runtime/rdoc_win.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only.
 // From totk-pc-recomp runtime/rdoc_win.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // RenderDoc in-app capture (debug tool). OOT_RDOC=<frame>[,<frame>...] captures those presented frames; OOT_RDOC_DIR is the
@@ -66,7 +66,7 @@ void rdoc_init(void) {
     char full[MAX_PATH], tmpl[MAX_PATH + 16];
     if (!_fullpath(full, dir && *dir ? dir : "build/captures", sizeof full)) return;
     CreateDirectoryA(full, NULL);
-    snprintf(tmpl, sizeof tmpl, "%s\oot", full);
+    snprintf(tmpl, sizeof tmpl, "%s\\oot", full);
     api->SetCaptureFilePathTemplate(tmpl);
     rt_log("rdoc: ready, %d frame(s), captures %s", n_targets, full);
 }

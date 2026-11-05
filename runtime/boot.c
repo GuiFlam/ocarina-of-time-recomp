@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/boot.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/boot.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; OoT's init_array sizes and first nvnBootstrapLoader return address.
 // From fe3h-pc-recomp runtime/boot.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; MP4 module list, init_array sizes, main stack, per-version boot checkpoint; nn::init::Start takes three callbacks again, as in TotK's SDK; shots are turned over for the lower-left window origin.
 // From totk-pc-recomp runtime/boot.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), renamed to fe3h; FE3H module list, init_array sizes, main stack, per-version boot checkpoint, and SDK 6.5.0's two-callback nn::init::Start.
 // Adapted from MacNativeGames games/totk/runtime/loader.c (lines 456-477) and services.c (lines 219-235) @ b75be8cf
@@ -24,20 +24,21 @@
 #include "nvn_api.h"
 #include "vk.h"
 
-// nn::init::Start(main thread handle, arguments region, loader_ready, module_inits, module_finis): SDK 19.3 exports
-// the three-callback form TotK's SDK has (FE3H's 6.5.0 had two).
+// nn::init::Start(main thread handle, arguments region, loader_ready, module_inits, module_finis): SDK 22.2.8 exports
+// the three-callback form TotK's and MP4's SDKs have (FE3H's 6.5.0 had two).
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
 // main: return address of the first nvnBootstrapLoader call per game version (rt_game_version, build_game.py), the
-// first of the two bl to its PLT stub (found by their GOT slot in Phase 0); nvn_ret() picks the running version's.
+// first of the three bl to its PLT stub in OoT 1.1.1 (main+0x346bf88, +0x346bf98, +0x346bfb4, found by the stub's GOT
+// slot in Phase 0); nvn_ret() picks the running version's.
 // The SetFocusHandlingMode checkpoint keeps TotK 1.2.1's address; this game never reaches it.
 #define CHECKPOINT_RET 0xe7a954ull
-static const struct { int version; uint64_t ret; } nvn_rets[] = {{100, 0xa2f384ull}, {110, 0xa20f54ull}};
+static const struct { int version; uint64_t ret; } nvn_rets[] = {{111, 0x346bf8cull}};
 #define CTOR_DONE 2                      // a module's constructor flag after its DT_INIT ran the init_array
 
-// The init_array sizes (DT_INIT_ARRAYSZ / 8 of OOT 1.1.0; 1.0.0 is to be checked), in the order the constructors
-// run, the same three modules as TotK.
+// The init_array sizes (DT_INIT_ARRAYSZ / 8 of OoT 1.1.1), in the order the constructors run, the same three modules
+// as TotK and MP4; subsdk0 (movie) has none, its DT_INIT only registers the module.
 typedef struct { const char *name; uint64_t entries; } InitCount;
-static const InitCount expected_inits[] = {{"main", 1212}, {"subsdk0", 45}, {"sdk", 87}};
+static const InitCount expected_inits[] = {{"main", 9783}, {"subsdk0", 0}, {"sdk", 96}};
 
 static volatile LONG inits_done, checkpoint_seen;
 uint64_t rt_guest_start_ns;
@@ -59,7 +60,7 @@ static uint64_t nvn_ret(void) {
 static const char *caller(const Cpu *c, char *buf, int n) { return ldr_describe(c->x[30] - 4, buf, n); }
 
 // main.npdm META: the main thread's priority (+0xE), core (+0xF) and stack size (+0x1C). kernel.c builds the main
-// thread with OOT's values (the same in 1.0.0 and 1.1.0); a different npdm means a different game build.
+// thread with OoT's values (1.1.1: the same as MP4's); a different npdm means a different game build.
 static void check_npdm(void) {
     size_t n;
     uint8_t *npdm = ldr_read_verified(rt_config()->exefs, "main.npdm", &n);

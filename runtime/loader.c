@@ -269,19 +269,22 @@ static void parse_dynamic(Mod *m) {
 }
 
 // The constructor state flag DT_INIT checks: ADRP xN at DT_INIT+16, LDR wM, [xN, #imm] at +20 or +24
-// (MNG scripts/prepare_runtime.py).
+// (MNG scripts/prepare_runtime.py). SDK 22 (OoT) opens DT_INIT with PACIBSP, which moves the ADRP to +20 and the LDR
+// to +24 or +28; the decoder takes either prologue.
 static uint64_t decode_ctor_flag(const Mod *m) {
     uint64_t init = m->pub.init;
     if (!init) return 0;
-    uint32_t a = rd32(init + 16);
+    int adrp_at = 16;
+    uint32_t a = rd32(init + adrp_at);
+    if ((a & 0x9f000000u) != 0x90000000u && rd32(init) == 0xd503237fu) a = rd32(init + (adrp_at = 20));   // pacibsp
     if ((a & 0x9f000000u) != 0x90000000u) return 0;
     uint32_t reg = a & 31;
-    for (int at = 20; at <= 24; at += 4) {
+    for (int at = adrp_at + 4; at <= adrp_at + 8; at += 4) {
         uint32_t w = rd32(init + at);
         if ((w & 0xffc00000u) != 0xb9400000u || ((w >> 5) & 31) != reg) continue;
         int64_t imm = (int64_t)(((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2));
         imm = (imm ^ (1 << 20)) - (1 << 20);
-        uint64_t flag = ((init + 16) & ~0xFFFull) + (uint64_t)(imm << 12) + ((w >> 10) & 0xfff) * 4;
+        uint64_t flag = ((init + adrp_at) & ~0xFFFull) + (uint64_t)(imm << 12) + ((w >> 10) & 0xfff) * 4;
         uint64_t data = m->pub.base + m->pub.data_off;
         return flag >= data && flag < m->pub.base + m->pub.size ? flag : 0;
     }
@@ -569,19 +572,18 @@ uint64_t ldr_plt_stub(const char *module, const char *name) {
 }
 
 // ---- --probe-loader
-// Expected values, measured on the 1.1.0 modules with this probe (TotK kept a table per version; 1.0.0's is to be
-// measured when that version is built).
+// Expected values, measured on OoT 1.1.1's modules with this probe (2026-11-05; TotK kept a table per version).
 typedef struct {
     const char *name;
     uint64_t kinds[K_COUNT], total, sym_import, sym_own;
     uint32_t imports, to[MOD_COUNT], weak, init_off, init_array;
 } Expect;
-static const Expect expect_110[] = {
-    {"main", {74444, 0, 3, 448}, 74895, 451, 0, 449, {0, 21, 426}, 2, 0xd334c0, 1212},
-    {"subsdk0", {3355, 10925, 974, 4025}, 19279, 6559, 9365, 665, {9, 0, 656}, 0, 0x20, 45},
-    {"sdk", {14684, 10051, 1155, 7962}, 33852, 10, 19158, 8, {8, 0, 0}, 0, 0x400, 87},
+static const Expect expect_111[] = {
+    {"main", {535967, 2004, 47, 1110}, 539128, 3161, 0, 1183, {0, 41, 1132}, 10, 0x12177e0, 9783},
+    {"subsdk0", {298, 420, 42, 506}, 1266, 390, 578, 258, {6, 0, 252}, 0, 0x40, 0},
+    {"sdk", {17089, 9414, 1443, 10082}, 38028, 10, 20929, 8, {8, 0, 0}, 0, 0x60, 96},
 };
-#define expect expect_110
+#define expect expect_111
 
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
@@ -671,7 +673,7 @@ int probe_loader(void) {
     const RtConfig *cfg = rt_config();
     hostfn_add_override(PROBE_SYMBOL, probe_override);
     ldr_load(cfg->exefs);
-    if (nmods != (int)(sizeof expect_110 / sizeof *expect_110)) {
+    if (nmods != (int)(sizeof expect / sizeof *expect)) {
         printf("probe-loader: FAILED (%d modules, expected 3)\n", nmods);
         return 1;
     }
