@@ -32,17 +32,13 @@ and `tools/data/expected-*.json`.
 
 ## Status
 
-Phase 0 (`docs/plan.md`). The `.nup` is a plain container (no keys needed): `python3.14 tools/extract_nup.py --list`,
-then `--exefs-only --verify` wrote `build/extracted/v131072/exefs` (title id `0400486024DEC000`, v131072, display
-1.1.1). `main` is ZBIC-compressed (NSO flag bit 7): `python3 tools/build_zbic.py` builds our decoder (upstream zstd plus
-`tools/zbic/`), and `extract_nup.py` then writes plain NSOs to `exefs/` (stored ones in `exefs-zbic/`). `--romfs-only`
-leaves the ExeFS alone. The RomFS is extracted: `build/extracted/v131072/romfs/romfs.bin` + `index.json` (status pass), the image
-`runtime/romfs.c` already reads; the loose files were deleted. NVN2 survey in `docs/plan.md`: 219 proc names we lack,
-SM86 shaders (the Maxwell translator does not apply). The lifter now takes the
-Switch 2's ARMv8.3 code (PAC branches and ops, `LDAPR`, `UDOT`, FP16 `FNEG`): 0 unsupported instructions in every
-module, differential tests pass. Survey C in `generated/survey-v131072/`. Run the lifter tools with a Python 3.12 venv
-holding `tools/requirements.txt` (MP4's `.venv` works for now) and the differential tests with a Windows venv
-(MP4's `.venv-win`). Next: NVN2 and the game-bound tables.
+Phase 1 reached (2026-11-05): `oot.exe` builds (`.venv-win/Scripts/python.exe tools/build_game.py` from MP4's venv for
+now), `--selftest` and the host probes pass, and `--boot` passes to the first `nvnBootstrapLoader` call. `docs/plan.md`
+Phase 1 lists the Switch 2 and SDK 22 differences met on the way (GetInfo 29-33, the thread handle at TLR+0x110, the
+PACIBSP prologue, nn::oe and nn::vi additions in `ov_oot.c`, `nv::InitializeGraphics(0, 0)`). Extraction:
+`python3.14 tools/extract_nup.py --verify` (needs `toolchain/zbic/nso_unzbic` from `tools/build_zbic.py`) writes
+`build/extracted/v131072/{exefs,romfs,extraction-manifest.json}`. Logs of runs go to `build/logs/`. Next: Phase 2, the
+game past the checkpoint (`oot.exe --seconds N`), which drives NVN2.
 
 ## Environment notes
 

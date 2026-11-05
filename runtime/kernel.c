@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/kernel.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/kernel.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the thread handle at TLR+0x110 for SDK 22's critical sections.
 // From fe3h-pc-recomp runtime/kernel.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; MP4's main thread stack size.
 // From totk-pc-recomp runtime/kernel.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), renamed to fe3h; FE3H's main thread stack size; FE3H_THREAD_DUMP.
 // Adapted from MacNativeGames games/totk/runtime/threads.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
@@ -1534,6 +1534,11 @@ static RtThread *thr_new(int prio, int core, uint64_t mask) {
 
 static void thr_link(RtThread *t) {   // holding G
     t->handle = h_new(O_THREAD, t);
+    // Switch 2 kernels put the thread's own handle at TLR+0x110 (Lichii k_thread.cpp: ThreadLocalRegion
+    // current_thread_handle, written by the kernel for the main thread and by CreateThread), and SDK 22's
+    // nn::os::detail::InternalCriticalSection reads it there for its CAS owner tag instead of from the thread object
+    // behind TLR+0x1F8. Left zero, every unlocked critical section read as held by the current thread.
+    *(uint32_t *)(t->tlr + 0x110) = t->handle;
     t->id = g_next_id++;
     t->all = g_all;
     g_all = t;

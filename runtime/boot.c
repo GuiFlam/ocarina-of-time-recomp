@@ -30,8 +30,9 @@
 // main: return address of the first nvnBootstrapLoader call per game version (rt_game_version, build_game.py), the
 // first of the three bl to its PLT stub in OoT 1.1.1 (main+0x346bf88, +0x346bf98, +0x346bfb4, found by the stub's GOT
 // slot in Phase 0); nvn_ret() picks the running version's.
-// The SetFocusHandlingMode checkpoint keeps TotK 1.2.1's address; this game never reaches it.
-#define CHECKPOINT_RET 0xe7a954ull
+// The SetFocusHandlingMode checkpoint: OoT 1.1.1 calls it from main+0x1202d40 early in nnMain (MP4 never did; TotK's
+// engine does), measured by the first --boot that got there; the return address is the word after.
+#define CHECKPOINT_RET 0x1202d44ull
 static const struct { int version; uint64_t ret; } nvn_rets[] = {{111, 0x346bf8cull}};
 #define CTOR_DONE 2                      // a module's constructor flag after its DT_INIT ran the init_array
 

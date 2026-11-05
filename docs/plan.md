@@ -64,8 +64,36 @@ Next:
 
 ## Phase 1: build
 
-Rewrite the game-bound tables still holding Metroid Prime 4's values, listed in `CLAUDE.md` ("Where to get code
-from"), then build `oot.exe` and run `--selftest`, the differential tests and the host probes as MP4 did.
+**Reached (2026-11-05): `--boot` passes.** `oot.exe` (302 MiB, 267 MiB of lifted code for 297,043 functions) builds
+with MSYS2 clang in 257 s; `--selftest`, `--probe-loader`, `--probe-kernel`, `--probe-gfx-abi`, `--probe-astc` and
+`--probe-dpi` pass; `--boot` runs through `nn::init::Start`, the three modules' constructors and `nnMain` to the first
+`nvnBootstrapLoader` call, from `main+0x346bf8c` as Phase 0 found, after 50 SVCs and 509 host calls. The game-bound
+tables rewritten: `boot.c` (init_array sizes 9783/0/96, the NVN return address, the `SetFocusHandlingMode` checkpoint at
+`main+0x1202d44`, which TotK's engine reaches and MP4 never did), `loader.c` (probe table), `build_game.py` (1.1.1,
+the ExeFS manifest from `extract_nup.py`), `ov_oot.c` (empty of MP4's entries, none imported here). Between the build
+and the pass, each a Switch 2 or SDK 22 difference the three earlier hosts never met:
+
+- `GetInfo` 29 to 33 (`memory.c`): `nnosInitialize` asks for the VAMM region (29/30) before anything else; the alias
+  reservation is split, the game's alias region its lower half and the VAMM region its upper half, so
+  `MapPhysicalMemory` works in both; 31/32 (remote memory for the graphics stack) 0, 33 (VAMM granule) the page.
+  Meanings from Lichii's `svc_types.h` (GPL-3.0, read for behaviour).
+- The constructor flag decoder (`loader.c`) takes the `PACIBSP` prologue SDK 22 puts before `DT_INIT`'s `ADRP`.
+- The thread handle at `TLR+0x110` (`kernel.c`): SDK 22's `nn::os::detail::InternalCriticalSection` reads the owner tag
+  for its CAS from there (`mrs tpidrro_el0; ldr w, [x, #0x110]`), where Switch 2 kernels write it (Lichii
+  `k_thread.cpp`), instead of from the thread object behind `TLR+0x1F8`. With 0 there every unlocked mutex read as held
+  by the current thread: the first heap allocation of `main`'s constructors aborted in `pthread_mutex_lock`.
+- `nn::oe` (SDK 22): `SetGraphicsScaleChangedNotificationEnabled` (no-op), `GetCurrentGraphicsScale` (0, as Lichii's
+  `IGraphicsScaleController` answers), `GetDisplayVersion` ("1.1.1"): lifted, they read the applet session the
+  overridden `Initialize` never opens.
+- `nn::vi` (SDK 22): HDR status, paper white, VRR and 120 Hz capability, extended swap interval and HDR layer metadata
+  stubbed in `ov_oot.c` (SDR, fixed rate); `QueryDisplayCurrentRefreshRate` is a `u32` Hz (60 or 120) plus a bool.
+- `nv::InitializeGraphics(0, 0)`: the Switch 2 game lends no work memory (`ov_gfx.c` accepts the form).
+
+Still MP4's: `ipc.c`'s SDK heap constructor address for `--probe-ipc` (fails: "sdk+0x217770 is not an sdk
+constructor"), `--probe-services`' override list (52 of MP4's host overrides match no import here), the installer
+(`installer/layout.py`, `make_release.py`). Not run yet: `tests/diff/func.py`, `tests/jumptables_check.py`.
+
+Next: past the boot checkpoint the game drives NVN2 (Phase 2).
 
 ## Shared core
 

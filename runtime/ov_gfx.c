@@ -36,15 +36,17 @@ static void ov_devtools_allocator(Cpu *c) { set_allocator(c, &nv.devtools); }
 // void nv::InitializeGraphics(void *memory, size_t size)
 static void ov_initialize_graphics(Cpu *c) {
     uint64_t mem = arg_x(c, 0), size = arg_x(c, 1);
-    if (!mem || !size) rt_fatal("nv::InitializeGraphics: no graphics work memory (%#llx, %#llx)", (unsigned long long)mem,
+    // OoT (SDK 22, Switch 2) passes (0, 0): the graphics stack's memory is the kernel's remote memory there (GetInfo 31
+    // and 32), not a buffer the game lends. Nothing in the host carves from this memory (ov_probe.c reads the record).
+    if (!mem != !size) rt_fatal("nv::InitializeGraphics: half a work memory (%#llx, %#llx)", (unsigned long long)mem,
                                 (unsigned long long)size);
     AcquireSRWLockExclusive(&lock);
     nv.memory = mem;
     nv.memory_size = size;
     nv.initialized = 1;
     ReleaseSRWLockExclusive(&lock);
-    rt_log("nv: graphics work memory %#llx+%#llx recorded", (unsigned long long)mem,
-           (unsigned long long)size);
+    if (mem) rt_log("nv: graphics work memory %#llx+%#llx recorded", (unsigned long long)mem, (unsigned long long)size);
+    else rt_log("nv: InitializeGraphics without work memory (Switch 2 form)");
 }
 
 // ---- nn::vi: the identities are small zeroed blocks in the guest-visible kernel region, in case SDK code reads them

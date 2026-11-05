@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/memory.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/memory.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; GetInfo 29 to 33 of Switch 2 kernels, the alias region split with the VAMM region.
 // From fe3h-pc-recomp runtime/memory.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; SetHeapSize refuses a size it cannot grant with OutOfMemory; shadow reservations for virtual pools mapped from CPU-visible pools.
 // From totk-pc-recomp runtime/memory.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); renamed to fe3h; MapMemory also takes stacks from module data (FE3H).
 // Adapted from MacNativeGames games/totk/runtime/services.c and loader.c @ b75be8c (MIT, Copyright (c) 2026
@@ -680,8 +680,10 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
 int mem_info(uint32_t id, uint64_t *out) {
     uint64_t v;
     switch (id) {
+    // The alias region the game sees is the lower half of the reserved one; the upper half is the Switch 2 region
+    // (ids 29, 30), so the two never overlap and MapPhysicalMemory works in either (both lie in the reservation).
     case 2: v = L.alias.base; break;
-    case 3: v = L.alias.size; break;
+    case 3: v = L.alias.size / 2; break;
     case 4: v = L.heap.base; break;
     case 5: v = L.heap.size; break;
     case 6: case 21: v = L.pool; break;
@@ -697,6 +699,15 @@ int mem_info(uint32_t id, uint64_t *out) {
     case 16: v = SYSTEM_RESOURCE_BUDGET; break;
     case 17: v = sizeof stack_maps + ALIAS_PAGES; break;   // system resource in use: our bookkeeping
     case 28: v = 0; break;   // AliasRegionExtraSize: no kernel-owned extension
+    // Switch 2 kernels (OoT's SDK 22 nnosInitialize asks for 29 and 30 before anything else). The meanings follow
+    // Lichii's reading (GPL-3.0, read for behaviour: svc_types.h, svc_info.cpp): 29/30 the address and size of the
+    // region the SDK's VAMM reserves address space in and backs with MapPhysicalMemory; 31/32 the remote memory set
+    // aside for the graphics stack and its use (nn::os::GetRemoteMemoryUsage), none here; 33 the page granule VAMM
+    // aligns to.
+    case 29: v = L.alias.base + L.alias.size / 2; break;
+    case 30: v = L.alias.size / 2; break;
+    case 31: case 32: v = 0; break;
+    case 33: v = PAGE; break;
     default: return 0;
     }
     *out = v;
