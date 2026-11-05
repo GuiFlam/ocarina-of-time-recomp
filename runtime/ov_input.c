@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/ov_input.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/ov_input.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the public six-axis and vibration forms OoT imports.
 // From fe3h-pc-recomp runtime/ov_input.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only.
 // From totk-pc-recomp runtime/ov_input.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); renamed to fe3h; adds the single-state GetNpadState overloads (FE3H); logs the initialization once (FE3H calls InitializeNpad every frame).
 // Adapted from MacNativeGames games/totk/runtime/input.c and hid_feedback.c @ b75be8cf (MIT, Copyright (c) 2026
@@ -489,6 +489,19 @@ static void ov_six_state(Cpu *c) {
     ret_x(c, 0);
 }
 
+// The public forms OoT (SDK 22) imports where MP4 imported the detail layer; lifted, the public functions open the hid
+// service before reaching detail. int GetSixAxisSensorStates(SixAxisSensorState *out, int max, const Handle &) returns
+// the count; void SetGyroscopeZeroDriftMode(const Handle &, const Mode &) is accepted (the host sensor has no drift
+// modes); bool IsOunceVibrationDeviceMounted(const Handle &): the Switch 2's own vibration device, none here.
+static void ov_six_states_public(Cpu *c) { ret_x(c, (uint32_t)six_fill(arg_p(c, 0), (int)arg_x(c, 1), arg_p(c, 2), "GetSixAxisSensorStates")); }
+static void ov_hid_void(Cpu *c) { (void)c; }
+static void ov_hid_false(Cpu *c) { ret_x(c, 0); }
+HOST_OVERRIDE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start);
+HOST_OVERRIDE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", ov_six_states_public);
+HOST_OVERRIDE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", ov_hid_void);
+HOST_OVERRIDE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", ov_vib_init);
+HOST_OVERRIDE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", ov_vib_send);
+HOST_OVERRIDE("_ZN2nn3hid29IsOunceVibrationDeviceMountedERKNS0_21VibrationDeviceHandleE", ov_hid_false);
 HOST_OVERRIDE("_ZN2nn3hid14InitializeNpadEv", ov_initialize_npad);
 HOST_OVERRIDE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", ov_supported_ids);
 HOST_OVERRIDE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", ov_supported_styles);

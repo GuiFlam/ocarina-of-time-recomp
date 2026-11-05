@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/nvn_api_obj.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/nvn_api_obj.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; nvnProgramInitializeFromBuilder (NVN2).
 // From fe3h-pc-recomp runtime/nvn_api_obj.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; adds the sparse tile layout queries; WindowAcquireTexture waits for the GPU's completion of the image's last present.
 // From totk-pc-recomp runtime/nvn_api_obj.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); renamed to fe3h; tracks the live windows for nvn_window_uses_pool (FE3H frees a pool per loaded resource); texture and sampler ids are slots of their pool (FE3H uses several pools).
 // NVN front end, second slice: descriptor pools, textures, samplers, programs,
@@ -491,6 +491,17 @@ NVN_API(nvnProgramInitialize) {
     memset(o, 0, sizeof *o);
     o->magic = NVN_PROG_MAGIC;
     ret_x(c, 1);
+}
+// NVNboolean nvnProgramInitializeFromBuilder(NVNprogram *p, const NVNprogramBuilder *b) (NVN2): nvnProgramInitialize
+// plus nvnProgramSetShaders with the stages the builder was given (nvn_api.h nvn2_prog_builder_t)
+static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd);
+NVN_API(nvnProgramInitializeFromBuilder) {
+    NVN_BLOCKING();
+    prog_t *o = arg_p(c, 0);
+    const nvn2_prog_builder_t *b = arg_p(c, 1);
+    memset(o, 0, sizeof *o);
+    o->magic = NVN_PROG_MAGIC;
+    ret_x(c, prog_set_shaders(o, b->nshaders, (const NVNshaderData *)(uintptr_t)b->shaders));
 }
 static void prog_release(prog_t *o) {
     if (o->serial) gfx_backend()->program_release(o);

@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/romfs.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/romfs.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; MountRom(const char *) and several mount names for the one image (SDK 22).
 // From fe3h-pc-recomp runtime/romfs.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; adds the SDK 19.3 forms of MountRom and QueryMountRomCacheSize; file handles are multiples of 8; adds directory listing over the index; the fs trace logs the first reads.
 // From totk-pc-recomp runtime/romfs.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Adapted from MacNativeGames games/totk/runtime/romfs.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
@@ -50,7 +50,17 @@ static HANDLE image = INVALID_HANDLE_VALUE;
 static const uint8_t *image_map;
 static char image_file[2048];
 static char index_dir[2048];         // the directory of romfs-index.bin: the proof file's default place
-static char mount_name[32];
+// The names the game mounts the one RomFS under: "content", and SDK 22's NPLN client mounts it again as "_npln" (OoT).
+#define MOUNTS_MAX 4
+static char mount_names[MOUNTS_MAX][32];
+static int nmounts;
+static const char *mount_of(const char *path) {   // the mounted name a "name:/..." path starts with, else ""
+    for (int k = 0; path && k < nmounts; k++) {
+        size_t n = strlen(mount_names[k]);
+        if (!strncmp(path, mount_names[k], n) && path[n] == ':') return mount_names[k];
+    }
+    return "";
+}
 static SRWLOCK lock = SRWLOCK_INIT;
 static uint64_t handles[NH];         // file index + 1; 0 is free
 static uint32_t handle_ovl[NH];      // overlay slot + 1 of an open handle, 0 = original
@@ -654,8 +664,7 @@ const char *romfs_overlay(size_t k, const char **file, uint64_t *size, int *is_a
 }
 
 int romfs_owns(const char *path) {
-    size_t n = strlen(mount_name);
-    return n && path && !strncmp(path, mount_name, n) && path[n] == ':';
+    return *mount_of(path) != 0;
 }
 
 // Handles are multiples of 8, as a Horizon FileHandle is a pointer: this game keeps its open mode in the low
@@ -666,12 +675,16 @@ int romfs_handle(uint64_t h) {
 
 uint32_t romfs_mount(const char *name) {
     fs_init();
-    if (!name || !romfs_path_valid_relative(name) || strlen(name) >= sizeof mount_name || strchr(name, '/') ||
+    if (!name || !romfs_path_valid_relative(name) || strlen(name) >= sizeof mount_names[0] || strchr(name, '/') ||
         strchr(name, ':'))
         return FS_R_INVALID;
     AcquireSRWLockExclusive(&lock);
-    if (*mount_name && strcmp(name, mount_name)) rt_fatal("second RomFS mount %s (%s is mounted)", name, mount_name);
-    strcpy(mount_name, name);
+    int k = 0;
+    while (k < nmounts && strcmp(name, mount_names[k])) k++;
+    if (k == nmounts) {
+        if (nmounts == MOUNTS_MAX) rt_fatal("RomFS mount %s: already mounted under %d names", name, nmounts);
+        strcpy(mount_names[nmounts++], name);
+    }
     ReleaseSRWLockExclusive(&lock);
     rt_log("fs mount %s: -> RomFS", name);
     return 0;
@@ -680,7 +693,7 @@ uint32_t romfs_mount(const char *name) {
 uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     fs_trace("rom", path);
     if (!out || mode != FS_OPEN_READ) return FS_R_UNSUPPORTED_OPEN;
-    const char *p = romfs_path_relative(mount_name, path);
+    const char *p = romfs_path_relative(mount_of(path), path);
     if (!p) return FS_R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
@@ -787,7 +800,7 @@ void romfs_close(uint64_t h) {
 
 uint32_t romfs_entry_type(int *out, const char *path) {
     if (!out) return FS_R_INVALID;
-    const char *p = romfs_path_relative(mount_name, path);
+    const char *p = romfs_path_relative(mount_of(path), path);
     if (!p) return FS_R_PATH_NOT_FOUND;
     if (file_index(p) != UINT64_MAX) {
         *out = FS_ENTRY_FILE;
@@ -823,6 +836,7 @@ HOST_OVERRIDE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", ov_query_cache);
 // QueryMountRomCacheSize(out, int). The host reads the image directly and ignores it; the handlers above read only
 // the first argument.
 HOST_OVERRIDE("_ZN2nn2fs8MountRomEPKciPvm", ov_mount_rom);
+HOST_OVERRIDE("_ZN2nn2fs8MountRomEPKc", ov_mount_rom);   // SDK 22 (OoT): the form without a cache, used for a second mount at start-up (main+0x21176f4)
 HOST_OVERRIDE("_ZN2nn2fs22QueryMountRomCacheSizeEPmi", ov_query_cache);
 HOST_OVERRIDE("_ZN2nn2fs24InitializeForApplicationEv", ov_initialize);
 
@@ -843,13 +857,13 @@ int romfs_dir_handle(uint64_t h) {
 // one and becomes "<path>/".
 static int dir_prefix(const char *path, char *out, size_t cap) {
     if (!romfs_owns(path)) return 0;
-    const char *p = path + strlen(mount_name) + 1;
+    const char *p = path + strlen(mount_of(path)) + 1;
     while (*p == '/') p++;
     if (!*p || !strcmp(p, ".")) {
         out[0] = 0;
         return 1;
     }
-    const char *rel = romfs_path_relative(mount_name, path);
+    const char *rel = romfs_path_relative(mount_of(path), path);
     return rel && snprintf(out, cap, "%s/", rel) < (int)cap;
 }
 

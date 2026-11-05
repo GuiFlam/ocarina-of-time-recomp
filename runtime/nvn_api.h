@@ -24,6 +24,10 @@ void nvn_called(uint8_t *seen, const char *name);          // the counting prolo
 #define NVN_LOG(...) do { if (rt_trace & RT_TRACE_GFX) rt_log("nvn: " __VA_ARGS__); } while (0)   // OOT_TRACE=gfx
 // A wait for the GPU, the display or another thread gives the virtual core up until the end of the enclosing scope.
 #define NVN_BLOCKING() __attribute__((cleanup(kern_core_back))) int nvn_away_ = kern_core_away()
+// NVN2's program builder (nvn_api_nvn2.c), kept inside the game's NVNprogramBuilder object (0x80 bytes, zeroed by the
+// game before SetDefaults): the device, the sample shading flag, and the shader stages SetShaders was given, which
+// nvnProgramInitializeFromBuilder (nvn_api_obj.c) hands to the same path as nvnProgramSetShaders.
+typedef struct { uint64_t device; int32_t sample_shading, nshaders; uint64_t shaders; } nvn2_prog_builder_t;
 static inline int nvn_arg_bool(const Cpu *c, int i) { return (int)(arg_x(c, i) & 0xff); }   // NVNboolean: low 8 bits only
 
 #define NVN_POOL_MAGIC MAGIC('P', 'O', 'O', 'L')           // pool_t.magic of an initialized pool

@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/audio_mixer.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/audio_mixer.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; IAudioDevice commands 15 to 21 (17.0.0+).
 // From fe3h-pc-recomp runtime/audio_mixer.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; MP4_AUDIO_AUX=0 bypasses the auxiliary effect.
 // From totk-pc-recomp runtime/audio_mixer.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Adapted from MacNativeGames games/totk/runtime/audio_mixer.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
@@ -1006,7 +1006,9 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
         return;
     }
     case 5: { int32_t n = 2; IPC_OUT(rs, n); return; }   // GetActiveChannelCount
-    case 4: case 11: case 12: {   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
+    case 16: case 18: return;   // ReleaseAudioInput/OutputDeviceNotification [17.0.0+]
+    case 4: case 11: case 12: case 15: case 17: {   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent,
+                                                   // AcquireAudioInput/OutputDeviceNotification(u64) [17.0.0+] (OoT): an event that never fires
         uint32_t ev = __atomic_load_n(&change_event, __ATOMIC_ACQUIRE);
         if (!ev) {
             uint32_t mine = kern_event_new(), expected = 0;
@@ -1018,6 +1020,9 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
         rs->copy[rs->ncopy++] = kern_event_readable(ev);
         return;
     }
+    case 19: return;   // SetAudioDeviceOutputVolumeAutoTuneEnabled(bool) [18.0.0+]: accepted, the host does no auto-tuning
+    case 20: { uint8_t v = 0; IPC_OUT(rs, v); return; }   // IsAudioDeviceOutputVolumeAutoTuneEnabled [18.0.0+] (OoT, SDK 22)
+    case 21: { uint8_t v = 0; IPC_OUT(rs, v); return; }   // IsActiveOutputDeviceEstimatedLowLatency [21.0.0+]
     default: ipc_unimplemented(s, rq);
     }
 }

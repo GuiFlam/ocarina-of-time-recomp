@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/ipc.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/ipc.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; aud:u and auddmg:u, SDK 22's audio user client and device manager.
 // From fe3h-pc-recomp runtime/ipc.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; the IPC probe's SDK constructor for SDK 19.3 and its fall-back to the SDK's definition of a call main does not import.
 // From totk-pc-recomp runtime/ipc.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Adapted from MacNativeGames games/totk/runtime/ipc.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
@@ -25,9 +25,42 @@
 enum { T_CLOSE = 2, T_REQUEST = 4, T_CONTROL = 5, T_REQUEST_CTX = 6, T_CONTROL_CTX = 7, T_TIPC_CLOSE = 15,
        T_TIPC_BASE = 16 };
 
+// SDK 22's audio user client (aud:u), the object the Switch 2 SDK opens first (OoT's nn::audio::CreateAudioRendererManager
+// goes through it): command 1 hands out the audio-out manager, 2 the audio renderer manager (the numbers from Lichii's
+// INx2AudioUserClient, GPL-3.0, read for behaviour). The renderer manager is the audren:u object; audio out has no host
+// service, so its manager names any command it gets.
+static void audout_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) { (void)rs; ipc_unimplemented(s, rq); }
+static void aud_user_client_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 1: rs->move[rs->nmove++] = ipc_session_new("IAudioOutManager", audout_manager_handler, NULL, NULL); break;
+    case 2: rs->move[rs->nmove++] = ipc_session_new("IAudioRendererManager", audren_manager_handler, NULL, NULL); break;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
+// SDK 22's audio device manager (auddmg:u): command 0 opens a virtual device manager, whose command 0 lists the virtual
+// devices into the client's buffer and returns their count (Lichii nx2_audio_device_manager.h, GPL-3.0, read for the
+// shapes). OoT's start-up lists the virtual input devices (nn::audio::detail::ListVirtualInputDevices); the host has
+// none, so the count is 0 and the other commands (100 default device, 300 format, 401 properties, 500 state event,
+// 700/800 streams) are named when reached.
+static void audio_virtual_device_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: { uint32_t count = 0; IPC_OUT(rs, count); return; }
+    default: ipc_unimplemented(s, rq);
+    }
+}
+static void audio_device_manager_service_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: rs->move[rs->nmove++] = ipc_session_new("IAudioVirtualDeviceManager", audio_virtual_device_manager_handler, NULL, NULL); break;
+    default: ipc_unimplemented(s, rq);
+    }
+}
+
 // Services sm: hands out. Anything else is a named fatal.
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"audren:u", audren_manager_handler},
+    {"aud:u", aud_user_client_handler},
+    {"auddmg:u", audio_device_manager_service_handler},
 };
 
 static volatile long g_live;

@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/nvn_procs.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied; up to 256 distinct unknown proc names are logged (OoT asks for many NVN2 ones).
+// From metroid-prime-4-recomp runtime/nvn_procs.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied; up to 256 distinct unknown proc names are logged; NVN2 procs without an implementation get logging stubs (nvn_procs_stub.inc).
 // From fe3h-pc-recomp runtime/nvn_procs.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 // From totk-pc-recomp runtime/nvn_procs.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 // NVN proc table. Every name the game's proc loader asks for gets a synthetic host
@@ -30,13 +30,30 @@
 #undef nvnp_nvnDeviceGetProcAddress
 void nvnp_nvnDeviceGetProcAddress(Cpu *c);
 
+// NVN2 names the game loads that have no implementation (nvn_procs_stub.inc): a stub logs its first three calls with
+// the caller and the first arguments and returns 0, so the game runs on and the log shows which procs it uses.
+#define NVN_STUB(n)                                                                                                  \
+    static void nvnp_stub_##n(Cpu *c) {                                                                               \
+        static volatile LONG seen;                                                                                   \
+        LONG k = InterlockedIncrement(&seen);                                                                         \
+        char at[128];                                                                                                \
+        if (k <= 3) rt_log("nvn2 stub " #n " from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx (returns 0)",                \
+                           ldr_describe(c->x[30] - 4, at, sizeof at), (unsigned long long)c->x[0],                      \
+                           (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);      \
+        ret_x(c, 0);                                                                                                 \
+    }
+#include "nvn_procs_stub.inc"
+#undef NVN_STUB
 typedef struct { const char *name; uint64_t addr; } Proc;
 
 #define NVN_PROC(n) +1
+#define NVN_STUB(n) +1
 enum { PROC_COUNT = 0
 #include "nvn_procs.inc"
+#include "nvn_procs_stub.inc"
 };
 #undef NVN_PROC
+#undef NVN_STUB
 
 static Proc procs[PROC_COUNT];
 static int nprocs;
@@ -48,6 +65,9 @@ void nvn_procs_register(void) {
 #define NVN_PROC(n) procs[nprocs++] = (Proc){#n, hostfn_register("nvn:" #n, nvnp_##n)};
 #include "nvn_procs.inc"
 #undef NVN_PROC
+#define NVN_STUB(n) procs[nprocs++] = (Proc){#n, hostfn_register("nvn:" #n, nvnp_stub_##n)};
+#include "nvn_procs_stub.inc"
+#undef NVN_STUB
     qsort(procs, (size_t)nprocs, sizeof *procs, by_name);
 }
 

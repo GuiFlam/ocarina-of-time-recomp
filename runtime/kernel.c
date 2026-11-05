@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/kernel.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the thread handle at TLR+0x110 for SDK 22's critical sections; six application cores.
+// From metroid-prime-4-recomp runtime/kernel.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the thread handle at TLR+0x110 for SDK 22's critical sections; six application cores; WaitForAddress type 3 (WaitIfEqual64); SwitchToFiber(nullptr) returns to the thread.
 // From fe3h-pc-recomp runtime/kernel.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; MP4's main thread stack size.
 // From totk-pc-recomp runtime/kernel.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), renamed to fe3h; FE3H's main thread stack size; FE3H_THREAD_DUMP.
 // Adapted from MacNativeGames games/totk/runtime/threads.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
@@ -1991,18 +1991,20 @@ int kern_svc(Cpu *c, uint32_t imm) {
         return 1;
     }
 
-    case 0x34: {   // WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 if less, 1 decrement if less, 2 if equal
+    case 0x34: {   // WaitForAddress(x0 address, w1 type, x2 value, x3 timeout): 0 if less, 1 decrement if less, 2 if equal,
+                   // 3 if the 64-bit word equals (Switch 2 kernels, Lichii svc_types.h WaitIfEqual64; libc++'s atomic
+                   // wait in SDK 22 uses it)
         RtThread *t = cur(imm);
         uint64_t addr = x[0];
         int type = (int)x[1];
         int32_t val = (int32_t)x[2];
-        if (type < 0 || type > 2) {
+        if (type < 0 || type > 3) {
             x[0] = R_INVALID_ENUM;
             return 1;
         }
         lock();
-        uint32_t r, v = ld32(addr);
-        int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+        uint32_t r, v = type == 3 ? 0 : ld32(addr);
+        int ok = type == 3 ? *(volatile uint64_t *)(uintptr_t)addr == x[2] : type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1)
             while (!cas32(addr, &v, v - 1))
                 if (!((int32_t)v < val)) {
@@ -2383,6 +2385,10 @@ void kern_fiber_finalize(Cpu *c) {
 void kern_fiber_switch(Cpu *c) {
     RtThread *t = tcur;
     if (!t) rt_fatal("SwitchToFiber on a host thread");
+    if (!c->x[0]) {   // SDK 22 (OoT): nn::async's fiber task coordinator yields with SwitchToFiber(nullptr), back to the thread's own context
+        if (t->fiber) fiber_switch_to(t, c, NULL);
+        return;
+    }
     Fiber *to = fiber_find(c->x[0]);
     if (!to) rt_fatal("SwitchToFiber(%#llx): not an initialized fiber", (unsigned long long)c->x[0]);
     if (to == t->fiber) return;

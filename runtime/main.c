@@ -462,6 +462,24 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
         }
         // The first 160 bytes behind each register that points at readable memory, as hex and text: the object or
         // string the faulting code was working on. The registers are as of the last sync point (the latest call).
+        // The thread's TLS slots: SDK 22 keeps them in the thread object behind TLR+0x1F8, at +0x80 (nn::os::GetTlsValue).
+        if (c->tpidrro && readable(c->tpidrro + 0x1F8, 8)) {
+            uint64_t thr = LD64(c->tpidrro + 0x1F8);
+            rt_logf("  TLR %#llx thread object %#llx\n", (unsigned long long)c->tpidrro, (unsigned long long)thr);
+            if (thr && readable(thr + 0x80, 0x80)) {
+                for (int k = 0; k < 16; k += 4)
+                    rt_logf("  tls[%2d..%2d] %016llx %016llx %016llx %016llx\n", k, k + 3, (unsigned long long)LD64(thr + 0x80 + 8 * k),
+                            (unsigned long long)LD64(thr + 0x88 + 8 * k), (unsigned long long)LD64(thr + 0x90 + 8 * k),
+                            (unsigned long long)LD64(thr + 0x98 + 8 * k));
+                // sead keeps a per-thread block behind one slot; its current heap sits at +0x88 (main+0x3ea70)
+                for (int k = 0; k < 16; k++) {
+                    uint64_t v = LD64(thr + 0x80 + 8 * k);
+                    if (v > 0x10000 && !(v >> 48) && readable(v + 0x80, 0x20))
+                        rt_logf("  tls[%2d] -> [+0x80] %016llx [+0x88] %016llx [+0x90] %016llx\n", k, (unsigned long long)LD64(v + 0x80),
+                                (unsigned long long)LD64(v + 0x88), (unsigned long long)LD64(v + 0x90));
+                }
+            }
+        }
         // OOT_CRASH_PEEK=<bytes> widens the peek (up to 16 KiB) to see a whole object.
         const char *pk = cfg_get("OOT_CRASH_PEEK");
         size_t peek = pk ? (size_t)strtoul(pk, NULL, 0) : 160;

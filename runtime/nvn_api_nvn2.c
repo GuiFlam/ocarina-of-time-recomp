@@ -52,9 +52,22 @@ NVN_API(nvnWindowSetHdrContentMetadata) { accept(c); }
 NVN_API(nvnWindowGetHdrContentMetadata) { zero(c); }
 
 // ---- program builder (NVN2)
-typedef struct { uint64_t device; int32_t sample_shading, pad; } prog_builder_t;
-#define PB(c) ((prog_builder_t *)arg_p(c, 0))
-NVN_API(nvnProgramBuilderSetDefaults) { prog_builder_t *b = PB(c); b->device = 0; b->sample_shading = 0; }
+#define PB(c) ((nvn2_prog_builder_t *)arg_p(c, 0))
+NVN_API(nvnProgramBuilderSetDefaults) { memset(PB(c), 0, sizeof(nvn2_prog_builder_t)); }
+// void nvnProgramBuilderSetShaders(b, int count, const NVNshaderData *data): the stages, {data address, control}
+// entries of 16 bytes as on Switch 1 (the game builds them on its stack, main+0x14e2468, 1.1.1); kept by reference
+// until nvnProgramInitializeFromBuilder copies them
+NVN_API(nvnProgramBuilderSetShaders) { nvn2_prog_builder_t *b = PB(c); b->nshaders = (int32_t)arg_x(c, 1); b->shaders = arg_x(c, 2); }
+NVN_API(nvnProgramBuilderGetShaders) { ret_x(c, PB(c)->shaders); }
+NVN_API(nvnProgramBuilderGetShaderCount) { ret_x(c, (uint32_t)PB(c)->nshaders); }
+// ray tracing modules and subroutine linkage: none (the back end does neither)
+NVN_API(nvnProgramBuilderSetRayTracingModules) { accept(c); }
+NVN_API(nvnProgramBuilderGetRayTracingModuleCount) { zero(c); }
+NVN_API(nvnProgramBuilderGetRayTracingModuleData) { zero(c); }
+NVN_API(nvnProgramBuilderSetSubroutineLinkage) { accept(c); }
+NVN_API(nvnProgramBuilderGetSubroutineLinkage) { zero(c); }
+NVN_API(nvnProgramBuilderGetSubroutineLinkageCount) { zero(c); }
+NVN_API(nvnProgramBuilderGetDebugDataHashes) { zero(c); }
 NVN_API(nvnProgramBuilderSetDevice) { PB(c)->device = arg_x(c, 1); }
 NVN_API(nvnProgramBuilderGetDevice) { ret_x(c, PB(c)->device); }
 NVN_API(nvnProgramBuilderSetSampleShading) { PB(c)->sample_shading = (int32_t)arg_x(c, 1); }

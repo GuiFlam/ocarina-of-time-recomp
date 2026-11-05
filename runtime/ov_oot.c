@@ -8,6 +8,7 @@
 // 2026-11-05), so this file starts empty, as MP4's did against FE3H's.
 //
 // Each entry names the call that needs it and the game version it was seen in.
+#include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -119,16 +120,37 @@ static void ov_socket_ok(Cpu *c) { ret_x(c, 0); }                          // Re
 static void ov_socket_initialized(Cpu *c) { ret_x(c, 1); }                 // bool IsInitialized()
 static void ov_socket_fail(Cpu *c) { ret_x(c, (uint64_t)(int64_t)-1); }    // int / ssize_t calls: -1
 static void ov_socket_errno(Cpu *c) { ret_x(c, SOCKET_ENETDOWN); }         // int GetLastError()
+// Local descriptors work offline on hardware, and the game's gRPC (NPLN) aborts at start-up when none of its polling
+// engines can make a wakeup descriptor ("No event engine could be initialized", main+0x21f0c7c). EventFd hands out
+// fake descriptors from 0x1000; reads on them report one event, writes, fcntl, close and socket options succeed; Poll
+// and Select sleep for the timeout (100 ms at most) and report nothing ready. Real sockets (Socket, Connect) stay down.
+static volatile LONG fake_fd_next = 0x1000;
+static void ov_eventfd_new(Cpu *c) { ret_x(c, (uint32_t)InterlockedIncrement(&fake_fd_next)); }
+static void ov_eventfd_read(Cpu *c) {   // int EventFdRead(int fd, uint64_t *value)
+    uint64_t *v = arg_p(c, 1);
+    if (v) *v = 1;
+    ret_x(c, 0);
+}
+static void ov_poll_sleep(Cpu *c, int ms) {
+    if (ms < 0 || ms > 100) ms = 100;
+    if (ms) Sleep((DWORD)ms);
+    ret_x(c, 0);
+}
+static void ov_socket_poll(Cpu *c) { ov_poll_sleep(c, (int)arg_x(c, 2)); }   // int Poll(pollfd *, nfds, int timeout_ms)
+static void ov_socket_select(Cpu *c) {   // int Select(nfds, fd_set *r, *w, *e, TimeVal *tv)
+    const int64_t *tv = arg_p(c, 4);
+    ov_poll_sleep(c, tv ? (int)(tv[0] * 1000 + tv[1] / 1000) : -1);
+}
 HOST_OVERRIDE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", ov_socket_ok);
 HOST_OVERRIDE("_ZN2nn6socket8FinalizeEv", ov_socket_ok);
 HOST_OVERRIDE("_ZN2nn6socket13IsInitializedEv", ov_socket_initialized);
 HOST_OVERRIDE("_ZN2nn6socket12GetLastErrorEv", ov_socket_errno);
-HOST_OVERRIDE("_ZN2nn6socket5CloseEi", ov_socket_fail);
-HOST_OVERRIDE("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", ov_socket_fail);
-HOST_OVERRIDE("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", ov_socket_fail);
-HOST_OVERRIDE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", ov_socket_fail);
-HOST_OVERRIDE("_ZN2nn6socket11EventFdReadEiPm", ov_socket_fail);
-HOST_OVERRIDE("_ZN2nn6socket12EventFdWriteEim", ov_socket_fail);
+HOST_OVERRIDE("_ZN2nn6socket5CloseEi", ov_socket_ok);
+HOST_OVERRIDE("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", ov_socket_ok);
+HOST_OVERRIDE("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", ov_socket_select);
+HOST_OVERRIDE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", ov_eventfd_new);
+HOST_OVERRIDE("_ZN2nn6socket11EventFdReadEiPm", ov_eventfd_read);
+HOST_OVERRIDE("_ZN2nn6socket12EventFdWriteEim", ov_socket_ok);
 
 // nn::ssl: Initialize succeeds without ssl:s; making a context or reading the built-in certificates fails with an
 // ssl-module result (module 123). Context's constructor and destructor are local SDK code and stay lifted.
@@ -162,3 +184,96 @@ HOST_OVERRIDE("_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE
 // local SDK code and runs lifted
 static void ov_prepo_send(Cpu *c) { ret_x(c, 0); }
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", ov_prepo_send);
+
+// ==== nn::hid, Switch 2 additions: the Joy-Con mouse sensor (Jcms), the mouse devices (Nmouse) and sensor fusion. The
+// host has none of these devices: handle lookups give handle 0 and no devices, start and stop succeed, finalizers are
+// no-ops. The game's input module queries them at start-up (1.1.1).
+static void ov_hid_none(Cpu *c) { ret_x(c, 0); }   // handles and counts of 0, Result 0
+static void ov_hid_nothing(Cpu *c) { (void)c; }
+static void ov_nmouse_type_set(Cpu *c) {   // void GetNmouseTypeSet(BitFlagSet<32, NmouseType> *out, NmouseHandle)
+    uint32_t *out = arg_p(c, 0);
+    if (out) *out = 0;
+}
+HOST_OVERRIDE("_ZN2nn3hid13GetJcmsHandleERKjRKNS0_8JcmsTypeE", ov_hid_none);
+HOST_OVERRIDE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", ov_hid_none);
+HOST_OVERRIDE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", ov_hid_none);
+HOST_OVERRIDE("_ZN2nn3hid12FinalizeJcmsEv", ov_hid_nothing);
+HOST_OVERRIDE("_ZN2nn3hid16GetNmouseHandlesEPNS0_12NmouseHandleEij", ov_hid_none);
+HOST_OVERRIDE("_ZN2nn3hid16GetNmouseTypeSetEPNS_4util10BitFlagSetILi32ENS0_10NmouseTypeEEENS0_12NmouseHandleE", ov_nmouse_type_set);
+HOST_OVERRIDE("_ZN2nn3hid14FinalizeNmouseEv", ov_hid_nothing);
+HOST_OVERRIDE("_ZN2nn3hid22GetSensorFusionHandlesEPNS0_18SensorFusionHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", ov_hid_none);
+HOST_OVERRIDE("_ZN2nn3hid20FinalizeSensorFusionEv", ov_hid_nothing);
+
+// ==== The C APIs of nn::socket and nn::ssl (nnsocket*, nnssl*), which this game's NPLN client uses beside the C++
+// forms above; the same offline answers. The byte-order helpers (nnsocketInet*), nnsocketGAIStrError and nnosXxx are
+// local SDK code and run lifted.
+static void ov_c_socket_fail(Cpu *c) { ret_x(c, (uint64_t)(int64_t)-1); }        // int calls: -1, errno ENETDOWN
+static void ov_c_socket_errno(Cpu *c) { ret_x(c, SOCKET_ENETDOWN); }               // int nnsocketGetLastErrno()
+static void ov_c_socket_void(Cpu *c) { (void)c; }                                  // nnsocketSetLastErrno, nnsocketFreeAddrInfo
+static void ov_c_socket_gai_fail(Cpu *c) { ret_x(c, 4); }                          // nnsocketGetAddrInfo*: EAI_FAIL
+static void ov_c_ssl_ok(Cpu *c) { ret_x(c, 0); }
+static void ov_c_ssl_fail(Cpu *c) { ret_x(c, SSL_R_UNAVAILABLE); }
+HOST_OVERRIDE("nnsocketAccept", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketBind", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketClose", ov_socket_ok);
+HOST_OVERRIDE("nnsocketConnect", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketFcntl", ov_socket_ok);
+HOST_OVERRIDE("nnsocketGetPeerName", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketGetSockName", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketGetSockOpt", ov_socket_ok);
+HOST_OVERRIDE("nnsocketListen", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketPoll", ov_socket_poll);
+HOST_OVERRIDE("nnsocketRecv", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketRecvMsg", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketResolverGetOption", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketResolverSetOption", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketSend", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketSendMsg", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketSetSockOpt", ov_socket_ok);
+HOST_OVERRIDE("nnsocketShutdown", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketSocket", ov_c_socket_fail);
+HOST_OVERRIDE("nnsocketGetLastErrno", ov_c_socket_errno);
+HOST_OVERRIDE("nnsocketSetLastErrno", ov_c_socket_void);
+HOST_OVERRIDE("nnsocketFreeAddrInfo", ov_c_socket_void);
+HOST_OVERRIDE("nnsocketGetAddrInfo", ov_c_socket_gai_fail);
+HOST_OVERRIDE("nnsocketGetAddrInfoWithOptions", ov_c_socket_gai_fail);
+HOST_OVERRIDE("nnsslInitialize", ov_c_ssl_ok);
+HOST_OVERRIDE("nnsslFinalize", ov_c_ssl_ok);
+HOST_OVERRIDE("nnsslContextDestroy", ov_c_ssl_ok);
+HOST_OVERRIDE("nnsslConnectionDestroy", ov_c_ssl_ok);
+HOST_OVERRIDE("nnsslConnectionCreate", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionDoHandshakeWithCertBuffer", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionGetConnectionId", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionGetNextAlpnProto", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionGetServerCertDetail", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionGetVerifyCertError", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionPeek", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionPending", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionRead", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetHostName", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetIoMode", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetNextAlpnProto", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetOption", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetServerCertBuffer", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetSessionCacheMode", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetSocketDescriptor", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionSetVerifyOption", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslConnectionWrite", ov_c_ssl_fail);
+HOST_OVERRIDE("nnsslContextGetContextId", ov_c_ssl_fail);
+
+// ==== nn::nsd: server environment discovery, which would open nsd:a. Result GetEnvironmentIdentifier(
+// EnvironmentIdentifier *out): the retail environment "lp1" (8 bytes, as yuzu and Lichii answer); Result ResolveEx(Fqdn
+// *out, const Fqdn &in): no server-name rewriting, the name stays (Fqdn is 0x100 bytes). The NPLN client asks for both
+// at start-up (main+0x241f494, 1.1.1); offline, nothing resolves afterwards anyway.
+static void ov_nsd_environment(Cpu *c) {
+    char *out = arg_p(c, 0);
+    if (out) { memset(out, 0, 8); memcpy(out, "lp1", 3); }
+    ret_x(c, 0);
+}
+static void ov_nsd_resolve(Cpu *c) {
+    char *out = arg_p(c, 0); const char *in = arg_p(c, 1);
+    if (out && in && out != in) memmove(out, in, 0x100);
+    ret_x(c, 0);
+}
+HOST_OVERRIDE("_ZN2nn3nsd24GetEnvironmentIdentifierEPNS0_21EnvironmentIdentifierE", ov_nsd_environment);
+HOST_OVERRIDE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", ov_nsd_resolve);

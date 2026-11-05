@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/memory.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; GetInfo 29 to 33 of Switch 2 kernels, the alias region split with the VAMM region.
+// From metroid-prime-4-recomp runtime/memory.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; GetInfo 29 to 33 of Switch 2 kernels, the alias region split with the VAMM region; the Switch 2 application pool and a 12 GiB heap cap.
 // From fe3h-pc-recomp runtime/memory.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; SetHeapSize refuses a size it cannot grant with OutOfMemory; shadow reservations for virtual pools mapped from CPU-visible pools.
 // From totk-pc-recomp runtime/memory.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh); renamed to fe3h; MapMemory also takes stacks from module data (FE3H).
 // Adapted from MacNativeGames games/totk/runtime/services.c and loader.c @ b75be8c (MIT, Copyright (c) 2026
@@ -23,15 +23,20 @@
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
 #define LOW_SEARCH_FROM 0x100000000ull
-#define LOW_SIZE (6 * GiB)
+#define LOW_SIZE (14 * GiB)              // stack block + the heap region (HEAP_OFF + HEAP_CAP must fit)
 #define STACK_OFF 0x10000000ull
 #define STACK_SIZE 0x10000000ull
 #define HEAP_OFF (STACK_OFF + STACK_SIZE + 0x10000000ull)
-#define HEAP_CAP (4 * GiB)
+#define HEAP_CAP (12 * GiB)              // the Switch 2 game's arena: pool minus its fixed budgets, about 7 GiB
 #define ALIAS_SIZE (64 * GiB)
 #define ALIAS_ALIGN (4 * GiB)
 #define ALIAS_PAGES (ALIAS_SIZE / PAGE)
-#define DEFAULT_POOL 0xCD500000ull       // retail application pool
+// The application pool the game sizes its arena from (GetInfo 6/21). OoT is a Switch 2 title: its System/HeapSize/
+// HeapDef budgets (VirtualAddressMemory 2.7 GiB, ...) are subtracted from the pool, and with the Switch 1 retail pool
+// (0xCD500000, 3.3 GB) 387 MiB were left, too little for the Graphics module's 841 MiB heap (its creation returned NULL
+// and the shader archive table was never allocated). 9809 MiB is the application pool of the 12 GB memory arrangement
+// (Lichii k_system_control.cpp GetApplicationPoolSize, GPL-3.0, read for the number).
+#define DEFAULT_POOL (9809ull << 20)
 #define SYSTEM_RESOURCE_BUDGET (32ull << 20)
 #define MAX_STACK_MAPS 4096
 #define REEXEC_LIMIT 20
@@ -278,7 +283,7 @@ void mem_init(void) {
     uint64_t low = 0, alias = 0;
     for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= mods_lo && !low; at += GiB)
         if (reserve_at(at, LOW_SIZE, MEM_WRITE_WATCH)) low = at;
-    if (!low) reexec_or_fail("a 6 GiB stack and heap block below 2^39");
+    if (!low) reexec_or_fail("a 14 GiB stack and heap block below 2^39");
     for (uint64_t at = align_up(low + LOW_SIZE, ALIAS_ALIGN); at + ALIAS_SIZE <= mods_lo && !alias; at += ALIAS_ALIGN)
         if (reserve_at(at, ALIAS_SIZE, MEM_WRITE_WATCH)) alias = at;
     if (!alias) reexec_or_fail("a 64 GiB alias region below 2^39");
