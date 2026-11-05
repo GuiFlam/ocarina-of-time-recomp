@@ -93,7 +93,56 @@ Still MP4's: `ipc.c`'s SDK heap constructor address for `--probe-ipc` (fails: "s
 constructor"), `--probe-services`' override list (52 of MP4's host overrides match no import here), the installer
 (`installer/layout.py`, `make_release.py`). Not run yet: `tests/diff/func.py`, `tests/jumptables_check.py`.
 
-Next: past the boot checkpoint the game drives NVN2 (Phase 2).
+## Phase 2: the game past the checkpoint
+
+Started 2026-11-05 (`oot.exe --seconds N`; run it with `WSLENV=OOT_TRACE:OOT_VOLUME:... OOT_TRACE=gfx,fs ...`, as WSL's
+environment does not reach a Windows process otherwise; every `OOT_*` variable set in this session before that was
+silently ignored). Reached so far: the NVN device, queue, three memory pools, texture pool (33,068 descriptors), sampler
+pool, a 2560x1440 window with 3 textures, command buffer and buffers; HID; the SDK's VAMM mapping memory into the
+region GetInfo 29/30 gave it; 31 RomFS files read (heap definition, region mask, rom config, address table, resource
+size table, zstd dictionaries, the first packs, the RSDB tables, agl/gsys resources, the shader ApplicationPackage).
+Fixed on the way:
+
+- NVN2 ABI: after `nvnDeviceInitialize` the game requires `nvnDeviceGetInteger` API major 231 and minor >= 40
+  (`main+0x346c10c`) and otherwise abandons its graphics bring-up, leaving a global it later locks null (the first
+  crash past the checkpoint, `main+0x946a20`). `devinfo[0..1]` = 231.40; the other limits are still the Tegra X1's.
+- 32 NVN2 procs the bring-up loads (`runtime/nvn_api_nvn2.c`, `nvnDeviceGetFlags` in `nvn_api_core.c`, names in
+  `tools/gen_nvn_procs.py` NVN2_OOT): window HDR/colour space/acquire timeout, queue ray tracing memory and primary
+  queue, device fast-clear registration, the program builder (device at +0, sample shading at +8 in the game's
+  object). The game then asks for 174 more NVN2 names we lack (58 command buffer, 57 DLSS, 21 device, 20 program,
+  13 dirty tile map, 3 multisample state, 1 texture, 1 sampler pool; `build/logs/nvn-missing-loaded.txt`), none called
+  yet.
+- Six application cores (`kernel.c` NCORE, its CreateThread check, `svc.c` GetInfo 0 mask 0x3f): the game puts a thread
+  on core 5.
+- SDK 22's `clock_gettime`: nnmusl dispatches it through hooks (`sdk+0xaf0f8` installs them) pointing at
+  `nn::time::GetStandardSteadyClockCurrentTimespec` and the two user-clock getters, which read the time service's
+  shared-memory client the overridden `nn::time::Initialize` never sets up and fail with 0x74; libc++'s
+  `steady_clock::now` then throws a `system_error` on a worker thread. Overridden in `ov_system.c` from the host clocks.
+- Offline and without add-on content (`ov_oot.c`): `nn::aoc::CountAddOnContent`, `nn::nifm`, `nn::socket`, `nn::ssl`,
+  the network service account calls, `nn::pctl::CheckAgcPermissionUnderMinimumAge`, `nn::prepo::PlayReport::Send`;
+  `nn::vi::QueryDisplayCurrentRefreshRate` (60 Hz).
+- The crash dump prints the memory behind each register (`OOT_CRASH_PEEK=<bytes>` widens it); `OOT_BREAK_AT`,
+  `OOT_BREAK_BRIEF` and `OOT_BREAK_WATCH` from MP4 work and were the tools that got through the analysis below.
+
+**Open: the shader archive table is never allocated** (`main+0x3b528f0`, crash writing `[NULL+0x30]`). Established:
+the engine's module system (`main+0x3b5a2c0`) gives each of its 82 modules a heap sized from
+`System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs` (`Heaps/<name>/Size` in KiB, looked up by `main+0x5a2630`);
+18 module names have no entry (among them ゲームグラフィックスレンダリング, whose init loads the shader archives) and
+the policy virtual that could give them -1 is a constant 0 (`main+0x31f61c0`), so on hardware too such a module gets no
+heap of its own (`main+0x3b5b414`). The shader loader then allocates its `sead::Buffer` of 4 entries (`main+0x11a89f0`,
+count 4 read from the parsed `gsys.bgapkginfo` object at +0xb48, confirmed by the crash peek) through
+`main+0x3ea70(heap = NULL, 0xe0, 8)`, which falls back to the thread's current heap (`nn::os::GetTlsValue` of the
+HeapMgr's slot, then +0x88) or `[HeapMgr+8]`, and that returns NULL here, so `allocBuffer` leaves the buffer empty.
+`SetTlsValue` is called 626 times before this, always slot 1 and value 0 (`main+0x18fe20`, `+0x18fe48`);
+`[HeapMgr+8]` holds `main+0x4bd8678`. The next step is a break at `main+0x3ea70` that follows the TLS value and the
+heap it picks, to see which of the two is wrong and why (a host TLS/thread-object difference under SDK 22, or the root
+heap). Two quick hypotheses were tested and are not it: `devinfo[0x5A]` (0 stays), `OOT_APP_POOL` (9 GiB changes the
+heap layout, not this).
+
+Also met: the C++ unwinder's `nn::ro::detail::FindModuleHeader` reads past `subsdk0`'s image into the unmapped gap
+before `sdk` (`0x70050e0000`) when an exception is thrown; `QueryMemory` should report that gap as free so the walk
+skips it. Not fixed yet, as nothing throws any more.
+
 
 ## Shared core
 

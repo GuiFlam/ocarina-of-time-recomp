@@ -923,6 +923,31 @@ HOST_OVERRIDE("_ZN2nn4time13IsInitializedEv", ov_time_ready);
 HOST_OVERRIDE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", ov_current_time);
 HOST_OVERRIDE("_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", ov_current_time);
 HOST_OVERRIDE("_ZN2nn4time19StandardSteadyClock3nowEv", ov_steady_now);
+// SDK 22 (OoT): nnmusl's clock_gettime dispatches through hooks its clock-source setter (sdk+0xaf0f8) points at these
+// three nn::time functions. Lifted, they read the time service's shared memory client the overridden Initialize never
+// sets up and fail with 0x74; clock_gettime then fails with EAGAIN and libc++'s steady_clock::now throws a system_error
+// (seen on a game worker thread, 1.1.1). CLOCK_MONOTONIC from the host's monotonic clock, the user clocks from the host
+// wall clock with the monotonic clock's sub-second part.
+// Result GetStandardSteadyClockCurrentTimespec(timespec *), GetStandardUserSystemClockCurrentTimespec(timespec *),
+// GetAdjustableUserSystemClockCurrentTimespec(timespec *)
+static void ov_steady_timespec(Cpu *c) {
+    int64_t *ts = arg_p(c, 0);
+    if (!ts) { ret_x(c, TIME_R_INVALID); return; }
+    uint64_t ns = kern_now_ns();
+    ts[0] = (int64_t)(ns / 1000000000u);
+    ts[1] = (int64_t)(ns % 1000000000u);
+    ret_x(c, 0);
+}
+static void ov_user_timespec(Cpu *c) {
+    int64_t *ts = arg_p(c, 0);
+    if (!ts) { ret_x(c, TIME_R_INVALID); return; }
+    ts[0] = posix_now();
+    ts[1] = (int64_t)(kern_now_ns() % 1000000000u);
+    ret_x(c, 0);
+}
+HOST_OVERRIDE("_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec", ov_steady_timespec);
+HOST_OVERRIDE("_ZN2nn4time41GetStandardUserSystemClockCurrentTimespecEP8timespec", ov_user_timespec);
+HOST_OVERRIDE("_ZN2nn4time43GetAdjustableUserSystemClockCurrentTimespecEP8timespec", ov_user_timespec);
 HOST_OVERRIDE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
               ov_to_calendar);
 HOST_OVERRIDE("_ZN2nn4time19ToCalendarTimeInUtcERKNS0_9PosixTimeE", ov_to_calendar_utc);

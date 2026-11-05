@@ -190,7 +190,9 @@ static int pool_gpu_visible(const pool_t *o) { return !(o->flags & NVN_MEMORY_PO
 
 // ---------- Device
 static const int devinfo[] = {   // Tegra X1 values (nnheaders nvn_DeviceConstantsNX.h, measured on SMO)
-    [0x00] = 55, [0x01] = 15,    // ABI: TOTK main requires major 55, minor >= 15
+    // ABI: OoT 1.1.1 (NVN2, SDK 22) requires major 231 and minor >= 40 (main+0x346c10c, after nvnDeviceInitialize) and
+    // gives up its graphics bring-up otherwise; TotK's main required 55.15. The limits below are still the Tegra X1's.
+    [0x00] = 231, [0x01] = 40,
     [0x02] = 14, [0x03] = 65536, [0x04] = 256, [0x05] = 8, [0x06] = 16, [0x07] = 4, [0x08] = 16, [0x09] = 32,
     [0x0A] = 16, [0x0B] = 4, [0x0C] = 4, [0x0D] = 4, [0x0E] = 16, [0x0F] = 32, [0x10] = 32, [0x11] = 256, [0x12] = 256,
     [0x13] = 4, [0x14] = 8, [0x15] = 512, [0x16] = 256, [0x17] = 2, [0x18] = 256, [0x19] = 4096, [0x1A] = 131072,
@@ -221,6 +223,8 @@ NVN_API(nvnDeviceInitialize) {
 }
 // void nvnDeviceFinalize(NVNdevice *d)
 NVN_API(nvnDeviceFinalize) { ((dev_t_ *)arg_p(c, 0))->magic = 0; }
+// int nvnDeviceGetFlags(const NVNdevice *d) (NVN2): the NVNdeviceFlagBits the device was built with
+NVN_API(nvnDeviceGetFlags) { ret_x(c, ((dev_t_ *)arg_p(c, 0))->flags); }
 // void nvnDeviceGetInteger(const NVNdevice *d, NVNdeviceInfo what, int *out)
 NVN_API(nvnDeviceGetInteger) {
     unsigned w = (unsigned)arg_x(c, 1);

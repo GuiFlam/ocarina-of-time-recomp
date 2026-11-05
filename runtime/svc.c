@@ -120,7 +120,7 @@ static void get_info(Cpu *c, uint64_t pc) {
         return;
     }
     switch (id) {
-    case 0: v = 7; break;                       // core mask
+    case 0: v = 0x3f; break;                    // core mask: the Switch 2's six application cores (main.npdm 0..5; kernel.c NCORES)
     case 1: v = 0x0ffffffff0000000ull; break;   // priority mask
     case 8: v = 0; break;                       // debugger attached
     case 10: v = 0; break;                      // idle tick count

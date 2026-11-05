@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/main.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From metroid-prime-4-recomp runtime/main.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the crash dump shows the memory behind each register.
 // From fe3h-pc-recomp runtime/main.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only; adds MP4_BREAK_AT, a log at chosen lifted function entries.
 // From totk-pc-recomp runtime/main.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // oot.exe entry: reserves the guest address space, parses the command line and runs one mode.
@@ -459,6 +459,29 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
             rt_logf("  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
             if (next <= fp || next - fp > (64u << 20)) break;
             fp = next;
+        }
+        // The first 160 bytes behind each register that points at readable memory, as hex and text: the object or
+        // string the faulting code was working on. The registers are as of the last sync point (the latest call).
+        // OOT_CRASH_PEEK=<bytes> widens the peek (up to 16 KiB) to see a whole object.
+        const char *pk = cfg_get("OOT_CRASH_PEEK");
+        size_t peek = pk ? (size_t)strtoul(pk, NULL, 0) : 160;
+        if (peek < 16) peek = 16;
+        if (peek > 16384) peek = 16384;
+        for (int i = 0; i < 29; i++) {
+            uint64_t a = c->x[i];
+            if (a < 0x10000 || (a & 0xffff000000000000ull) || !readable(a, peek)) continue;
+            const uint8_t *m = (const uint8_t *)(uintptr_t)a;
+            rt_logf("  [x%-2d] at %#llx:\n", i, (unsigned long long)a);
+            for (size_t row = 0; row < peek; row += 32) {
+                char hex[32 * 3 + 1], txt[33];
+                size_t n = peek - row < 32 ? peek - row : 32;
+                for (size_t k = 0; k < n; k++) {
+                    snprintf(hex + k * 3, 4, "%02x ", m[row + k]);
+                    txt[k] = m[row + k] >= 0x20 && m[row + k] < 0x7f ? (char)m[row + k] : '.';
+                }
+                txt[n] = 0;
+                rt_logf("    +%04zx %s |%s|\n", row, hex, txt);
+            }
         }
     } else {
         rt_logf("  not on a guest thread\n");

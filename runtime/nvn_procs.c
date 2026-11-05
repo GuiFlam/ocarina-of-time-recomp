@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/nvn_procs.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
+// From metroid-prime-4-recomp runtime/nvn_procs.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied; up to 256 distinct unknown proc names are logged (OoT asks for many NVN2 ones).
 // From fe3h-pc-recomp runtime/nvn_procs.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 // From totk-pc-recomp runtime/nvn_procs.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 // NVN proc table. Every name the game's proc loader asks for gets a synthetic host
@@ -57,13 +57,13 @@ uint64_t nvn_proc_address(const char *name) {
     if (p) return p->addr;
     // Unknown names get NULL, as on hardware; each distinct one is logged once.
     static SRWLOCK lock = SRWLOCK_INIT;
-    static char seen[32][96];
+    static char seen[256][96];
     static int nseen;
     AcquireSRWLockExclusive(&lock);
     int fresh = 1;
     for (int i = 0; i < nseen; i++)
         if (!strncmp(seen[i], name, sizeof seen[i] - 1)) fresh = 0;
-    if (fresh && nseen < 32) {
+    if (fresh && nseen < 256) {
         strncpy(seen[nseen], name, sizeof seen[0] - 1);
         nseen++;
     } else {

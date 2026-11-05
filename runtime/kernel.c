@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp runtime/kernel.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the thread handle at TLR+0x110 for SDK 22's critical sections.
+// From metroid-prime-4-recomp runtime/kernel.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot; the thread handle at TLR+0x110 for SDK 22's critical sections; six application cores.
 // From fe3h-pc-recomp runtime/kernel.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; MP4's main thread stack size.
 // From totk-pc-recomp runtime/kernel.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), renamed to fe3h; FE3H's main thread stack size; FE3H_THREAD_DUMP.
 // Adapted from MacNativeGames games/totk/runtime/threads.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
@@ -33,7 +33,7 @@
 #define H_CUR_THREAD KERN_H_CURRENT_THREAD
 
 #define MAX_H 4096
-#define NCORE 3
+#define NCORE 6                          // application cores: the Switch 2's six (main.npdm 0..5; the Switch 1 had three)
 #define HOST_STACK (256ull << 20)        // reserved, committed on demand
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400            // "current thread object" at TLR+0x1F8 (d2r-mobile thread.c)
@@ -1774,7 +1774,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
     switch (imm) {
     case 0x08: {   // CreateThread(-> w1 handle; x1 entry, x2 arg, x3 stack top, w4 priority, w5 core)
         int prio = (int)x[4], core = (int)x[5];
-        if (!x[1] || !x[3] || prio < 28 || prio > 59 || core < -3 || core > 2) {
+        if (!x[1] || !x[3] || prio < 28 || prio > 59 || core < -3 || core >= NCORE) {
             x[0] = R_BAD_STATE;
             return 1;
         }

@@ -79,3 +79,86 @@ HOST_OVERRIDE("_ZN2nn2vi35SetLayerNextHdrContentGamutMetadataEPNS0_5LayerENS0_15
 HOST_OVERRIDE("_ZN2nn2vi39SetLayerNextHdrToSdrToneMappingMetadataEPNS0_5LayerENS0_14HdrToneMappingE", ov_vi_result_ok);
 HOST_OVERRIDE("_ZN2nn2vi52SetLayerNextHdrExtendedContentLuminanceRangeMetadataEPNS0_5LayerEtt", ov_vi_result_ok);
 HOST_OVERRIDE("_ZN2nn2vi52SetLayerNextHdrStandardContentLuminanceRangeMetadataEPNS0_5LayerEtt", ov_vi_result_ok);
+
+// Result QueryDisplayCurrentRefreshRate(RefreshRate *hz, bool *flag, const Display *): the SDK's RefreshRate is a u32
+// in Hz and it accepts 60 or 120 (nn::vi::detail::DefaultDisplay::QueryRefreshRate, sdk+0x5de520, 1.1.1); the bool's
+// meaning is not known (kept false). The host presents at the game's 60 Hz pace whatever the monitor does.
+static void ov_vi_refresh_rate(Cpu *c) {
+    uint32_t *hz = arg_p(c, 0); uint8_t *flag = arg_p(c, 1);
+    if (hz) *hz = 60;
+    if (flag) *flag = 0;
+    ret_x(c, 0);
+}
+HOST_OVERRIDE("_ZN2nn2vi30QueryDisplayCurrentRefreshRateEPNS0_11RefreshRateEPbPKNS0_7DisplayE", ov_vi_refresh_rate);
+
+// ==== Offline and without add-on content. The stubs for nn::aoc, nn::nifm and nn::account below are from
+// fe3h-pc-recomp runtime/ov_fe3h.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner),
+// which this game imports again (MP4 imported none of them); nn::socket and nn::ssl follow the same pattern for the
+// forms this game uses. OoT's framework init (main+0x3372a38, 1.1.1) counts the add-on content, and its NPLN client
+// brings up nifm, socket and ssl.
+// int nn::aoc::CountAddOnContent(): none (ov_system.c's ListAddOnContent lists none)
+static void ov_aoc_count(Cpu *c) { ret_x(c, 0); }
+HOST_OVERRIDE("_ZN2nn3aoc17CountAddOnContentEv", ov_aoc_count);
+
+// nn::nifm: every network request ends without a connection; the failure is a nifm-module result (module 110).
+#define NIFM_R_NO_CONNECTION (110u | (1u << 9))
+static void ov_nifm_ok(Cpu *c) { ret_x(c, 0); }                       // Result Initialize()
+static void ov_nifm_none(Cpu *c) { (void)c; }                         // void SubmitNetworkRequestAndWait(), CancelNetworkRequest()
+static void ov_nifm_unavailable(Cpu *c) { ret_x(c, 0); }              // bool IsNetworkAvailable()
+static void ov_nifm_fail(Cpu *c) { ret_x(c, NIFM_R_NO_CONNECTION); }  // Result GetCurrentProxySetting(out), HandleNetworkRequestErrorResult()
+HOST_OVERRIDE("_ZN2nn4nifm10InitializeEv", ov_nifm_ok);
+HOST_OVERRIDE("_ZN2nn4nifm18IsNetworkAvailableEv", ov_nifm_unavailable);
+HOST_OVERRIDE("_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv", ov_nifm_none);
+HOST_OVERRIDE("_ZN2nn4nifm20CancelNetworkRequestEv", ov_nifm_none);
+HOST_OVERRIDE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", ov_nifm_fail);
+HOST_OVERRIDE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", ov_nifm_fail);
+
+// nn::socket: Initialize succeeds without bsd:u; every call that would reach a socket fails with ENETDOWN.
+#define SOCKET_ENETDOWN 50
+static void ov_socket_ok(Cpu *c) { ret_x(c, 0); }                          // Result Initialize(config), Finalize()
+static void ov_socket_initialized(Cpu *c) { ret_x(c, 1); }                 // bool IsInitialized()
+static void ov_socket_fail(Cpu *c) { ret_x(c, (uint64_t)(int64_t)-1); }    // int / ssize_t calls: -1
+static void ov_socket_errno(Cpu *c) { ret_x(c, SOCKET_ENETDOWN); }         // int GetLastError()
+HOST_OVERRIDE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", ov_socket_ok);
+HOST_OVERRIDE("_ZN2nn6socket8FinalizeEv", ov_socket_ok);
+HOST_OVERRIDE("_ZN2nn6socket13IsInitializedEv", ov_socket_initialized);
+HOST_OVERRIDE("_ZN2nn6socket12GetLastErrorEv", ov_socket_errno);
+HOST_OVERRIDE("_ZN2nn6socket5CloseEi", ov_socket_fail);
+HOST_OVERRIDE("_ZN2nn6socket10SetSockOptEiNS0_5LevelENS0_6OptionEPKvj", ov_socket_fail);
+HOST_OVERRIDE("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", ov_socket_fail);
+HOST_OVERRIDE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", ov_socket_fail);
+HOST_OVERRIDE("_ZN2nn6socket11EventFdReadEiPm", ov_socket_fail);
+HOST_OVERRIDE("_ZN2nn6socket12EventFdWriteEim", ov_socket_fail);
+
+// nn::ssl: Initialize succeeds without ssl:s; making a context or reading the built-in certificates fails with an
+// ssl-module result (module 123). Context's constructor and destructor are local SDK code and stay lifted.
+#define SSL_R_UNAVAILABLE (123u | (1u << 9))
+static void ov_ssl_ok(Cpu *c) { ret_x(c, 0); }
+static void ov_ssl_fail(Cpu *c) { ret_x(c, SSL_R_UNAVAILABLE); }
+HOST_OVERRIDE("_ZN2nn3ssl10InitializeEv", ov_ssl_ok);
+HOST_OVERRIDE("_ZN2nn3ssl8FinalizeEv", ov_ssl_ok);
+HOST_OVERRIDE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", ov_ssl_fail);
+HOST_OVERRIDE("_ZN2nn3ssl7Context7DestroyEv", ov_ssl_ok);
+HOST_OVERRIDE("_ZN2nn3ssl7Context9ImportCrlEPmPKcj", ov_ssl_fail);
+HOST_OVERRIDE("_ZN2nn3ssl7Context15ImportClientPkiEPmPKcS4_jj", ov_ssl_fail);
+HOST_OVERRIDE("_ZN2nn3ssl7Context15ImportServerPkiEPmPKcjNS0_17CertificateFormatE", ov_ssl_fail);
+HOST_OVERRIDE("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", ov_ssl_fail);
+HOST_OVERRIDE("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS0_26BuiltInCertificateInfoBaseEPhjPNS0_15CaCertificateIdEj", ov_ssl_fail);
+
+// nn::account network service account: none; the calls that would make or fetch an online identity fail with an
+// account-module result (module 124). The local user comes from ov_system.c.
+#define ACCOUNT_R_NSA_UNAVAILABLE (124u | (1u << 9))
+static void ov_nsa_fail(Cpu *c) { ret_x(c, ACCOUNT_R_NSA_UNAVAILABLE); }
+HOST_OVERRIDE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", ov_nsa_fail);
+HOST_OVERRIDE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", ov_nsa_fail);
+HOST_OVERRIDE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", ov_nsa_fail);
+HOST_OVERRIDE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", ov_nsa_fail);
+
+// Result nn::pctl::CheckAgcPermissionUnderMinimumAge(const account::Uid &): no parental controls (ov_system.c), permitted
+static void ov_pctl_ok(Cpu *c) { ret_x(c, 0); }
+HOST_OVERRIDE("_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE", ov_pctl_ok);
+
+// Result nn::prepo::PlayReport::Send(const account::Uid &): play reports stay local (ov_system.c); building one is
+// local SDK code and runs lifted
+static void ov_prepo_send(Cpu *c) { ret_x(c, 0); }
+HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", ov_prepo_send);

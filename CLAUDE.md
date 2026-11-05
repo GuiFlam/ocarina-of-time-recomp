@@ -37,8 +37,9 @@ now), `--selftest` and the host probes pass, and `--boot` passes to the first `n
 Phase 1 lists the Switch 2 and SDK 22 differences met on the way (GetInfo 29-33, the thread handle at TLR+0x110, the
 PACIBSP prologue, nn::oe and nn::vi additions in `ov_oot.c`, `nv::InitializeGraphics(0, 0)`). Extraction:
 `python3.14 tools/extract_nup.py --verify` (needs `toolchain/zbic/nso_unzbic` from `tools/build_zbic.py`) writes
-`build/extracted/v131072/{exefs,romfs,extraction-manifest.json}`. Logs of runs go to `build/logs/`. Next: Phase 2, the
-game past the checkpoint (`oot.exe --seconds N`), which drives NVN2.
+`build/extracted/v131072/{exefs,romfs,extraction-manifest.json}`. Logs of runs go to `build/logs/`. Phase 2 (the game
+past the checkpoint, `oot.exe --seconds 8`) reaches the module system's init after a full NVN bring-up and 31 file
+reads; the open crash and what is known about it are in `docs/plan.md` ("Open: the shader archive table").
 
 ## Environment notes
 
@@ -46,4 +47,8 @@ game past the checkpoint (`oot.exe --seconds N`), which drives NVN2.
   Clang through interop, as in MP4 (`.venv-win/Scripts/python.exe tools/build_game.py`); make the venvs from
   `tools/requirements.txt`.
 - The dump is 25 GB on the Windows desktop; `config.local.toml` points at it in place rather than copying it.
+- `oot.exe` is a Windows program run from WSL through interop: WSL environment variables do NOT reach it unless named
+  in `WSLENV`. Always run it as `WSLENV=OOT_TRACE:OOT_VOLUME:OOT_APP_POOL OOT_TRACE=gfx build/v131072/oot.exe ...`
+  (add every `OOT_*` variable used); without it the variable is silently ignored. Half a day of traces in this
+  session were empty for this reason.
 - Never commit without the content check passing; never bypass the hook.
