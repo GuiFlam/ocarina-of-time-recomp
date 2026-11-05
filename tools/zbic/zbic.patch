@@ -1,0 +1,49 @@
+diff --git a/lib/common/entropy_common.c b/lib/common/entropy_common.c
+index e2173af..7f6f922 100644
+--- a/lib/common/entropy_common.c
++++ b/lib/common/entropy_common.c
+@@ -38,9 +38,20 @@ const char* HUF_getErrorName(size_t code) { return ERR_getErrorName(code); }
+ /*-**************************************************************
+ *  FSE NCount encoding-decoding
+ ****************************************************************/
++#ifdef ZSTD_ZBIC
++/* ZBIC (ocarina-of-time-recomp tools/zbic/zbic_ncount.c): the one table header form that differs from zstd's. */
++size_t ZBIC_readNCount(short* normalizedCounter, unsigned* maxSVPtr, unsigned* tableLogPtr,
++                       const void* headerBuffer, size_t hbSize);
++#endif
++
+ FORCE_INLINE_TEMPLATE
+ size_t FSE_readNCount_body(short* normalizedCounter, unsigned* maxSVPtr, unsigned* tableLogPtr,
+                            const void* headerBuffer, size_t hbSize)
++#ifdef ZSTD_ZBIC
++{
++    return ZBIC_readNCount(normalizedCounter, maxSVPtr, tableLogPtr, headerBuffer, hbSize);
++}
++#else
+ {
+     const BYTE* const istart = (const BYTE*) headerBuffer;
+     const BYTE* const iend = istart + hbSize;
+@@ -185,6 +196,7 @@ size_t FSE_readNCount_body(short* normalizedCounter, unsigned* maxSVPtr, unsigne
+     ip += (bitCount+7)>>3;
+     return ip-istart;
+ }
++#endif
+ 
+ /* Avoids the FORCE_INLINE of the _body() function. */
+ static size_t FSE_readNCount_body_default(
+diff --git a/lib/zstd.h b/lib/zstd.h
+index b8c0644..89fe486 100644
+--- a/lib/zstd.h
++++ b/lib/zstd.h
+@@ -139,7 +139,11 @@ ZSTDLIB_API const char* ZSTD_versionString(void);
+  ***************************************/
+ 
+ /* All magic numbers are supposed read/written to/from files/memory using little-endian convention */
++#ifdef ZSTD_ZBIC
++#define ZSTD_MAGICNUMBER            0x4349425A    /* "ZBIC": zstd frames with ZBIC table headers */
++#else
+ #define ZSTD_MAGICNUMBER            0xFD2FB528    /* valid since v0.8.0 */
++#endif
+ #define ZSTD_MAGIC_DICTIONARY       0xEC30A437    /* valid since v0.7.0 */
+ #define ZSTD_MAGIC_SKIPPABLE_START  0x184D2A50    /* all 16 values, from 0x184D2A50 to 0x184D2A5F, signal the beginning of a skippable frame */
+ #define ZSTD_MAGIC_SKIPPABLE_MASK   0xFFFFFFF0

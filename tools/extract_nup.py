@@ -3,12 +3,16 @@
 one file) and list or extract its packages.
 
     python3.14 tools/extract_nup.py [--config config.local.toml] --list
-    python3.14 tools/extract_nup.py [--config config.local.toml] [--package N] [--exefs-only] [--verify]
+    python3.14 tools/extract_nup.py [--config config.local.toml] [--package N] [--exefs-only | --romfs-only] [--verify]
 
 Extraction writes the package's ExeFS to build/extracted/v<version>/exefs and its RomFS, as loose files, to
 build/extracted/v<version>/romfs_files, with nup.json beside them (title id, version, kind, title name, display
 version, and every file's path, size and SHA-256). The NPDM from the package's metadata goes to exefs/main.npdm when the
 ExeFS tree lacks one. The default package is the highest-versioned update, else the base.
+
+Switch 2 modules whose segments are ZBIC (NSO flag bit 7) are rewritten as plain NSOs, which recomp/nso.py reads, by
+toolchain/zbic/nso_unzbic (tools/build_zbic.py); the module as stored goes to exefs-zbic/, and each rewritten
+segment is checked against the SHA-256 in its NSO header.
 
 Needs Python 3.14 or later for the standard library's compression.zstd; no keys are needed, as the container holds
 the files decrypted.
@@ -35,6 +39,7 @@ import json
 import os
 import struct
 import sys
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -44,6 +49,7 @@ except ImportError:
     zstd = None
 
 ROOT = Path(__file__).resolve().parent.parent
+UNZBIC = ROOT / 'toolchain' / 'zbic' / ('nso_unzbic.exe' if os.name == 'nt' else 'nso_unzbic')
 NO_DIR = 0xFFFFFFFF
 KINDS = {0: 'base', 1: 'update', 2: 'addon'}
 META_NAMES = {1: 'npdm', 3: 'icon', 4: 'display_version', 5: 'title_name', 6: 'publisher', 8: 'source_dump',
@@ -182,6 +188,29 @@ class Nup:
             require(h.digest() == rec['sha256'], f'{out_path.name}: SHA-256 mismatch')
 
 
+def unzbic_exefs(exefs):
+    """Rewrite every ZBIC module of an extracted ExeFS as a plain NSO, keeping the stored one in exefs-zbic/."""
+    stored_dir = exefs.parent / 'exefs-zbic'
+    for path in sorted(exefs.iterdir()):
+        head = path.read_bytes()[:0x10] if path.is_file() else b''
+        if head[:4] != b'NSO0' or not struct.unpack_from('<I', head, 0xC)[0] & 0x80:
+            continue
+        require(UNZBIC.is_file(), f'{path.name} is ZBIC-compressed: build {UNZBIC} first (tools/build_zbic.py)')
+        stored_dir.mkdir(exist_ok=True)
+        stored = stored_dir / path.name
+        os.replace(path, stored)
+        done = subprocess.run([str(UNZBIC), str(stored), str(path)], capture_output=True, text=True)
+        require(done.returncode == 0, f'{path.name}: {done.stderr.strip()}')
+        raw = path.read_bytes()
+        flags = struct.unpack_from('<I', raw, 0xC)[0]
+        for i in range(3):
+            off, _, size = struct.unpack_from('<III', raw, 0x10 + 0x10 * i)
+            if flags >> (3 + i) & 1:
+                require(hashlib.sha256(raw[off:off + size]).digest() == raw[0xA0 + 0x20 * i:0xC0 + 0x20 * i],
+                        f'{path.name}: segment {i} SHA-256 mismatch after ZBIC decompression')
+        print(f'exefs/{path.name}: ZBIC decompressed, segment hashes verified (stored module in exefs-zbic/)')
+
+
 def load_config(path):
     with open(path, 'rb') as f:
         return tomllib.load(f)
@@ -219,7 +248,9 @@ def main():
     ap.add_argument('--input', help='the .nup (default: [input] base from the config)')
     ap.add_argument('--list', action='store_true', help='list the packages and ExeFS files, extract nothing')
     ap.add_argument('--package', type=int, help='package index from --list')
-    ap.add_argument('--exefs-only', action='store_true')
+    group = ap.add_mutually_exclusive_group()
+    group.add_argument('--exefs-only', action='store_true')
+    group.add_argument('--romfs-only', action='store_true')
     ap.add_argument('--verify', action='store_true', help='check every extracted file against its SHA-256')
     ap.add_argument('--out', help='output folder (default build/extracted/v<version>)')
     args = ap.parse_args()
@@ -242,7 +273,7 @@ def main():
                     **{k: v for k, v in pkg.items() if k not in ('meta', 'root_dir', 'exefs_dir', 'romfs_dir')},
                     'title_name': pkg['meta'].get('title_name'), 'display_version': pkg['meta'].get('display_version'),
                     'files': {}}
-        trees = [('exefs', pkg['exefs_dir'], out / 'exefs')]
+        trees = [] if args.romfs_only else [('exefs', pkg['exefs_dir'], out / 'exefs')]
         if not args.exefs_only:
             trees.append(('romfs', pkg['romfs_dir'], out / 'romfs_files'))
         for label, d, dest in trees:
@@ -259,11 +290,19 @@ def main():
                 manifest['files'][f'{label}/{path}'] = {'size': rec['size'], 'sha256': rec['sha256'].hex()}
                 if n % 500 == 0 or n == len(entries):
                     print(f'{label}: {n}/{len(entries)} files, {done / 2**30:.2f}/{total / 2**30:.2f} GiB', flush=True)
-        npdm = pkg['meta'].get('npdm')
-        if npdm and pkg['exefs_dir'] is not None and not (out / 'exefs' / 'main.npdm').exists():
-            (out / 'exefs' / 'main.npdm').write_bytes(npdm)
-            print('exefs/main.npdm written from the package metadata')
-        (out / 'nup.json').write_text(json.dumps(manifest, indent=1))
+        if not args.romfs_only and pkg['exefs_dir'] is not None:
+            npdm = pkg['meta'].get('npdm')
+            if npdm and not (out / 'exefs' / 'main.npdm').exists():
+                (out / 'exefs' / 'main.npdm').write_bytes(npdm)
+                print('exefs/main.npdm written from the package metadata')
+            unzbic_exefs(out / 'exefs')
+        # A partial run keeps the other tree's entries of an earlier manifest.
+        old = out / 'nup.json'
+        if (args.exefs_only or args.romfs_only) and old.is_file():
+            kept = json.loads(old.read_text()).get('files', {})
+            prefix = 'romfs/' if args.exefs_only else 'exefs/'
+            manifest['files'] = {**{k: v for k, v in kept.items() if k.startswith(prefix)}, **manifest['files']}
+        old.write_text(json.dumps(manifest, indent=1))
         print(f'wrote {out}')
     except NupError as e:
         print(f'extract_nup: {e}', file=sys.stderr)
