@@ -37,9 +37,12 @@ now), `--selftest` and the host probes pass, and `--boot` passes to the first `n
 Phase 1 lists the Switch 2 and SDK 22 differences met on the way (GetInfo 29-33, the thread handle at TLR+0x110, the
 PACIBSP prologue, nn::oe and nn::vi additions in `ov_oot.c`, `nv::InitializeGraphics(0, 0)`). Extraction:
 `python3.14 tools/extract_nup.py --verify` (needs `toolchain/zbic/nso_unzbic` from `tools/build_zbic.py`) writes
-`build/extracted/v131072/{exefs,romfs,extraction-manifest.json}`. Logs of runs go to `build/logs/`. Phase 2 (the game
-past the checkpoint, `oot.exe --seconds 8`) reaches the module system's init after a full NVN bring-up and 31 file
-reads; the open crash and what is known about it are in `docs/plan.md` ("Open: the shader archive table").
+`build/extracted/v131072/{exefs,romfs,extraction-manifest.json}`. Logs of runs go to `build/logs/`. Phase 2 (`oot.exe
+--seconds 15`) runs the whole start-up without a crash: audio, saves, NPLN offline, 3,661 shader programs, three frames
+presented; it then stalls because no SM86 shader translates (`docs/plan.md`, "Open: shader translation"), which is
+Phase 3. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the crash dump's memory
+and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`), `build/logs/nvn-proc-got.json`
+(GOT slot -> proc name, from the loader at `main+0x129e290`).
 
 ## Environment notes
 

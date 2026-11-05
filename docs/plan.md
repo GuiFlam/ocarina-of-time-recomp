@@ -124,20 +124,28 @@ Fixed on the way:
 - The crash dump prints the memory behind each register (`OOT_CRASH_PEEK=<bytes>` widens it); `OOT_BREAK_AT`,
   `OOT_BREAK_BRIEF` and `OOT_BREAK_WATCH` from MP4 work and were the tools that got through the analysis below.
 
-**Open: the shader archive table is never allocated** (`main+0x3b528f0`, crash writing `[NULL+0x30]`). Established:
-the engine's module system (`main+0x3b5a2c0`) gives each of its 82 modules a heap sized from
-`System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs` (`Heaps/<name>/Size` in KiB, looked up by `main+0x5a2630`);
-18 module names have no entry (among them ゲームグラフィックスレンダリング, whose init loads the shader archives) and
-the policy virtual that could give them -1 is a constant 0 (`main+0x31f61c0`), so on hardware too such a module gets no
-heap of its own (`main+0x3b5b414`). The shader loader then allocates its `sead::Buffer` of 4 entries (`main+0x11a89f0`,
-count 4 read from the parsed `gsys.bgapkginfo` object at +0xb48, confirmed by the crash peek) through
-`main+0x3ea70(heap = NULL, 0xe0, 8)`, which falls back to the thread's current heap (`nn::os::GetTlsValue` of the
-HeapMgr's slot, then +0x88) or `[HeapMgr+8]`, and that returns NULL here, so `allocBuffer` leaves the buffer empty.
-`SetTlsValue` is called 626 times before this, always slot 1 and value 0 (`main+0x18fe20`, `+0x18fe48`);
-`[HeapMgr+8]` holds `main+0x4bd8678`. The next step is a break at `main+0x3ea70` that follows the TLS value and the
-heap it picks, to see which of the two is wrong and why (a host TLS/thread-object difference under SDK 22, or the root
-heap). Two quick hypotheses were tested and are not it: `devinfo[0x5A]` (0 stays), `OOT_APP_POOL` (9 GiB changes the
-heap layout, not this).
+**Resolved (2026-11-05): the shader archive table was never allocated** because the Graphics module's 841 MiB heap
+could not be created: the game sizes its arena from `TotalMemorySize` minus the HeapDef budgets (VirtualAddressMemory
+2.7 GiB, ...), and the Switch 1 pool left 387 MiB. The 12 GB arrangement's application pool (9809 MiB, Lichii
+`k_system_control.cpp`) is the default now (`memory.c`, with a 12 GiB heap cap), and the arena is 6.75 GiB. Found with
+`OOT_BREAK_AT` on the heap-size lookup (`main+0x5a2630`), the allocator (`main+0x3ea70`) and the heap creation
+(`main+0x9bf710`), the TLS dump the crash handler now prints, and `OOT_BREAK_WATCH` on the HeapMgr.
+
+**Then, to a 15 s run without a crash (2026-11-05):** the NVN2 program path (`nvnProgramBuilderSetShaders`,
+`nvnProgramInitializeFromBuilder`; 3,661 programs set), logging stubs for every other NVN2 proc the game loads
+(`runtime/nvn_procs_stub.inc`; a stub logs its first calls and returns 0, and the log shows which are used: so far only
+`nvnCommandBufferSetRecordingMode`, `SetComputeWorkloadPriority`, `SetComputeOverlapMode`), SDK 22's audio services
+(`aud:u` hands out the renderer manager, `auddmg:u` lists no virtual devices, IAudioDevice 15 to 21), the public
+six-axis and vibration forms and the Switch 2 `Jcms`/`Nmouse`/sensor fusion stubs, the `nnsocket`/`nnssl` C APIs
+offline with working local descriptors (gRPC's event engine needs a wakeup fd even offline), `nn::nsd` ("lp1"),
+`MountRom(const char *)` and several mount names for the one image (`_npln`), `WaitForAddress` type 3
+(`WaitIfEqual64`) and `SwitchToFiber(nullptr)` for SDK 22's libc++ and `nn::async`. The run: 82 threads, 10,988 IPC
+messages, 1,485 file opens, the audio renderer at 48 kHz (12,002 renders in 60 s, none late), three frames presented at
+2560x1440, then a stall in the third frame.
+
+**Open: shader translation.** Every program fails with "bad control section" (`gfx_shader.c`): the SM86 control block is
+224 to 280 bytes against Maxwell's 0x880, and the code is Ampere. Draws with failed programs are skipped, and the game
+waits for GPU work that never completes. This is Phase 3: an SM86 front end (see "NVN2 survey").
 
 Also met: the C++ unwinder's `nn::ro::detail::FindModuleHeader` reads past `subsdk0`'s image into the unmapped gap
 before `sdk` (`0x70050e0000`) when an exception is thrown; `QueryMemory` should report that gap as free so the walk
