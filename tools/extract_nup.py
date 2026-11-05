@@ -5,9 +5,11 @@ one file) and list or extract its packages.
     python3.14 tools/extract_nup.py [--config config.local.toml] --list
     python3.14 tools/extract_nup.py [--config config.local.toml] [--package N] [--exefs-only | --romfs-only] [--verify]
 
-Extraction writes the package's ExeFS to build/extracted/v<version>/exefs and its RomFS, as loose files, to
-build/extracted/v<version>/romfs_files, with nup.json beside them (title id, version, kind, title name, display
-version, and every file's path, size and SHA-256). The NPDM from the package's metadata goes to exefs/main.npdm when the
+Extraction writes the package's ExeFS to build/extracted/v<version>/exefs and its RomFS as the image the runtime reads
+(runtime/romfs.c), build/extracted/v<version>/romfs/romfs.bin and index.json: the files back to back in path order,
+which tools/romfs_index.py indexes like an extracted Switch 1 RomFS. --romfs-loose writes loose files to romfs_files/
+instead. nup.json beside them records the package (title id, version, kind, title name, display version) and every
+loose file's path, size and SHA-256. The NPDM from the package's metadata goes to exefs/main.npdm when the
 ExeFS tree lacks one. The default package is the highest-versioned update, else the base.
 
 Switch 2 modules whose segments are ZBIC (NSO flag bit 7) are rewritten as plain NSOs, which recomp/nso.py reads, by
@@ -155,37 +157,75 @@ class Nup:
                 rec = self.files[c - len(self.dirs)]
                 yield prefix + rec['name'], rec
 
+    def stream_file(self, rec, out, name, verify, also=None):
+        """Write one member's contents to the open file out; also, if given, is a hash fed the same bytes."""
+        h = hashlib.sha256() if verify else None
+        if rec['size'] == 0:
+            pass
+        elif rec['codec'] == 0:
+            self.f.seek(rec['offset'])
+            left = rec['size']
+            while left:
+                chunk = self.f.read(min(left, 64 << 20))
+                require(chunk, 'short read')
+                out.write(chunk)
+                h and h.update(chunk)
+                also and also.update(chunk)
+                left -= len(chunk)
+        else:
+            require(zstd is not None, 'zstd members need Python 3.14+ (compression.zstd)')
+            self.f.seek(rec['offset'])
+            dec = zstd.ZstdDecompressor()
+            left, written = rec['extent'], 0
+            while left:
+                chunk = self.f.read(min(left, 16 << 20))
+                require(chunk, 'short read')
+                left -= len(chunk)
+                data = dec.decompress(chunk)
+                out.write(data)
+                h and h.update(data)
+                also and also.update(data)
+                written += len(data)
+            require(written == rec['size'], f'{name}: decompressed {written} bytes, expected {rec["size"]}')
+        if verify and rec['size']:
+            require(h.digest() == rec['sha256'], f'{name}: SHA-256 mismatch')
+
     def extract_file(self, rec, out_path, verify):
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        h = hashlib.sha256()
         with open(out_path, 'wb') as out:
-            if rec['size'] == 0:
-                pass
-            elif rec['codec'] == 0:
-                self.f.seek(rec['offset'])
-                left = rec['size']
-                while left:
-                    chunk = self.f.read(min(left, 64 << 20))
-                    require(chunk, 'short read')
-                    out.write(chunk)
-                    h.update(chunk)
-                    left -= len(chunk)
-            else:
-                require(zstd is not None, 'zstd members need Python 3.14+ (compression.zstd)')
-                self.f.seek(rec['offset'])
-                dec = zstd.ZstdDecompressor()
-                left, written = rec['extent'], 0
-                while left:
-                    chunk = self.f.read(min(left, 16 << 20))
-                    require(chunk, 'short read')
-                    left -= len(chunk)
-                    data = dec.decompress(chunk)
-                    out.write(data)
-                    h.update(data)
-                    written += len(data)
-                require(written == rec['size'], f'{out_path.name}: decompressed {written} bytes, expected {rec["size"]}')
-        if verify and rec['size']:
-            require(h.digest() == rec['sha256'], f'{out_path.name}: SHA-256 mismatch')
+            self.stream_file(rec, out, out_path.name, verify)
+
+    def write_romfs_image(self, dir_index, dest, verify, version):
+        """The RomFS as runtime/romfs.c reads it: dest/romfs.bin, every file back to back in the byte order of its
+        path (the index's order, tools/romfs_index.py), and dest/index.json with each file's offset and size and the
+        image's size and SHA-256. The status is "pass" only when every file was checked against its stored SHA-256
+        (verify). Written to .part names and renamed at the end, so an interrupted run leaves no image that looks
+        whole."""
+        entries = sorted(self.walk(dir_index), key=lambda e: e[0].encode())
+        dest.mkdir(parents=True, exist_ok=True)
+        image, part = dest / 'romfs.bin', dest / 'romfs.bin.part'
+        total = sum(r['size'] for _, r in entries)
+        whole = hashlib.sha256()
+        files, offset = [], 0
+        with open(part, 'wb') as out:
+            for n, (path, rec) in enumerate(entries, 1):
+                require('..' not in path.split('/') and not path.startswith('/'), f'unsafe path {path!r}')
+                self.stream_file(rec, out, path, verify, whole)
+                files.append({'path': path, 'offset': offset, 'size': rec['size']})
+                offset += rec['size']
+                if n % 2000 == 0 or n == len(entries):
+                    print(f'romfs image: {n}/{len(entries)} files, {offset / 2**30:.2f}/{total / 2**30:.2f} GiB',
+                          flush=True)
+        require(offset == total == part.stat().st_size, 'image size differs from the sum of its files')
+        index = {'status': 'pass' if verify else 'unverified', 'version': version, 'source': self.path.name,
+                 'romfs_size': total, 'romfs_sha256': whole.hexdigest(),
+                 'integrity': ('every file checked against its SHA-256 in the NUP TOC, whose own SHA-256 the superblock '
+                               'holds') if verify else 'not checked (run with --verify)',
+                 'files': files}
+        (dest / 'index.json.part').write_text(json.dumps(index), encoding='utf-8')
+        os.replace(part, image)
+        os.replace(dest / 'index.json.part', dest / 'index.json')
+        return len(files), total
 
 
 def unzbic_exefs(exefs):
@@ -252,6 +292,8 @@ def main():
     group.add_argument('--exefs-only', action='store_true')
     group.add_argument('--romfs-only', action='store_true')
     ap.add_argument('--verify', action='store_true', help='check every extracted file against its SHA-256')
+    ap.add_argument('--romfs-loose', action='store_true',
+                    help='write the RomFS as loose files in romfs_files/ instead of the romfs/ image the runtime reads')
     ap.add_argument('--out', help='output folder (default build/extracted/v<version>)')
     args = ap.parse_args()
 
@@ -274,7 +316,7 @@ def main():
                     'title_name': pkg['meta'].get('title_name'), 'display_version': pkg['meta'].get('display_version'),
                     'files': {}}
         trees = [] if args.romfs_only else [('exefs', pkg['exefs_dir'], out / 'exefs')]
-        if not args.exefs_only:
+        if not args.exefs_only and args.romfs_loose:
             trees.append(('romfs', pkg['romfs_dir'], out / 'romfs_files'))
         for label, d, dest in trees:
             if d is None:
@@ -290,6 +332,12 @@ def main():
                 manifest['files'][f'{label}/{path}'] = {'size': rec['size'], 'sha256': rec['sha256'].hex()}
                 if n % 500 == 0 or n == len(entries):
                     print(f'{label}: {n}/{len(entries)} files, {done / 2**30:.2f}/{total / 2**30:.2f} GiB', flush=True)
+        if not args.exefs_only and not args.romfs_loose:
+            if pkg['romfs_dir'] is None:
+                print('romfs: none in this package')
+            else:
+                n, size = nup.write_romfs_image(pkg['romfs_dir'], out / 'romfs', args.verify, pkg['version'])
+                print(f'romfs: {n} files in {out / "romfs" / "romfs.bin"} ({size / 2**30:.2f} GiB)')
         if not args.romfs_only and pkg['exefs_dir'] is not None:
             npdm = pkg['meta'].get('npdm')
             if npdm and not (out / 'exefs' / 'main.npdm').exists():

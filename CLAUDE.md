@@ -36,11 +36,12 @@ Phase 0 (`docs/plan.md`). The `.nup` is a plain container (no keys needed): `pyt
 then `--exefs-only --verify` wrote `build/extracted/v131072/exefs` (title id `0400486024DEC000`, v131072, display
 1.1.1). `main` is ZBIC-compressed (NSO flag bit 7): `python3 tools/build_zbic.py` builds our decoder (upstream zstd plus
 `tools/zbic/`), and `extract_nup.py` then writes plain NSOs to `exefs/` (stored ones in `exefs-zbic/`). `--romfs-only`
-leaves the ExeFS alone. The lifter now takes the
+leaves the ExeFS alone. The RomFS goes into `romfs/romfs.bin` + `index.json`, the image `runtime/romfs.c` already
+reads (`--romfs-loose` for loose files). The lifter now takes the
 Switch 2's ARMv8.3 code (PAC branches and ops, `LDAPR`, `UDOT`, FP16 `FNEG`): 0 unsupported instructions in every
 module, differential tests pass. Survey C in `generated/survey-v131072/`. Run the lifter tools with a Python 3.12 venv
 holding `tools/requirements.txt` (MP4's `.venv` works for now) and the differential tests with a Windows venv
-(MP4's `.venv-win`). Next: RomFS serving, NVN2.
+(MP4's `.venv-win`). Next: NVN2 and the game-bound tables.
 
 ## Environment notes
 

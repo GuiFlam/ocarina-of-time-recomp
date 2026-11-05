@@ -29,7 +29,10 @@ Differential tests (Windows venv): `tests/diff/lift.py` over this game, 72,000 e
 
 Next:
 
-1. Extract the RomFS (24 GiB, loose files) and decide how the runtime serves it: a loose-file mode in `romfs.c` instead of MP4's `romfs.bin` image.
+1. RomFS: `runtime/romfs.c` reads one image through an index of (offset, size, path) and never parses the RomFS
+   format, so `tools/extract_nup.py` writes the NUP's loose files back to back, in the index's path order, into
+   `romfs/romfs.bin` with the `index.json` `tools/romfs_index.py` reads (status "pass" when every file was checked
+   against its SHA-256). No runtime change; one file instead of 186,587 opens. `--romfs-loose` still writes loose files.
 2. Done: ZBIC without GPL code (see the table).
 3. The SDK and NVN versions; the NVN2 entry points `main` imports (`tools/survey_imports.py`).
 4. Rewrite the game-bound tables and reach a build (Phase 1).
