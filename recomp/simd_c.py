@@ -1,4 +1,4 @@
-# From metroid-prime-4-recomp recomp/simd_c.py @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
+# From metroid-prime-4-recomp recomp/simd_c.py @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied, with SDOT/UDOT (vector) and FP16 FABS/FNEG (vector) added for Switch 2 code.
 # From fe3h-pc-recomp recomp/simd_c.py @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 # From totk-pc-recomp recomp/simd_c.py @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 # Adapted from LAS Recomp tools/simd_c.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
@@ -7,7 +7,7 @@
 Every encoding is decoded here at lift time and turned into C over the Cpu struct, calling the static
 inline helpers in runtime/simd.h with constant fields (sizes, lanes, ops), so clang folds the helpers'
 switches. Covers ARMv8.0-A + Crypto + CRC32 (the Switch's Cortex-A57); unallocated or later-architecture
-encodings (FP16 arithmetic, RDM, dot product, FCMA, JSCVT, ...) raise Unsupported.
+encodings (FP16 arithmetic, RDM, FCMA, JSCVT, ...) raise Unsupported, except the few forms Switch 2 code needs (three_same_extra, misc2_fp16).
 """
 from lifter import COND_NAMES, Unsupported, W, X, XS, bits, extend_expr, hx, set_reg, sext
 
@@ -171,6 +171,10 @@ class SimdC:
                 return self.misc2(w)
             if not (op1 & 2) and (op2 & 7) == 6 and (op3 & 0b110000011) == 0b10:
                 return self.across(w)
+            if not (op1 & 2) and not (op2 & 4) and (op3 & 0b000100001) == 0b000100001:
+                return self.three_same_extra(w)
+            if not (op1 & 2) and op2 == 0b1111 and (op3 & 0b110000011) == 0b10:
+                return self.misc2_fp16(w)
             if op1 == 2 and op2 == 0 and (op3 & 1):
                 return self.modimm(w)
             if op1 == 2 and op2 and (op3 & 1):
@@ -327,6 +331,30 @@ class SimdC:
         return f'sv_tbl(c, {Q}, {ln}, {op}, {d}, {n}, {m});'
 
     # ------------------------------------------------------------ three same
+
+    def three_same_extra(self, w):
+        """AdvSIMD three same extra. Only SDOT/UDOT (vector, ARMv8.2 DotProd), which OoT's main uses: each 32-bit lane
+        of Vd adds the four byte products of the matching bytes of Vn and Vm."""
+        Q, U, sz, m, opc, n, d = (bits(w, 30, 1), bits(w, 29, 1), bits(w, 22, 2), bits(w, 16, 5), bits(w, 11, 4),
+                                  bits(w, 5, 5), bits(w, 0, 5))
+        if opc != 0b0010 or sz != 2:
+            raise Unsupported(f'3same extra {w:08x}')
+        T, P = ('vu8', 'uint32_t') if U else ('vs8', 'int32_t')
+        ne = 4 if Q else 2
+        terms = lambda i: ' + '.join(f'({P})a[{4 * i + j}] * ({P})b[{4 * i + j}]' for j in range(4))
+        sums = ' '.join(f'r[{i}] += (uint32_t)({terms(i)});' for i in range(ne))
+        return (f'{{ {T} a = {VR(T, n)}, b = {VR(T, m)}; vu32 r = {VR("vu32", d)}; {sums} '
+                f'{VWr("vu32", Q, d, "r")} }}')
+
+    def misc2_fp16(self, w):
+        """AdvSIMD two-register miscellaneous (FP16, ARMv8.2). Only FABS and FNEG, which OoT's sdk uses: they touch the
+        sign bit of each 16-bit lane alone, so no half-precision arithmetic is needed."""
+        Q, U, a_, opc, n, d = (bits(w, 30, 1), bits(w, 29, 1), bits(w, 23, 1), bits(w, 12, 5), bits(w, 5, 5),
+                               bits(w, 0, 5))
+        if not (a_ and opc == 0b01111):
+            raise Unsupported(f'fp16 misc {w:08x}')
+        x = VR('vu16', n)
+        return VWr('vu16', Q, d, f'{x} ^ (uint16_t)0x8000' if U else f'{x} & (uint16_t)0x7FFF')
 
     def three_same(self, w, scalar=False):
         Q, U, sz, m, opc, n, d = (bits(w, 30, 1), bits(w, 29, 1), bits(w, 22, 2), bits(w, 16, 5), bits(w, 11, 5),

@@ -25,14 +25,21 @@ alone (its `docs/plan.md`, Phase 0), so everything below the container is unknow
 Still MP4's and to be rewritten for this game once Phase 0 knows its modules and versions (they would mislead if
 trusted): `runtime/boot.c` (modules, init_array sizes, stack, `nvnBootstrapLoader` return addresses, SDK init form),
 the main stack in `runtime/kernel.c`, the version tables in `tools/build_game.py`, `installer/layout.py`,
-`tools/make_release.py` and `tools/prepare_shaders.py` (`v131072`), the bases in `tests/diff/lift.py`, the probe
+`tools/make_release.py` and `tools/prepare_shaders.py` (`v131072`), the probe
 table in `runtime/loader.c`, `runtime/frame_rate.c` (host half of MP4's frame-time patch), and `runtime/ov_oot.c`
 (MP4's SDK 19.3 overrides: keep what this game reaches, drop the rest). Not taken: MP4's `recomp/patches-v131072.txt`
 and `tools/data/expected-*.json`.
 
 ## Status
 
-Phase 0 (`docs/plan.md`): nothing read from the dump yet beyond its container header.
+Phase 0 (`docs/plan.md`). The `.nup` is a plain container (no keys needed): `python3.14 tools/extract_nup.py --list`,
+then `--exefs-only --verify` wrote `build/extracted/v131072/exefs` (title id `0400486024DEC000`, v131072, display
+1.1.1). `main` is ZBIC-compressed (NSO flag bit 7) and was decompressed for the survey with a local, uncommitted build of
+kinnay/zbic (GPL-2.0); the copy in `build/extracted/v131072/exefs/main` is a plain NSO. The lifter now takes the
+Switch 2's ARMv8.3 code (PAC branches and ops, `LDAPR`, `UDOT`, FP16 `FNEG`): 0 unsupported instructions in every
+module, differential tests pass. Survey C in `generated/survey-v131072/`. Run the lifter tools with a Python 3.12 venv
+holding `tools/requirements.txt` (MP4's `.venv` works for now) and the differential tests with a Windows venv
+(MP4's `.venv-win`). Next: RomFS, our own ZBIC, NVN2.
 
 ## Environment notes
 

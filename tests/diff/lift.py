@@ -1,4 +1,4 @@
-# From metroid-prime-4-recomp tests/diff/lift.py @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
+# From metroid-prime-4-recomp tests/diff/lift.py @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied, with the module bases from recomp/layout.py, --model max, --only, and LDAPR tested.
 # From fe3h-pc-recomp tests/diff/lift.py @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with the module bases of this game's layout (recomp/layout.py).
 # From totk-pc-recomp tests/diff/lift.py @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 """Differential test of the lifter on the game's own instructions: lifted C against Unicorn, one instruction at a time.
@@ -33,10 +33,12 @@ from common import BUF, BUF_SIZE, ROOT, Emu, build_harness, diff_state, dis, mne
     run_harness
 from lifter import Lifter, Unsupported, bits
 from nso import Nso
+from layout import layout
 
 BUF_MID = BUF + 0x10000
 # Test load addresses, below 2^39 and clear of BUF.
-BASES = {'main': 0x7000000000, 'subsdk0': 0x7001c00000, 'sdk': 0x7002400000}
+# Module bases: the lifter's own layout of the ExeFS under test (recomp/layout.py layout), filled in main.
+BASES = {}
 
 
 def is_mem(w):
@@ -49,6 +51,8 @@ def classify(w):
         return 'skip'
     if (w & 0x3F000000) == 0x08000000 and (bits(w, 23, 1) == 0 or bits(w, 21, 1)):
         return 'skip'  # exclusives need a paired load; CAS is ARMv8.1; both are covered by atomic.py
+    if (w & 0x3FFFFC00) == 0x38BFC000:  # LDAPR (ARMv8.3 RCpc): a plain load, compared here (needs --model max)
+        return 'ok'
     if (w & 0x3F200C00) == 0x38200000:  # LSE atomics, ARMv8.1: atomic.py
         return 'skip'
     if (w & 0xFF000000) == 0xD4000000:  # SVC, BRK, HLT
@@ -82,11 +86,17 @@ def to_test_body(ins, pc):
     raise Unsupported(ins.kind)
 
 
-def pick_module(name, nso, base, count, r, unsupported):
-    """Distinct words of .text, one per opcode signature first, lifted. Returns [(word, pc, body)]."""
+def pick_module(name, nso, base, count, r, unsupported, only=None):
+    """Distinct words of .text, one per opcode signature first, lifted. Returns [(word, pc, body)]. only: a list of
+    (value, mask) pairs; when given, only words matching one of them are picked."""
     lo, size = nso.text
     words = np.frombuffer(bytes(nso.image[lo:lo + size]), dtype='<u4')
     uniq, first = np.unique(words, return_index=True)
+    if only:
+        keep = np.zeros(len(uniq), dtype=bool)
+        for value, mask in only:
+            keep |= (uniq & np.uint32(mask)) == np.uint32(value)
+        uniq, first = uniq[keep], first[keep]
     keys = class_keys(uniq)
     order = list(range(len(uniq)))
     r.shuffle(order)
@@ -159,7 +169,7 @@ def make_case(r, w):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--exefs', type=Path, default=ROOT / 'build' / 'extracted' / 'v121' / 'exefs')
+    ap.add_argument('--exefs', type=Path, default=ROOT / 'build' / 'extracted' / 'v131072' / 'exefs')
     ap.add_argument('--modules', default='main,sdk,subsdk0')
     ap.add_argument('--encodings', type=int, default=20000, help='per module')
     ap.add_argument('--cases', type=int, default=3, help='random states per encoding')
@@ -167,9 +177,16 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--show', type=int, default=40)
     ap.add_argument('--cflags', default='-march=x86-64-v3' if platform.machine().lower() in ('amd64', 'x86_64') else '')
+    ap.add_argument('--model', choices=('a57', 'max'), default='a57',
+                    help='Unicorn CPU: a57 (the Switch) or max (ARMv8.2+ forms of Switch 2 code: DotProd, FP16, LDAPR); '
+                         'with a57, cases Unicorn rejects are dropped, so later-architecture forms go untested')
+    ap.add_argument('--only', action='append', default=[], metavar='HEX/MASK',
+                    help='test only words w with (w & MASK) == HEX; repeatable')
     ap.add_argument('--coverage', action='store_true',
                     help='only lift every distinct word and list the rejected ones (capstone "?" = undecodable data)')
     args = ap.parse_args()
+    BASES.update({name: base for name, base, _ in layout(args.exefs)})
+    only = [tuple(int(x, 16) for x in o.split('/')) for o in args.only]
     r = random.Random(args.seed)
     t0 = time.time()
     names = args.modules.split(',')
@@ -188,14 +205,15 @@ def main():
         img = work / f'{name}.img'
         img.write_bytes(bytes(nso.image))
         images.append((base, img, nso.image))
-        picks += [(name,) + p for p in pick_module(name, nso, base, args.encodings, r, unsupported)]
+        picks += [(name,) + p for p in pick_module(name, nso, base, args.encodings, r, unsupported, only)]
     print(f'lifted {len(picks)} encodings ({time.time() - t0:.0f}s)')
 
     t1 = time.time()
     exe = build_harness(work, [p[3] for p in picks], args.jobs, args.cflags)
     print(f'compiled ({time.time() - t1:.0f}s)')
 
-    emu = Emu([(base, data) for base, _, data in images])
+    emu = Emu([(base, data) for base, _, data in images],
+              **({'model': uc.arm64_const.UC_CPU_ARM64_MAX} if args.model == 'max' else {}))
     mu = emu.mu
     buf0 = bytes(r.getrandbits(8) for _ in range(4096)) * (BUF_SIZE // 4096)
     mu.mem_write(BUF, buf0)

@@ -1,4 +1,4 @@
-// From metroid-prime-4-recomp tests/diff/harness.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
+// From metroid-prime-4-recomp tests/diff/harness.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied, with the fnprof_hit stub following cpu.h.
 // From fe3h-pc-recomp tests/diff/harness.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 // From totk-pc-recomp tests/diff/harness.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 // Runs lifted tests and writes the resulting CPU state per case.
@@ -71,7 +71,7 @@ void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; (void)pc; a
 void rt_udf(Cpu *c, uint64_t pc) { (void)c; (void)pc; abort(); }
 uint64_t rt_ticks(void) { return 0; }
 volatile int g_fnprof;
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)addr; (void)lr; (void)x0; }
+void fnprof_hit(uint64_t addr, void *cpu) { (void)addr; (void)cpu; }   // cpu.h FN_ENTER; the harness never profiles
 
 static void *map_at(uint64_t addr, size_t len) {
     len = (len + 0xffff) & ~(size_t)0xffff;

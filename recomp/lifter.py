@@ -1,4 +1,4 @@
-# From metroid-prime-4-recomp recomp/lifter.py @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
+# From metroid-prime-4-recomp recomp/lifter.py @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied, with the ARMv8.3 forms of Switch 2 code added: PAC branches and data-processing ops, LDAPR.
 # From fe3h-pc-recomp recomp/lifter.py @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 # From totk-pc-recomp recomp/lifter.py @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
 # Adapted from LAS Recomp tools/lifter.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
@@ -299,7 +299,17 @@ class Lifter:
             return Insn('bcond', target=t, cond=f'(({X(rt)} >> {b}) & 1) {"!=" if nz else "=="} 0')
         if bits(w, 25, 7) == 0b1101011:  # branch register
             opc, rn = bits(w, 21, 4), bits(w, 5, 5)
-            if bits(w, 16, 5) != 31 or bits(w, 10, 6) or bits(w, 0, 5):
+            op3, rm = bits(w, 10, 6), bits(w, 0, 5)
+            if bits(w, 16, 5) == 31 and op3 in (2, 3) and (opc in (8, 9) or (opc in (0, 1, 2) and rm == 31)):
+                # ARMv8.3 pointer authentication: BRAA(Z)/BRAB(Z), BLRAA(Z)/BLRAB(Z), RETAA/RETAB (Switch 2 code,
+                # OoT's main returns with RETAB). The signing side (PACIBSP and the other hint-space PAC
+                # instructions) lifts as a no-op hint and PACIA and friends as identities (dp_reg), so pointers are
+                # never signed, authentication always succeeds and each is its plain branch. The modifier (Rm, or SP
+                # for RETAx) is ignored.
+                if opc == 2:
+                    return Insn('ret')
+                return Insn('blr' if opc & 1 else 'br', target=X(rn))
+            if bits(w, 16, 5) != 31 or op3 or rm:
                 raise Unsupported('branch reg variant')
             if opc == 0:
                 return Insn('br', target=X(rn))
@@ -465,6 +475,10 @@ class Lifter:
         p, v = f'({t} *)(uintptr_t)({XS(rn)})', f'({t}){X(rs)}'
         order = ('__ATOMIC_RELAXED', '__ATOMIC_RELEASE', '__ATOMIC_ACQUIRE', '__ATOMIC_ACQ_REL')[A << 1 | R]
         if o3:
+            if opc == 4 and rs == 31 and A and not R:
+                # LDAPR (ARMv8.3 RCpc load-acquire): lifted like LDAR (ldst_excl), whose acquire is at least as
+                # strong as the RCpc one the code asks for.
+                return Insn('op', set_reg(1, rt, f'lda{nbits}({XS(rn)})'))
             if opc:
                 raise Unsupported('ldapr')
             expr = f'__atomic_exchange_n({p}, {v}, {order})'
@@ -676,6 +690,11 @@ class Lifter:
         if op2 == 6:
             opcode = bits(w, 10, 6)
             if bits(w, 30, 1):  # 1-source
+                if bits(w, 16, 5) == 1 and sf and opcode <= 17:
+                    # ARMv8.3 PACIA/PACIB/PACDA/PACDB/AUTIA/AUTIB/AUTDA/AUTDB, their Z forms and XPACI/XPACD: no
+                    # pointer is ever signed (see the authenticated branches in branch_sys), so adding, checking
+                    # or stripping a PAC leaves Xd as it is.
+                    return Insn('op', '/* pac: identity */')
                 if bits(w, 16, 5):
                     raise Unsupported('dp1 opcode2')
                 a = R(sf, rn)
@@ -695,6 +714,13 @@ class Lifter:
                     return Insn('op', self.sc.crc(w))
                 gprs = [(p, r) for p, r in ((0, rd), (5, rn), (16, rm)) if r != 31]
                 return Insn('asm', asm=AsmInsn(w, set(), gprs))
+            if opcode == 12 and sf:
+                # PACGA Xd, Xn, Xm|SP (ARMv8.3): a 32-bit code over two values in Xd's upper half, the lower half zero.
+                # OoT's sdk signs saved register sets with it and later recomputes and compares, so any
+                # deterministic mix of the two inputs serves; this one is not the hardware's QARMA.
+                a, b = X(rn), XS(rm)
+                return Insn('op', set_reg(1, rd, f'(({a} * 0x9E3779B97F4A7C15ull) ^ (({b} + 0x632BE59BD9B4E019ull) '
+                                                 f'* 0xC2B2AE3D27D4EB4Full)) & 0xFFFFFFFF00000000ull'))
             a, b = R(sf, rn), R(sf, rm)
             expr = {
                 2: f'udiv{size}({a}, {b})',
