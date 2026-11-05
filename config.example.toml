@@ -1,0 +1,15 @@
+# Copy to config.local.toml (ignored by git) and point it at your own files.
+
+[input]
+# The game dump. Title id 04004860224DEC00 (Switch 2), as a .nup; the tools that read XCI and NSP do not read this
+# container yet (docs/plan.md, Phase 0).
+base = 'C:\Games\OoT\game.nup'
+# Update packages, if the game has any (unknown yet).
+updates = []
+dlc = []
+# Keys dumped from your own console. Never printed or copied by the tools.
+keys = 'C:\Switch\prod.keys'
+
+[work]
+# Extracted files, generated C and builds go here.
+dir = 'build'

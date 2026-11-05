@@ -1,0 +1,158 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -41,6 +41,12 @@
+         public Dictionary<IoDefinition, Instruction> InputsPerPatch { get; } = new();
+         public Dictionary<IoDefinition, Instruction> OutputsPerPatch { get; } = new();
+ 
++        // MP4 (2026-11-04): a fragment shader that indexes its inputs reads them from a private copy (IndexedInputCopy),
++        // filled at the start of main from one input variable per location (IndexedInputs), each with its own
++        // interpolation (Declarations.DeclareIndexedFragmentInputs).
++        public Instruction IndexedInputCopy { get; set; }
++        public List<(int Location, Instruction Variable)> IndexedInputs { get; } = new();
++
+         public StructuredFunction CurrentFunction { get; set; }
+         private readonly Dictionary<AstOperand, Instruction> _locals = new();
+         private readonly Dictionary<int, Instruction> _funcArgs = new();
+@@ -156,6 +162,11 @@
+             mainInterface.AddRange(InputsPerPatch.Values);
+             mainInterface.AddRange(OutputsPerPatch.Values);
+ 
++            foreach ((int _, Instruction variable) in IndexedInputs)
++            {
++                mainInterface.Add(variable);
++            }
++
+             return mainInterface.ToArray();
+         }
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -368,6 +368,15 @@
+ 
+             foreach (IoDefinition ioDefinition in info.IoDefinitions)
+             {
++                if (context.Definitions.Stage == ShaderStage.Fragment &&
++                    context.Definitions.IaIndexing &&
++                    ioDefinition.IoVariable == IoVariable.UserDefined &&
++                    ioDefinition.StorageKind == StorageKind.Input)
++                {
++                    DeclareIndexedFragmentInputs(context);
++                    continue;
++                }
++
+                 PixelImap iq = PixelImap.Unused;
+ 
+                 if (context.Definitions.Stage == ShaderStage.Fragment)
+@@ -496,6 +505,77 @@
+             return perVertexStructType;
+         }
+ 
++        // MP4 (2026-11-04): with indexed input reads (IPA with an index register) the inputs were one array of 16 vec4
++        // decorated with the interpolation of location 0 alone, while the shader header gives each location its own:
++        // a flat integer (Metroid Prime 4's glowing fruit pass an instance index at location 8, a denormal as a float)
++        // came out interpolated and flushed to zero, and the fruit read another object's light data, flickering. Each
++        // location the header uses is declared on its own with its interpolation, and the indexed reads go to a private
++        // array of 16 vec4 that main fills from them first (SpirvGenerator.Generate, Instructions.GetStoragePointer).
++        private static void DeclareIndexedFragmentInputs(CodeGenContext context)
++        {
++            if (context.IndexedInputCopy != null)
++            {
++                return;
++            }
++
++            SpvInstruction vec4 = context.TypeVector(context.TypeFP32(), 4);
++            SpvInstruction arrayType = context.TypeArray(vec4, context.Constant(context.TypeU32(), Constants.MaxAttributes));
++            SpvInstruction copy = context.Variable(context.TypePointer(StorageClass.Private, arrayType), StorageClass.Private);
++            context.AddGlobalVariable(copy);
++            context.IndexedInputCopy = copy;
++
++            for (int location = 0; location < Constants.MaxAttributes; location++)
++            {
++                PixelImap iq = context.Definitions.ImapTypes[location].GetFirstUsedType();
++
++                if (iq == PixelImap.Unused)
++                {
++                    continue;
++                }
++
++                SpvInstruction spvVar = context.Variable(context.TypePointer(StorageClass.Input, vec4), StorageClass.Input);
++                context.Decorate(spvVar, Decoration.Location, (LiteralInteger)location);
++
++                if (iq == PixelImap.Constant)
++                {
++                    context.Decorate(spvVar, Decoration.Flat);
++                }
++                else if (iq == PixelImap.ScreenLinear)
++                {
++                    context.Decorate(spvVar, Decoration.NoPerspective);
++                }
++
++                context.AddGlobalVariable(spvVar);
++                context.IndexedInputs.Add((location, spvVar));
++            }
++        }
++
++        // Fills the private copy of the indexed inputs at the start of main: the locations the header leaves unused read
++        // (0, 0, 0, 0).
++        public static void FillIndexedFragmentInputs(CodeGenContext context)
++        {
++            if (context.IndexedInputCopy == null)
++            {
++                return;
++            }
++
++            SpvInstruction vec4 = context.TypeVector(context.TypeFP32(), 4);
++            SpvInstruction pointerType = context.TypePointer(StorageClass.Private, vec4);
++            SpvInstruction[] values = new SpvInstruction[Constants.MaxAttributes];
++
++            foreach ((int location, SpvInstruction variable) in context.IndexedInputs)
++            {
++                values[location] = context.Load(vec4, variable);
++            }
++
++            for (int location = 0; location < Constants.MaxAttributes; location++)
++            {
++                SpvInstruction value = values[location] ?? context.ConstantNull(vec4);
++                SpvInstruction element = context.AccessChain(pointerType, context.IndexedInputCopy, context.Constant(context.TypeS32(), location));
++                context.Store(element, value);
++            }
++        }
++
+         private static void DeclareInputOrOutput(
+             CodeGenContext context,
+             IoDefinition ioDefinition,
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1828,7 +1828,17 @@
+                         ? (isOutput ? context.OutputsPerPatch : context.InputsPerPatch)
+                         : (isOutput ? context.Outputs : context.Inputs);
+ 
+-                    baseObj = dict[ioDefinition];
++                    if (!isOutput && !isPerPatch && ioVariable == IoVariable.UserDefined && context.IndexedInputCopy != null)
++                    {
++                        // MP4: indexed fragment inputs read the private copy (Declarations.DeclareIndexedFragmentInputs).
++                        storageClass = StorageClass.Private;
++                        baseObj = context.IndexedInputCopy;
++                    }
++                    else
++                    {
++                        baseObj = dict[ioDefinition];
++                    }
++
+                     break;
+ 
+                 default:
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -172,6 +172,11 @@
+ 
+             Declarations.DeclareLocals(context, function);
+ 
++            if (funcIndex == 0)
++            {
++                Declarations.FillIndexedFragmentInputs(context);
++            }
++
+             Generate(context, function.MainBlock);
+ 
+             // Functions must always end with a return.

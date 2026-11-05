@@ -1,0 +1,5 @@
+// From metroid-prime-4-recomp installer/launcher/launcher.rc @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+// From fe3h-pc-recomp installer/launcher/launcher.rc @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), renamed to mp4; MP4 changes are noted where made.
+/* The icon of OOT-Setup.exe: runtime/oot.ico, the icon of oot.exe. tools/make_release.py compiles this file with
+   llvm-windres -I runtime and links it with launcher.c. */
+1 ICON "oot.ico"

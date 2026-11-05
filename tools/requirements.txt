@@ -1,0 +1,9 @@
+# Python 3.12 venv at .venv (WSL): the lifter, its tests and the survey tools.
+# Recreate: uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r tools/requirements.txt
+# Pins follow totk-pc-recomp tools/requirements.txt.
+capstone==5.0.9
+cryptography==50.0.2
+lz4==4.4.5
+numpy==2.5.4
+pyelftools==0.33
+unicorn==2.1.4

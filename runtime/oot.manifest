@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- From fe3h-pc-recomp runtime/fe3h.manifest @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to oot only. -->
+<!-- From totk-pc-recomp runtime/totk.manifest @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only. -->
+<!-- Embedded by oot.rc. activeCodePage makes UTF-8 the process code page (Windows 10 1903 and later): the narrow file
+     functions (fopen, CreateFileA, GetModuleFileNameA) and getenv then carry UTF-8, the same encoding platform/win32.c
+     and fs_host.c convert with, so an install folder or user profile with a non-ASCII name works.
+     dpiAwareness PerMonitorV2 (dpiAware true/pm on Windows 10 before 1607): window, monitor and cursor sizes are physical
+     pixels and the swapchain matches the screen. A DPI-unaware process gets them divided by the display scale and its
+     image stretched back up by Windows, so 4K at 150% presented a 2560x1440 image, blurred. gfx_window.c follows a
+     change of the window's DPI (WM_GETDPISCALEDSIZE, WM_DPICHANGED). -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

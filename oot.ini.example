@@ -1,0 +1,46 @@
+# From metroid-prime-4-recomp mp4.ini.example @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+# From fe3h-pc-recomp fe3h.ini.example @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4 only.
+# oot.ini: settings for oot.exe. Copy this file to oot.ini next to oot.exe and remove the '#' of a line to change it.
+# Each line shows the default. A OOT_* environment variable of the same name (OOT_FPS_LIMIT for fps_limit) overrides
+# the file. Keys are case-insensitive; '#' and ';' start a comment; [sections] only group lines (runtime/cfg.c).
+
+[frame rate]
+# Frame rate limit: 30, 60 (the Switch's rate), 90, 120, 144, any whole rate up to 360, or display (the monitor's
+# refresh rate). Above 60 is experimental and needs realtime = 1.
+# fps_limit = 60
+# Game speed follows the clock: the game is stepped by real time, so frame rate does not change its pace (0: the
+# fixed 1/60 s steps of the Switch, which run slow below 60 fps and fast above).
+# realtime = 1
+
+[display]
+# Full screen (1) or a window (0).
+# fullscreen = 0
+# Window size, WxH.
+# window_size = 1920x1080
+# Vulkan present mode: mailbox (the default), fifo (vsync) or immediate.
+# vk_present = mailbox
+# Which GPU, by index in the Vulkan device list (the best one when unset).
+# gpu_index = 0
+
+[language]
+# The game's language, a Switch language code: ja, en-US, en-GB, fr, fr-CA, de, it, es, es-419, zh-Hans, zh-Hant, ko
+# (nl, pt, pt-BR and ru fall back inside the game). The Windows user locale decides when unset.
+# lang = en-US
+# docked (the console in its dock, 1080p) or handheld (720p).
+# operation_mode = docked
+
+[audio]
+# Volume, 0 to 100.
+# volume = 100
+
+[video]
+# The cinematics' H.264 decoder, OpenH264 (openh264-2.7.0-win64.dll next to oot.exe, downloaded from Cisco by the
+# setup): 1 uses it, 0 does not (the cinematics then play their sound over a still picture).
+# OpenH264 Video Codec provided by Cisco Systems, Inc.
+# openh264 = 1
+
+[input]
+# Button prompts and layout: auto (from the controller), nintendo or xbox.
+# pad_layout = auto
+# Rumble strength in percent, and off with 0.
+# rumble_strength = 80

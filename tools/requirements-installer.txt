@@ -1,0 +1,10 @@
+# From metroid-prime-4-recomp tools/requirements-installer.txt @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
+# From fe3h-pc-recomp tools/requirements-installer.txt @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), renamed to mp4; MP4 changes are noted where made.
+# Packages of the release's bundled Python 3.14.9 (tools/make_release.py): what the installer steps import.
+# numpy: recomp/gen.py. capstone: recomp/gen.py function discovery (OOT). lz4: recomp/nso.py, tools/shader_census.py. cryptography, cffi, pycparser: tools/extract.py and the vendored extract scripts.
+numpy==2.5.4
+capstone==5.0.9
+lz4==4.4.5
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.11

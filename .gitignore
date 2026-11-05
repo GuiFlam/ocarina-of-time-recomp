@@ -1,0 +1,55 @@
+# Reference checkouts of upstream projects (tools/fetch_refs.sh), never committed
+/refs/
+
+# Python environments
+/.venv/
+/.venv-py314/
+/.venv-win/
+__pycache__/
+
+# Personal paths to game files and keys
+/config.local.toml
+
+# Game inputs and everything derived from them. Never commit these.
+# tools/check_content.py enforces the same rule in CI and the pre-commit hook.
+/game/
+/build/
+/generated/
+*.xci
+*.xcz
+*.nsp
+*.nsz
+*.nca
+*.ncz
+*.tik
+*.keys
+*.nso
+*.npdm
+
+# Build outputs
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.lib
+*.a
+
+# Coding-agent local setup and notes
+/.claude/
+/CLAUDE.local.md
+/notes/
+
+# Editors, logs and OS files
+.vs/
+.vscode/
+.idea/
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
+
+/files/
+
+# Toolchain built from source (tools/build_hactool.py)
+/toolchain/

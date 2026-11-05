@@ -1,0 +1,127 @@
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -461,6 +461,21 @@
+         }
+ 
+         /// <summary>
++        /// MP4 (2026-11-03): the numeric class of a sampled texture: an integer format (R32Uint or R32Sint stand for
++        /// any unsigned or signed integer format) declares an integer sampled image and the result is bitcast to the
++        /// float bits the shader expects; Unknown keeps the float sampler. Vulkan requires the sampled type to match
++        /// the view's format (VUID-vkCmdDraw-format-07753), and a float fetch of an R32_UINT light list flushed its
++        /// small indices as denormals.
++        /// </summary>
++        /// <param name="handle">Texture handle</param>
++        /// <param name="cbufSlot">Constant buffer slot for the texture handle</param>
++        /// <returns>R32Uint, R32Sint or Unknown</returns>
++        TextureFormat QuerySamplerFormat(int handle, int cbufSlot = -1)
++        {
++            return TextureFormat.Unknown;
++        }
++
++        /// <summary>
+         /// Queries transform feedback enable state.
+         /// </summary>
+         /// <returns>True if the shader uses transform feedback, false otherwise</returns>
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -239,7 +239,8 @@
+ 
+             if (!isImage)
+             {
+-                format = TextureFormat.Unknown;
++                // MP4: the host's numeric class of the sampled texture (IGpuAccessor.QuerySamplerFormat)
++                format = _gpuAccessor.QuerySamplerFormat(handle, cbufSlot);
+             }
+ 
+             SetBindingPair setAndBinding = GetTextureOrImageBinding(
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SamplerDeclaration.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SamplerDeclaration.cs
+@@ -1,3 +1,4 @@
++using Ryujinx.Graphics.Shader.Translation;
+ using Spv.Generator;
+ 
+ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+@@ -9,19 +10,22 @@
+         public readonly Instruction SampledImagePointerType;
+         public readonly Instruction Image;
+         public readonly bool IsIndexed;
++        public readonly AggregateType ComponentType;   // MP4: the sampled type (FP32, U32 or S32), see QuerySamplerFormat
+ 
+         public SamplerDeclaration(
+             Instruction imageType,
+             Instruction sampledImageType,
+             Instruction sampledImagePointerType,
+             Instruction image,
+-            bool isIndexed)
++            bool isIndexed,
++            AggregateType componentType)
+         {
+             ImageType = imageType;
+             SampledImageType = sampledImageType;
+             SampledImagePointerType = sampledImagePointerType;
+             Image = image;
+             IsIndexed = isIndexed;
++            ComponentType = componentType;
+         }
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -162,6 +162,11 @@
+ 
+                 SpvInstruction imageType;
+                 SpvInstruction sampledImageType;
++                // MP4: integer textures get integer sampled images (QuerySamplerFormat); the sample result is bitcast
++                AggregateType componentType = sampler.Type != SamplerType.None ? sampler.Format.GetComponentType() : AggregateType.FP32;
++                SpvInstruction sampledType = componentType == AggregateType.U32 ? context.TypeU32()
++                                           : componentType == AggregateType.S32 ? context.TypeS32() : context.TypeFP32();
++                if (componentType != AggregateType.U32 && componentType != AggregateType.S32) componentType = AggregateType.FP32;
+ 
+                 if (sampler.Type != SamplerType.None)
+                 {
+@@ -176,7 +181,7 @@
+                     };
+ 
+                     imageType = context.TypeImage(
+-                        context.TypeFP32(),
++                        sampledType,
+                         dim,
+                         sampler.Type.HasFlag(SamplerType.Shadow),
+                         sampler.Type.HasFlag(SamplerType.Array),
+@@ -213,7 +218,8 @@
+                     sampledImageType,
+                     sampledImagePointerType,
+                     sampledImageVariable,
+-                    sampler.ArrayLength != 1));
++                    sampler.ArrayLength != 1,
++                    componentType));
+                 context.SamplersTypes.Add(new(sampler.Set, sampler.Binding), sampler.Type);
+ 
+                 context.Name(sampledImageVariable, sampler.Name);
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1428,7 +1428,11 @@
+ 
+             bool colorIsVector = isGather || !isShadow;
+ 
+-            SpvInstruction resultType = colorIsVector ? context.TypeVector(context.TypeFP32(), 4) : context.TypeFP32();
++            // MP4: an integer sampled image (SamplerDeclaration.ComponentType) returns integer texels; they are bitcast
++            // below to the float bits the rest of the translation works on
++            SpvInstruction sampledScalar = declaration.ComponentType == AggregateType.U32 ? context.TypeU32()
++                                         : declaration.ComponentType == AggregateType.S32 ? context.TypeS32() : context.TypeFP32();
++            SpvInstruction resultType = colorIsVector ? context.TypeVector(sampledScalar, 4) : sampledScalar;
+ 
+             if (intCoords)
+             {
+@@ -1474,6 +1478,11 @@
+                 result = context.ImageSampleImplicitLod(resultType, image, pCoords, operandsMask, operands);
+             }
+ 
++            if (declaration.ComponentType == AggregateType.U32 || declaration.ComponentType == AggregateType.S32)
++            {
++                result = context.Bitcast(colorIsVector ? context.TypeVector(context.TypeFP32(), 4) : context.TypeFP32(), result);
++            }
++
+             AggregateType swizzledResultType = AggregateType.FP32;
+ 
+             if (colorIsVector)
