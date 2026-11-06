@@ -25,14 +25,19 @@ int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void
 // region, not the level. Same textures as nvn_deswizzle; -1 for others and for a box outside the level.
 int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z, uint32_t wb,
                    uint32_t h, void *storage, void *rows, size_t pitch, int to_linear);
+// The byte order inside a 64-byte x 8-row GOB (tex_deswizzle.c gob_off): the Tegra X1's, or the Switch 2's for 8- and
+// 16-byte elements (block-compressed formats among them), where the 16-byte column and the second row bit trade places.
+enum { TEX_GOB_X1 = 0, TEX_GOB_SWITCH2 = 1 };
+int tex_gob_kind(uint32_t bytes_per_element);
 // Byte offset of (x byte, y block row, z slice) inside one level of block height 2^th and block depth 2^td GOBs.
-uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td);
+uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td,
+                       int gob);
 // Geometry of a level as the two functions above use it; -1 for textures they reject.
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t *row_bytes, uint32_t *rows,
                        uint32_t *slices, uint64_t *base, unsigned *th, unsigned *td, uint32_t *bpb);
 // The copy loop on its own, for callers that know the level geometry (bl points at the level's first byte).
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
-                 unsigned th, unsigned td, int to_linear);
+                 unsigned th, unsigned td, int to_linear, int gob);
 
 // ---- tex_astc.c (LAS Recomp runtime/nvn/astc.c, MIT) ----
 // ASTC LDR 2D to RGBA8, bit-exact with astcenc's 8-bit decode. blocks: row-major 16-byte blocks covering

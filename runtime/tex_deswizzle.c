@@ -1,7 +1,7 @@
 // From metroid-prime-4-recomp runtime/tex_deswizzle.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 // From fe3h-pc-recomp runtime/tex_deswizzle.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied unchanged.
 // From totk-pc-recomp runtime/tex_deswizzle.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied unchanged.
-// Tegra X1 block-linear <-> linear copies.
+// Tegra X1 and Switch 2 block-linear <-> linear copies.
 // Ported from MacNativeGames games/totk/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); comments translated, the copy loop split out as tex_bl_copy.
 //
 // Layout (public descriptions: deko3d, Ryujinx BlockLinearLayout):
@@ -11,14 +11,38 @@
 //   in x -> y -> z row-major order.
 // Level and layer start offsets and the block height and depth of a level come from nvn_tex.c; this file only does the
 // addressing inside a level and the copy.
+//
+// The Switch 2 (2026-11-06): the GOB orders its 16-byte pieces differently, at least for 8- and 16-byte elements:
+//     (x%64/32)*256 + (y%8/4)*128 + (x%32/16)*64 + (y%4/2)*32 + (y%2)*16 + x%16
+// (the 16-byte column and the middle row bit trade places; blocks and GOB order within a block are unchanged). Found
+// from the game's own textures: its ASTC 4x4 title logo (1664x1280 and 1464x640) and BC4 masks (683x683, 320x107)
+// came out in 4x4 tiles that did not join up; matching each block's edges against every other block's in the stored
+// order gave neighbour distances of 64 bytes across and 16, 32 and 128 down, and with this order all four are smooth.
+// Elements of 1, 2 and 4 bytes had no game data that tells yet, so they keep the Tegra X1 order unless
+// OOT_GOB_SWITCH2_MIN lowers the element size from which the Switch 2 order applies (default 8).
 #include "tex.h"
+#include <stdlib.h>
 #include <string.h>
+#include "cfg.h"
 
-static uint32_t gob_off(uint32_t x, uint32_t y) {
+int tex_gob_kind(uint32_t bpe) {
+    static int min_bpe;
+    if (!min_bpe) {
+        const char *e = cfg_get("OOT_GOB_SWITCH2_MIN");
+        int v = e && *e ? atoi(e) : 8;
+        min_bpe = v > 0 ? v : 8;
+    }
+    return bpe >= (uint32_t)min_bpe ? TEX_GOB_SWITCH2 : TEX_GOB_X1;
+}
+
+static uint32_t gob_off(uint32_t x, uint32_t y, int gob) {
+    if (gob == TEX_GOB_SWITCH2)
+        return (x % 64 / 32) * 256 + (y % 8 / 4) * 128 + (x % 32 / 16) * 64 + (y % 4 / 2) * 32 + (y % 2) * 16 + x % 16;
     return (x % 64 / 32) * 256 + (y % 8 / 2) * 64 + (x % 32 / 16) * 32 + (y % 2) * 16 + x % 16;
 }
 
-uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td) {
+uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td,
+                       int gob) {
     uint32_t bh = 1u << th, bd = 1u << td;
     uint64_t gobs_x = (row_bytes + 63) / 64, blocks_y = (rows + 8 * bh - 1) / (8 * bh);
     uint64_t block = 512ull * bh * bd;                                  // bytes in one block
@@ -26,7 +50,7 @@ uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, u
          + (y / (8 * bh)) * gobs_x * block                             // which block row
          + (x / 64) * block                                            // which block column
          + ((z % bd) * bh + (y % (8 * bh)) / 8) * 512ull               // which GOB within the block
-         + gob_off(x, y);
+         + gob_off(x, y, gob);
 }
 
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
@@ -50,14 +74,15 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
 }
 
 // nvn_bl_offset per row instead of per 16 bytes: within a row, GOB column k starts k blocks further, and the four
-// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 32, 256 and 288 of it.
+// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 32, 256 and 288 of it (Switch 2: 0, 64, 256, 320).
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
-                 unsigned th, unsigned td, int to_linear) {
-    static const uint32_t seg[4] = {0, 32, 256, 288};
+                 unsigned th, unsigned td, int to_linear, int gob) {
+    static const uint32_t segs[2][4] = {{0, 32, 256, 288}, {0, 64, 256, 320}};
+    const uint32_t *seg = segs[gob == TEX_GOB_SWITCH2];
     uint64_t block = 512ull << th << td;
     for (uint32_t z = 0; z < slices; z++)
         for (uint32_t y = 0; y < rows; y++) {
-            uint8_t *row = lin + ((size_t)z * rows + y) * pitch, *g = bl + nvn_bl_offset(0, y, z, row_bytes, rows, th, td);
+            uint8_t *row = lin + ((size_t)z * rows + y) * pitch, *g = bl + nvn_bl_offset(0, y, z, row_bytes, rows, th, td, gob);
             uint32_t x = 0;
             if (to_linear)
                 for (; x + 64 <= row_bytes; x += 64, g += block)
@@ -89,7 +114,7 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
     if (pitch < row_bytes) return -1;
-    tex_bl_copy(bl + base, lin, pitch, row_bytes, rows, slices, th, td, to_linear);
+    tex_bl_copy(bl + base, lin, pitch, row_bytes, rows, slices, th, td, to_linear, tex_gob_kind(bpb));
     return 0;
 }
 
@@ -112,12 +137,13 @@ int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_
     uint32_t row_bytes, nrows, slices, bpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &nrows, &slices, &base, &th, &td, &bpb)) return -1;
     if (x + (uint64_t)wb > row_bytes || y + (uint64_t)h > nrows || z >= slices) return -1;
+    int gob = tex_gob_kind(bpb);
     for (uint32_t r = 0; r < h; r++) {
         uint8_t *q = ln + r * pitch;
         for (uint32_t i = 0; i < wb;) {
             uint32_t xb = x + i, n = 16 - xb % 16;   // contiguous up to the end of its 16-byte segment
             if (n > wb - i) n = wb - i;
-            uint8_t *p = st + base + nvn_bl_offset(xb, y + r, z, row_bytes, nrows, th, td);
+            uint8_t *p = st + base + nvn_bl_offset(xb, y + r, z, row_bytes, nrows, th, td, gob);
             if (to_linear) memcpy(q + i, p, n); else memcpy(p, q + i, n);
             i += n;
         }

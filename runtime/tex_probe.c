@@ -22,14 +22,17 @@ static uint8_t rnd8(void) {
     return (uint8_t)(g_rng >> 32);
 }
 
-// Byte offset inside a 64 x 8 GOB from the bit layout: x[3:0] -> 0-3, y[0] -> 4, x[4] -> 5, y[2:1] -> 6-7, x[5] -> 8.
-static unsigned gob_bits(unsigned x, unsigned y) {
+// Byte offset inside a 64 x 8 GOB from the bit layout. Tegra X1: x[3:0] -> 0-3, y[0] -> 4, x[4] -> 5, y[2:1] -> 6-7,
+// x[5] -> 8. Switch 2 (8- and 16-byte elements): x[3:0] -> 0-3, y[1:0] -> 4-5, x[4] -> 6, y[2] -> 7, x[5] -> 8.
+static unsigned gob_bits(unsigned x, unsigned y, int gob) {
+    if (gob == TEX_GOB_SWITCH2)
+        return (x & 15) | (y & 3) << 4 | (x >> 4 & 1) << 6 | (y >> 2 & 1) << 7 | (x >> 5 & 1) << 8;
     return (x & 15) | (y & 1) << 4 | (x >> 4 & 1) << 5 | (y >> 1 & 3) << 6 | (x >> 5 & 1) << 8;
 }
 
 // lin: slices * rows * row_bytes (tight). bl: block-linear storage, pre-filled with a marker.
 static void ref_swizzle(const uint8_t *lin, uint8_t *bl, uint32_t row_bytes, uint32_t rows, uint32_t slices,
-                        unsigned th, unsigned td) {
+                        unsigned th, unsigned td, int gob) {
     uint32_t bh = 1u << th, bd = 1u << td;
     uint32_t gx = (row_bytes + 63) / 64, by = (rows + 8 * bh - 1) / (8 * bh), bz = (slices + bd - 1) / bd;
     uint8_t *p = bl;
@@ -42,7 +45,7 @@ static void ref_swizzle(const uint8_t *lin, uint8_t *bl, uint32_t row_bytes, uin
                             for (unsigned x = 0; x < 64; x++) {
                                 uint32_t ax = kx * 64 + x, ay = (ky * bh + g) * 8 + y, az = kz * bd + z;
                                 if (ax < row_bytes && ay < rows && az < slices)
-                                    p[gob_bits(x, y)] = lin[((size_t)az * rows + ay) * row_bytes + ax];
+                                    p[gob_bits(x, y, gob)] = lin[((size_t)az * rows + ay) * row_bytes + ax];
                             }
                         p += 512;
                     }
@@ -56,17 +59,18 @@ static size_t bl_size(uint32_t row_bytes, uint32_t rows, uint32_t slices, unsign
 static unsigned g_cases;
 
 static int check_swizzle(uint32_t row_bytes, uint32_t rows, uint32_t slices, unsigned th, unsigned td, uint32_t bpb) {
+    int gob = tex_gob_kind(bpb);
     size_t n = (size_t)row_bytes * rows * slices, bn = bl_size(row_bytes, rows, slices, th, td);
     uint8_t *lin = malloc(n), *back = malloc(n), *ref = malloc(bn), *got = malloc(bn);
     for (size_t i = 0; i < n; i++) lin[i] = rnd8();
     memset(ref, 0xEE, bn);
     memset(got, 0xEE, bn);
-    ref_swizzle(lin, ref, row_bytes, rows, slices, th, td);
-    tex_bl_copy(got, lin, row_bytes, row_bytes, rows, slices, th, td, 0);
+    ref_swizzle(lin, ref, row_bytes, rows, slices, th, td, gob);
+    tex_bl_copy(got, lin, row_bytes, row_bytes, rows, slices, th, td, 0, gob);
     int bad = 0;
     if (memcmp(ref, got, bn)) { printf("probe-vkmem: FAIL swizzle bpb=%u th=%u td=%u %ux%ux%u differs from the reference\n", bpb, th, td, row_bytes, rows, slices); bad = 1; }
     memset(back, 0, n);
-    tex_bl_copy(ref, back, row_bytes, row_bytes, rows, slices, th, td, 1);
+    tex_bl_copy(ref, back, row_bytes, row_bytes, rows, slices, th, td, 1, gob);
     if (!bad && memcmp(lin, back, n)) { printf("probe-vkmem: FAIL deswizzle bpb=%u th=%u td=%u %ux%ux%u differs from the source\n", bpb, th, td, row_bytes, rows, slices); bad = 1; }
     g_cases++;
     free(lin); free(back); free(ref); free(got);
@@ -103,8 +107,8 @@ static int test_deswizzle(void) {
         for (uint32_t y = 0; y < rows; y++) memcpy(tight + (size_t)y * rb, lin + (size_t)y * pitch, rb);
         memset(ref0, 0x00, bn);
         memset(ref1, 0xFF, bn);
-        ref_swizzle(tight, ref0, rb, rows, sl, th, td);
-        ref_swizzle(tight, ref1, rb, rows, sl, th, td);
+        ref_swizzle(tight, ref0, rb, rows, sl, th, td, tex_gob_kind(bpb));
+        ref_swizzle(tight, ref1, rb, rows, sl, th, td, tex_gob_kind(bpb));
         // bytes where both fills agree were written by the reference; the untouched storage must hold the same
         for (size_t i = 0; i < bn; i++)
             if (ref0[i] == ref1[i] && store[base + i] != ref0[i]) { printf("probe-vkmem: FAIL level %u differs from the reference at byte %zu\n", lv, i); return 1; }
@@ -470,7 +474,7 @@ static int fill_storage(const tex_t *t, uint8_t **lin) {
         size_t n = (size_t)rb * rows;
         if (!lin[lv]) lin[lv] = malloc(n);
         for (size_t i = 0; i < n; i++) lin[lv][i] = rnd8();
-        ref_swizzle(lin[lv], t->mem + base, rb, rows, 1, th, td);
+        ref_swizzle(lin[lv], t->mem + base, rb, rows, 1, th, td, tex_gob_kind(bpb));
     }
     return 0;
 }

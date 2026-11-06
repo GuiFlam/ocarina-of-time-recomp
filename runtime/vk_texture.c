@@ -622,6 +622,42 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 }
 
 // Copies the whole storage into the image (every level and layer the image has).
+// OOT_TEX_RAW=<w>x<h>[,...]: the deswizzled blocks of level 0 of textures of that size go to
+// build/logs/tex-<w>x<h>-<format>-<n>.astc|.bin: ASTC in the .astc file format (16-byte header, then the blocks), for
+// decoding with ARM's astcenc (-dl / -ds) as a reference independent of tex_astc.c and astc_decode.comp; other formats
+// as the bare rows of blocks. For checking the block-linear layout against the game's own data.
+static void tex_raw_dump(const nvn_texdesc *d, const uint8_t *blocks, size_t size, int bw, int bh, int astc) {
+    static uint32_t want[8][2];
+    static int nwant = -1;
+    static volatile LONG seq;
+    if (nwant < 0) {
+        nwant = 0;
+        const char *e = cfg_get("OOT_TEX_RAW");
+        for (const char *p = e; p && *p && nwant < 8;) {
+            unsigned w, h;
+            if (sscanf(p, "%ux%u", &w, &h) != 2) break;
+            want[nwant][0] = w, want[nwant++][1] = h;
+            p = strchr(p, ',');
+            if (p) p++;
+        }
+    }
+    for (int i = 0; i < nwant; i++) {
+        if (want[i][0] != d->width || want[i][1] != d->height) continue;
+        char path[160];
+        snprintf(path, sizeof path, "build/logs/tex-%ux%u-%#x-%ld.%s", d->width, d->height, d->format,
+                 (long)InterlockedIncrement(&seq), astc ? "astc" : "bin");
+        FILE *f = fopen(path, "wb");
+        if (!f) return;
+        uint8_t hd[16] = {0x13, 0xAB, 0xA1, 0x5C, (uint8_t)bw, (uint8_t)bh, 1,
+                          (uint8_t)d->width, (uint8_t)(d->width >> 8), (uint8_t)(d->width >> 16),
+                          (uint8_t)d->height, (uint8_t)(d->height >> 8), (uint8_t)(d->height >> 16), 1, 0, 0};
+        if (astc) fwrite(hd, 1, 16, f);
+        fwrite(blocks, 1, size, f), fclose(f);
+        rt_log("vk: raw blocks of a %ux%u texture (fmt %#x) written to %s", d->width, d->height, d->format, path);
+        return;
+    }
+}
+
 static void upload(Tex *e) {
     static volatile long n_bad, n_undecoded;
     const tex_t *t = &e->t;
@@ -663,6 +699,7 @@ static void upload(Tex *e) {
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
             }
+            if (lv == 0 && ly == 0) tex_raw_dump(d, tmp ? tmp : dst, raw, bw, bh, astc);
             if (agpu) {
                 ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
             } else if (astc) {

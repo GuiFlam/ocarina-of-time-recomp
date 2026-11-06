@@ -17,7 +17,7 @@
 // swizzle. Copies and texture clears are logged as "copy/clear after pass N". OOT_DUMP_LOG=<from> also logs the
 // frames from..frame-1 to passes.txt, with PNGs only of targets up to 64K texels. OOT_DUMP_BUF=<addr>:<size>[:...]
 // snapshots one GPU buffer range after every logged pass (buf_<pass>.bin and bufs.txt, see buf_snap).
-// PNGs are opaque (alpha dropped). Integer formats are scaled by the image maximum, depth by its min..max range, SNORM
+// PNGs are opaque; 8-bit four-channel UNORM and sRGB images also get their alpha as grey in ..._a.png. Integer formats are scaled by the image maximum, depth by its min..max range, SNORM
 // as x/2+1/2, UNORM and sRGB bytes written as stored. Caps: MAX_PASSES passes copied, PNG_CAP bytes of PNGs.
 // OOT_DUMP_TEX=<id>|<w>x<h>[,...]: those texture slots, or 2D textures of that size, are copied where first sampled,
 // whatever their format.
@@ -265,6 +265,13 @@ static void write_images(const Job *j) {
         char path[600];
         snprintf(path, sizeof path, "%s/%s%s.png", dir, j->name, pass ? "_tm" : "");
         flip_rows(out, pw, ph);   // bottom-up targets and textures with the lower-left window origin (boot.c)
+        rt_write_png(path, out, pw, ph);
+    }
+    if (j->f->nc == 4 && mode == M_UNORM) {                  // alpha as grey: ..._a.png (cut-outs, dissolve masks)
+        for (uint64_t i = 0; i < n; i++) out[4 * i] = out[4 * i + 1] = out[4 * i + 2] = u8(px[4 * i + 3]), out[4 * i + 3] = 255;
+        char path[600];
+        snprintf(path, sizeof path, "%s/%s_a.png", dir, j->name);
+        flip_rows(out, pw, ph);
         rt_write_png(path, out, pw, ph);
     }
     uint64_t all = distinct(j, 0, j->h), top = distinct(j, 0, j->h / 4 ? j->h / 4 : 1);
