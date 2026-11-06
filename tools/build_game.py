@@ -228,8 +228,13 @@ def runtime_sources(skip=()):
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
             'third_party/imgui/backends/*.cpp')
     left_out = set(SDL_TWIN) if sys.platform != 'win32' else set(SDL_TWIN.values())
+    def windows_only(p):
+        # Linux builds platform/linux.c, the *_sdl.c twins and the Linux stubs; the Windows files stay out.
+        return p.name in ('win32.c', 'rdoc_win.c', 'prof_win.c', 'gfx_window_probe.c') or p.stem.endswith('_win')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat)
-                  if p.name not in skip and p.name not in left_out and (sys.platform == 'win32' or p.suffix != '.rc'))
+                  if p.name not in skip and p.name not in left_out
+                  and (sys.platform == 'win32' or (p.suffix != '.rc' and not windows_only(p)))
+                  and (sys.platform != 'win32' or p.name != 'linux.c'))
 
 
 def runtime_object(out, src):
