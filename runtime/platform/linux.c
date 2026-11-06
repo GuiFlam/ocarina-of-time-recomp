@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -990,4 +991,18 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     do k = read(c->out, buf, cap);
     while (k < 0 && errno == EINTR);
     return (long)k;
+}
+
+// getrandom(2) fills up to 256 bytes per call without blocking once the kernel has its entropy.
+int plat_random(void *out, size_t n) {
+    uint8_t *p = out;
+    while (n) {
+        ssize_t k = getrandom(p, n, 0);
+        if (k < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        p += k, n -= (size_t)k;
+    }
+    return 1;
 }
