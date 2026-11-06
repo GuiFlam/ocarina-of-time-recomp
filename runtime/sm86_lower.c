@@ -96,6 +96,7 @@ typedef struct {
     struct { uint8_t kind, bank; uint32_t value; } cur_def[64];   // local forwarding: the constant uniform
                                                    // register n holds at this point of its block (kind as ur_def)
     uint8_t needs_reg[64];                         // uniform register n has a use no forwarding covers
+    uint8_t ur_pair[64];                           // n is half of a 64-bit pair (UIMAD.WIDE, ULDC.64): adjacent registers
     uint32_t ur_first[64], ur_last[64];            // the instructions a uniform register is touched at, first and last
     uint8_t ur_whole[64];                          // a use before its first definition: live over the whole program
     int scanned;                                   // needs_reg is final: a read of another register is a scan bug
@@ -145,6 +146,13 @@ static void reloc(L *l, uint32_t target) {
 }
 
 static uint32_t alloc_gpr(L *l) {
+#ifdef SM86_TOOL
+    if (getenv("SM86_POOL")) {
+        fprintf(stderr, "alloc: ur_next %u scratch_base %u max_gpr %u up_reg %u; needs:", l->ur_next, l->scratch_base, l->max_gpr, l->up_reg);
+        for (int n = 0; n < 63; n++) if (l->needs_reg[n]) fprintf(stderr, " UR%d(k%d%s)", n, l->ur_def[n].kind, l->ur_map[n] ? "=R" : "");
+        fprintf(stderr, "\n");
+    }
+#endif
     if (l->ur_next >= l->scratch_base) return fail(l, "no general register free for a uniform register"), NOREG;
     l->reserved[l->ur_next / 64] |= 1ull << (l->ur_next % 64);
     return l->ur_next++;
@@ -170,26 +178,57 @@ struct Src {
 static Src reg_src(uint32_t r) { Src s = {0}; s.reg = r; return s; }
 
 // The general register standing in for uniform register n (URZ = RZ).
+// Liveness mode: a register neither reserved nor live anywhere in instructions a..b (NOREG when there is none).
+static uint32_t alloc_dead(L *l, uint32_t a, uint32_t b) {
+    uint64_t busy[4];
+    memcpy(busy, l->reserved, sizeof busy);
+    for (uint32_t i = a; i <= b && i < l->n; i++)
+        for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w];
+    for (uint32_t c = 0; c < 255; c++)
+        if (!(busy[c / 64] >> (c % 64) & 1)) { l->reserved[c / 64] |= 1ull << (c % 64); return c; }
+    return NOREG;
+}
+
 static uint32_t ur(L *l, uint32_t n) {
     if (n == 63) return RZ;
     if (n > 63) return fail(l, "uniform register number"), RZ;
     if (l->scanned && !l->needs_reg[n]) return fail(l, "uniform register read the scan did not see"), RZ;
     if (!l->ur_map[n]) {
         uint32_t r = NOREG;
+        if (l->ur_pair[n] && l->needs_reg[n ^ 1] && !l->ur_map[n ^ 1] && l->ur_next + 1 < l->scratch_base) {
+            // Both halves of a pair at once, so they land in adjacent registers whatever the order of first use.
+            uint32_t e = n & ~1u, r0 = alloc_gpr(l), r1 = alloc_gpr(l);
+            if (r0 == NOREG || r1 == NOREG) return RZ;
+            l->ur_map[e] = (uint8_t)r0, l->ur_map[e + 1] = (uint8_t)r1;
+            return l->ur_map[n];
+        }
         if (l->ur_next < l->scratch_base) r = alloc_gpr(l);
         else if (l->liveness) {
             // No room above the program's registers: one dead over the instructions the uniform register spans
-            // (the whole program when it is read before any definition).
+            // (the whole program when it is read before any definition); a pair takes two adjacent ones dead over
+            // both halves' spans.
             uint32_t a = l->ur_whole[n] || !l->ur_first[n] ? 0 : l->ur_first[n] - 1;
             uint32_t b = l->ur_whole[n] || !l->ur_last[n] ? l->n - 1 : l->ur_last[n] - 1;
-            uint64_t busy[4];
-            memcpy(busy, l->reserved, sizeof busy);
-            for (uint32_t i = a; i <= b && i < l->n; i++)
-                for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w];
-            for (uint32_t c = 0; c < 255 && r == NOREG; c++)
-                if (!(busy[c / 64] >> (c % 64) & 1)) r = c;
+            if (l->ur_pair[n] && l->needs_reg[n ^ 1] && !l->ur_map[n ^ 1]) {
+                uint32_t m = n ^ 1, e = n & ~1u;
+                uint32_t a2 = l->ur_whole[m] || !l->ur_first[m] ? 0 : l->ur_first[m] - 1;
+                uint32_t b2 = l->ur_whole[m] || !l->ur_last[m] ? l->n - 1 : l->ur_last[m] - 1;
+                if (a2 < a) a = a2;
+                if (b2 > b) b = b2;
+                uint64_t busy[4];
+                memcpy(busy, l->reserved, sizeof busy);
+                for (uint32_t i = a; i <= b && i < l->n; i++)
+                    for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w];
+                for (uint32_t c = 0; c + 1 < 255; c++)
+                    if (!(busy[c / 64] >> (c % 64) & 1) && !(busy[(c + 1) / 64] >> ((c + 1) % 64) & 1)) {
+                        l->reserved[c / 64] |= 1ull << (c % 64), l->reserved[(c + 1) / 64] |= 1ull << ((c + 1) % 64);
+                        l->ur_map[e] = (uint8_t)c, l->ur_map[e + 1] = (uint8_t)(c + 1);
+                        return l->ur_map[n];
+                    }
+                return fail(l, "no register pair dead over a uniform pair's span"), RZ;
+            }
+            r = alloc_dead(l, a, b);
             if (r == NOREG) return fail(l, "no general register dead over a uniform register's span"), RZ;
-            l->reserved[r / 64] |= 1ull << (r % 64);
         } else {
             return fail(l, "no general register free for a uniform register"), RZ;
         }
@@ -275,6 +314,7 @@ static void scan_registers(L *l) {
         int b_is_reg = base < 0x100 ? form == 1 || form == 2 || form == 3 || form == 7 : 1;
         if (base >= 0x100 && (form == 4 || form == 5 || form == 6 || op == 0xf60)) b_is_reg = 0;
         if (base == 0x182 || base == 0x181 || base == 0x183 || base == 0x184) b_is_reg = base != 0x182 && !bits(x, 91, 1);
+        if (base == 0x19b) b_is_reg = 1;                           // SUST: the data register at 32-37 beside the handle's constant
         for (int k = 0; k < 4; k++) {
             if (k == 2 && !b_is_reg) continue;
             if (f[k] != RZ && f[k] > m) m = f[k];
@@ -431,6 +471,11 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
     if (c_reg || base == 0x122 || base == 0x189 || tex) set_run(use, f64, base == 0x025 ? 2 : tex ? 1 : 1);
     if (base == 0x122) set_run(use, f32, bits(x, 74, 2) + 1);     // AST data
     if (base == 0x121) set_run(use, f32, 1);                      // ALD vertex register
+    if (base == 0x19b) {                                          // SUST: coordinates by the dimension, data by the mask
+        static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
+        set_run(use, f24, coords[bits(x, 61, 3)]);
+        set_run(use, f32 & 0x3f, (uint32_t)__builtin_popcount(bits(x, 72, 4)));
+    }
 }
 
 // ---- uniform registers: definitions, forwarding and the registers they need
@@ -551,6 +596,7 @@ static void scan_uniform(L *l) {
             if (w < 63) {
                 cur[w].kind = kind, cur[w].bank = bank, cur[w].value = value;
                 if (pair && w + 1 < 63) cur[w + 1].kind = kind == 1 ? 1 : 3, cur[w + 1].bank = bank, cur[w + 1].value = value + 4;
+                if (pair && w + 1 < 63 && !(w & 1)) l->ur_pair[w] = l->ur_pair[w + 1] = 1;
             }
         }
     }
@@ -589,7 +635,7 @@ static void scan_uniform(L *l) {
     // one for the uniform predicates when they are swapped through a register. The scratch block starts above them.
     uint32_t nur = 0;
     for (uint32_t n = 0; n < 63; n++)
-        if (l->ur_def[n].kind == 3 && l->needs_reg[n]) nur++;
+        if (l->needs_reg[n]) nur++;                               // defined or not (a read before any definition)
     if ((l->used_preds & 0x7f) == 0x7f)                           // the uniform predicates' register (up_swap)
         for (uint32_t i = 0; i < l->n; i++) if (up_fields(&l->in[i])) { nur++; break; }
     l->scratch_base = l->ur_next + nur > 255 ? 255 : l->ur_next + nur;
@@ -985,6 +1031,15 @@ static void lower_lop3(L *l, const Insn *x) {
                 ((uint64_t)(pout == 7 ? 0 : 3) << 36) | ((uint64_t)rc << 39) | ((uint64_t)pout << 48));
 }
 
+// The carry in of the .X forms: t += 1 when predicate p (inverted by inv) holds. Nothing for !PT.
+static void add_carry_in(L *l, uint32_t t, uint32_t p, int inv) {
+    if (p == 7 && inv) return;
+    uint32_t one = S(l, 6);
+    mov_imm(l, one, 1);
+    if (p != 7) emit(l, base(l, 0x5ca0000000000000ull, one, one) | ((uint64_t)RZ << 20) | ((uint64_t)p << 39) | ((uint64_t)inv << 42));
+    emit(l, base(l, 0x5c10000000000000ull, t, t) | ((uint64_t)one << 20));
+}
+
 // IADD3: a + b + c; negations 72 (a), 63 (b, register and constant forms), 75 (c); .X 74; carry outs 81-83 and
 // 84-86; carry ins 87-89 (90) and 77-79 (80).
 static void lower_iadd3(L *l, const Insn *x, uint32_t op) {
@@ -1067,12 +1122,15 @@ static void lower_iadd3(L *l, const Insn *x, uint32_t op) {
 
 // LEA: Rd = (Ra << shift) + Rb (shift 75-79); 72 negates the shifted a; .HI 80; carry out 81-83; .X 74 with the
 // carry in at 87-90; 63 negates Rb in the register and constant forms. Maxwell LEA: a 8, b 20 (register, constant
-// or 20-bit immediate), shift 39-43, NegA 45, X 46, carry out predicate 48-50.
+// or 20-bit immediate), shift 39-43, NegA 45, X 46, carry out predicate 48-50; the translator reads neither X nor the
+// carry predicate (Ryujinx InstEmitIntegerArithmetic.cs EmitLea / EmitLeaHi), so carries go through comparisons.
 static void lower_lea(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), shift = bits(x, 75, 5), cout = bits(x, 81, 3);
     Src a = src0(x, 0), b = srcn(l, x, 1, 0);
     int neg_b = op == 0x811 ? 0 : bits(x, 63, 1), neg_a = bits(x, 72, 1);
-    if (bits(x, 74, 1) || bits(x, 87, 4) != 15) return (void)fail(l, "LEA mode");
+    int ext = bits(x, 74, 1);
+    uint32_t cin = bits(x, 87, 3), cin_inv = bits(x, 90, 1);
+    if (!ext && bits(x, 87, 4) != 15) return (void)fail(l, "LEA carry in without .X");
     if (neg_b) return (void)fail(l, "LEA negated addend");
     if (bits(x, 80, 1)) {
         // LEA.HI: Rd = Rb + the high word of (Rc:Ra << shift): SHF.L Rt = (Rc:Ra) << shift high, or a right shift
@@ -1086,19 +1144,35 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
             emit(l, base(l, 0x36f8000000000000ull, t, a.reg) | ((uint64_t)shift << 20) | ((uint64_t)rc << 39));
         }
         uint32_t rb = to_reg(l, b, 1, 0, 0);
-        if (cout == 7) {
+        if (cout == 7 && !ext) {
             emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)rb << 20));
             return;
         }
         emit(l, base(l, 0x5c10000000000000ull, t, t) | ((uint64_t)rb << 20));
-        emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)cout << 3) | ((uint64_t)t << 8) | ((uint64_t)rb << 20) |
-                    ((uint64_t)7 << 39) | ((uint64_t)1 << 49));
+        if (cout != 7)       // Pc = t < b (unsigned): the sum wrapped
+            emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)cout << 3) | ((uint64_t)t << 8) | ((uint64_t)rb << 20) |
+                        ((uint64_t)7 << 39) | ((uint64_t)1 << 49));
+        if (ext) add_carry_in(l, t, cin, cin_inv);
         mov_reg(l, rd, t);
         return;
     }
-    int is32;
-    uint64_t w = b_slot(l, b, 0x5bd0000000000000ull, 0x4bd0000000000000ull, 0x36d0000000000000ull, 0, 0, 1, &is32);
-    emit(l, w | l->pred | rd | ((uint64_t)a.reg << 8) | ((uint64_t)shift << 39) | ((uint64_t)neg_a << 45) | ((uint64_t)cout << 48));
+    if (cout == 7 && !ext) {
+        int is32;
+        uint64_t w = b_slot(l, b, 0x5bd0000000000000ull, 0x4bd0000000000000ull, 0x36d0000000000000ull, 0, 0, 1, &is32);
+        emit(l, w | l->pred | rd | ((uint64_t)a.reg << 8) | ((uint64_t)shift << 39) | ((uint64_t)neg_a << 45));
+        return;
+    }
+    // With a carry out or in: Ryujinx ignores Maxwell LEA's carry predicate and X, so the sum is made by hand:
+    // t = (a << shift) + b, the carry out Pc = t < b (unsigned), the carry in added from its predicate.
+    if (neg_a) return (void)fail(l, "LEA carry with a negated source");
+    uint32_t t = S(l, 2), rb = to_reg(l, b, 1, 0, 0);
+    emit(l, base(l, 0x3848000000000000ull, t, a.reg) | ((uint64_t)shift << 20));   // SHL imm
+    emit(l, base(l, 0x5c10000000000000ull, t, t) | ((uint64_t)rb << 20));
+    if (cout != 7)
+        emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)cout << 3) | ((uint64_t)t << 8) | ((uint64_t)rb << 20) |
+                    ((uint64_t)7 << 39) | ((uint64_t)1 << 49));
+    if (ext) add_carry_in(l, t, cin, cin_inv);
+    mov_reg(l, rd, t);
 }
 
 // IMAD (0x024 forms): a * b + c, low 32 bits (signedness 73 does not change them). Also the compiler's moves
@@ -1108,8 +1182,20 @@ static void lower_imad(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8);
     Src a = src0(x, 0), b = srcn(l, x, 1, 0), c = srcn(l, x, 2, 0);
     int ext = bits(x, 74, 1), neg_c = bits(x, 75, 1);
-    if (ext || bits(x, 76, 5) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) || bits(x, 87, 4) != 15)
+    if (bits(x, 76, 5) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) || (!ext && bits(x, 87, 4) != 15))
         return (void)fail(l, "IMAD mode");
+    if (ext) {
+        // IMAD.X: a * b + c + the carry predicate (87-89, inverted by 90): the product and addend by the plain
+        // lowering into Rd, then the carry; the plain lowering reads Rd's sources before it writes Rd.
+        if (neg_c) return (void)fail(l, "IMAD.X negated addend");
+        Insn y = *x;
+        y.w[2] &= ~(1u << (74 - 64));                        // the plain instruction
+        y.w[2] |= 0xfu << (87 - 64);                         // with no carry in
+        lower_imad(l, &y, op);
+        if (l->failed) return;
+        add_carry_in(l, rd, bits(x, 87, 3), bits(x, 90, 1));
+        return;
+    }
     if (a.reg == RZ && b.kind == 0 && b.reg == RZ) {                   // IMAD.MOV.U32 Rd, RZ, RZ, c
         if (neg_c && c.kind == 0) {
             emit(l, base(l, 0x5c10000000000000ull, rd, RZ) | ((uint64_t)c.reg << 20) | ((uint64_t)1 << 48));
@@ -1154,7 +1240,7 @@ static void lower_imad_wide(L *l, const Insn *x) {
     int is_signed = bits(x, 73, 1);
     Src a = src0(x, 0), b = srcn(l, x, 1, 0);
     if (bits(x, 72, 1) || bits(x, 74, 7) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) ||
-        bits(x, 87, 4) != 15 || (rd & 1) || rd == RZ || (c != RZ && (c & 1)))
+        bits(x, 87, 4) != 15 || rd >= 254 || (c != RZ && c >= 254))
         return (void)fail(l, "IMAD.WIDE mode");
     uint32_t rb = to_reg(l, b, 1, 0, 0);
     uint32_t lo = S(l, 2), hi = S(l, 3);
@@ -1438,6 +1524,21 @@ static void lower_stg(L *l, const Insn *x, uint32_t op) {
     }
     emit(l, 0xeed8000000000000ull | l->pred | data | ((uint64_t)address << 8) | ((uint64_t)offset << 20) | ((uint64_t)1 << 45) |
                 ((uint64_t)size << 48));
+}
+
+// SUST.P (0xb9b: the image handle from a constant-buffer word at 38-53 with its bank at 54-58, as the game's compute
+// shaders bind their images): coordinates at 24-31 (their count by the dimension at 61-63, NVN's order 1D, buffer,
+// 1D array, 2D, 2D array, 3D), data at 32-37, channel mask 72-75. Maxwell SUST.B (bindless, Ryujinx InstSustB):
+// data 0-7, coordinates 8-15, mask 20-23, dimension 33-35, handle register 39-46; the handle is loaded from the
+// constant word as TEX.B's is, and the translator's bindless elimination turns it back into the constant's slot.
+static void lower_sust(L *l, const Insn *x) {
+    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 6), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
+    if (bits(x, 38, 2) || bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 0) return (void)fail(l, "SUST mode");
+    Src h = srcn(l, x, 1, 0);
+    if (h.kind != 2 || !cbuf_ok(&h)) return (void)fail(l, "SUST handle");
+    uint32_t hr = to_reg(l, h, 4, 0, 0);
+    emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
+                ((uint64_t)hr << 39));
 }
 
 // TEX (0xb60: handle from a constant-buffer word, its dword index at 40-53 and bank at 54-58; 0xf60: handle in a
@@ -1832,7 +1933,14 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     if (plain == 0x025) {                                     // a pair: both registers, or neither (dropped)
         if (!ur_has_reg(l, dst) && !ur_has_reg(l, dst + 1) && bits(x, 81, 6) == 0x3f) return;
         if (!ur_has_reg(l, dst) || !ur_has_reg(l, dst + 1)) return (void)fail(l, "uniform pair half without a register");
-        if (ur(l, dst + 1) != ur(l, dst) + 1) return (void)fail(l, "uniform pair not adjacent");
+        if (ur(l, dst + 1) != ur(l, dst) + 1) {
+#ifdef SM86_TOOL
+            if (getenv("SM86_POOL"))
+                fprintf(stderr, "pair UR%u: map %u %u pair flags %u %u needs %u %u ur_next %u scratch_base %u\n", dst, l->ur_map[dst],
+                        l->ur_map[dst + 1], l->ur_pair[dst], l->ur_pair[dst + 1], l->needs_reg[dst], l->needs_reg[dst + 1], l->ur_next, l->scratch_base);
+#endif
+            return (void)fail(l, "uniform pair not adjacent");
+        }
     } else if (!ur_has_reg(l, dst) && bits(x, 81, 6) == 0x3f && dst != 63) {
         return;                                               // never read, no carry out: nothing to compute
     }
@@ -1842,7 +1950,10 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     if (has_c) y.w[2] = (x->w[2] & ~0xffu) | ur_in(l, bits(x, 64, 8), 7);
     y.w[2] &= ~(1u << 27);                                    // bit 91: the uniform marker
     if (plain == 0x010 || plain == 0x011 || plain == 0x012 || plain == 0x024 || plain == 0x025) {
+        // The predicate fields the op has (NAK's encoders): IADD3 77, 81, 84, 87; LEA, LOP3, IMAD, IMAD.WIDE 81, 87.
+        // The others are 0 in NAK's encoding, not 7, and must not be read as UP0.
         for (unsigned f = 77; f <= 87; f += (f == 77 ? 4 : 3)) {
+            if (plain != 0x010 && (f == 77 || f == 84)) continue;
             uint32_t v = bits(x, f, 3);
             if (v != 7) y.w[2] = (y.w[2] & ~(7u << (f - 64))) | (up(l, v) << (f - 64));
         }
@@ -2201,7 +2312,10 @@ static void lower_one(L *l, const Insn *x) {
     uint32_t swap = l->up_swap ? up_fields(x) : 0;
     if (swap) {
         // Save P(mask), load the uniform predicates into them, run the instruction, merge them back, restore.
-        if (!l->up_reg) { l->up_reg = alloc_gpr(l); if (l->up_reg == NOREG) return; }
+        if (!l->up_reg) {
+            l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
+            if (l->up_reg == NOREG) return (void)fail(l, "no general register free for the uniform predicates");
+        }
         uint32_t save = S(l, 7);
         emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)swap << 20));
         emit(l, 0x38f0000000070000ull | ((uint64_t)l->up_reg << 8) | ((uint64_t)swap << 20));
@@ -2267,6 +2381,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x381: case 0x981: return lower_ldg(l, x, op);
     case 0x386: case 0x986: return lower_stg(l, x, op);
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
+    case 0xb9b: return lower_sust(l, x);
     case 0xb63: case 0xf63: return lower_tld4(l, x, op);
     case 0xb66: case 0xf66: return lower_tld(l, x, op);
     case 0xb6f: case 0x370: return lower_txq(l, x, op);

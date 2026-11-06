@@ -25,10 +25,10 @@ As of 2026-11-05 (details and dates in [docs/plan.md](docs/plan.md), the shader 
   lowers, and every lowered program translates), and the host binds the lowered jump tables itself. With that the
   boot logo renders at 60 fps through translated shaders.
 - Where it stops: the title screen, which in this version is a looping cinematic. SDK 22's movie library decodes
-  through console services this host does not serve; a null stand-in (`runtime/ov_movie22.c`) carries the game's
-  decoder protocol so it no longer aborts, but shows no picture: the title is AV1 at 1920x1080, and decoding it on
-  the host (dav1d) is the next step. After that: the 656 skinning vertex shaders the lowering still refuses (register
-  pressure), the surface stores and the mesh stages.
+  through console services this host does not serve; `runtime/ov_movie22.c` replaces it and decodes the AV1
+  stream with dav1d, but the picture stays black: the game's video path, and its rendering, run a neural upscaler
+  on the Switch 2's tensor cores (HMMA, LDSM, MOVM), which no Maxwell translator has. Lowering those is the next
+  step; after it, the 656 skinning vertex shaders the lowering still refuses (register pressure) and the mesh stages.
 
 Builds run with Windows Python and MSYS2 Clang (`tools/build_game.py`), the shader translator with .NET
 (`tools/build_xlate.py`); see the plan for the set-up.

@@ -40,6 +40,44 @@ Steps 1 to 3 of the order of work below are done; step 4 is at 86% of the corpus
   the lowered program's c1 (`gfx_shader_c1`, uploaded once per shader) as uniform slot 1 instead of the game's, since
   the jump tables' targets moved with the code.
 
+## Status (2026-11-06)
+
+The game plays its title cinematic through a host decoder, and the picture is still black for a reason outside the
+shaders lowered so far: the game's video path runs on the tensor cores.
+
+- `runtime/ov_movie22.c` decodes the cinematics with dav1d (linked statically from MSYS2, BSD-2, row in
+  `THIRD_PARTY_NOTICES.md`): the title is "video/av01" 1920x1080 at 60 fps, a 64 s stream with a key frame every
+  321 samples (`nn::movie::Buffer` flag 4 marks those, not the end of the stream, which is an empty flagged buffer).
+  Frames come back to the game as NV12 in the buffer it registered (it reads planes 0 and 1 only), with the
+  sample's time stamp. Audio is still dropped. The decode runs on the game's decode thread; the game then runs
+  at about 14 fps there, to be profiled (dav1d on 4 threads, the NV12 interleave, or the game waiting on frames).
+- The lowering grew: SUST (bindless store, the handle loaded from the constant word), LEA and IMAD.X carries
+  through comparisons and predicate adds (the translator ignores Maxwell LEA's carry predicate and X), the
+  uniform register budget counts registers read before any definition, uniform pairs are allocated adjacently
+  in both the pool and the liveness mode, the swap register for uniform predicates comes from the liveness
+  allocator when the pool is full, and only the predicate fields an op has are rewritten. Corpus: 13,514 of 14,363
+  lower (94.1%), all translate.
+- What blocks the picture: every shader of the video path (19 compute programs, dumped by the host to
+  `shader-cache/<key>.fail.{ctl,code}` for `tools/sm86_dis.py`) uses the tensor-core instructions: HMMA (0x03c,
+  4,478 instructions), LDSM (0x03b, 1,670) and MOVM (0x03a, 24). They are the game's neural upscaler (the SDK
+  list names "SMAA_For_NDSR"; the swapchain is 2560x1440 while the movie is 1080p), and they are not in the RomFS
+  archives the census reads (nor in the ExeFS modules; the raw `romfs.bin` has no match either, so they sit in a
+  compressed file the census does not visit, or the game builds them). NVN2 device property `0x67`, kept by the
+  game as a capability flag and required by its video surface setup, is most likely "supports tensor cores".
+  Next: lower HMMA.16816 / 1688 f16 (LDSM's matrix loads into per-lane fragments, the warp-cooperative product
+  through SHFL and FFMA, MOVM's transpose) in front of the translator, or find the non-tensor path if the game has
+  one (with `0x67` = 0 the player aborted in its surface setup; the shader's decision may lie elsewhere).
+- Reaching the game proper: `OOT_INPUT_SCRIPT` (lines "<ticks> A 10") passes the title; the file select and the
+  opening are cinematics too, so they need the same path.
+- The intermittent death right after the first frame (one run in three, exit 40 or 5): the crash handler's dump
+  (`main.c`) caught two. One executed from the thread's own stack while logging a guest `Break` from
+  `sdk+0x1a5560` (the SDK abort), the log line itself garbled; the other executed from the heap region of the
+  `Cpu` structures with `rt_svc+0x59` (after `svc_body`: the host-depth bookkeeping, `kern_preempt_pending` /
+  `kern_host_left`) as the return address and lifted `main+0x3779bc0` below it. Both point at the asynchronous
+  preemption (`kernel.c`, the interrupt trampoline that pushes the interrupted thread's registers on its stack).
+  Test: `OOT_ASYNC_PREEMPT=0` over several runs; then read the trampoline against a thread suspended inside host
+  code.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485

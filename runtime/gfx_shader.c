@@ -1333,8 +1333,11 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     // The SM86 program lowered to Maxwell: the translator's input, with its moved jump tables as c1.
     Sm86Lowered low;
     if (!sm86_lower(code, r->length, control, CONTROL_BOUND, &low)) {
-        char msg[160];
+        char msg[160], dump[PATH_CAP + 80];
         snprintf(msg, sizeof msg, "lowering failed at +%#x: %s", low.error_offset, low.error);
+        // The program as the lowering saw it, for tools/sm86_dis.py (copy to the census ctl/ and code/ dirs).
+        snprintf(dump, sizeof dump, "%s\\%s.fail.ctl", cache_dir, hex), write_file(dump, control, r->ctl.size);
+        snprintf(dump, sizeof dump, "%s\\%s.fail.code", cache_dir, hex), write_file(dump, code, r->length);
         return fail(msg, hex);
     }
     if (!write_file(code_path, low.code, low.code_size)) return sm86_lower_free(&low), fail("cannot write the code file", hex);

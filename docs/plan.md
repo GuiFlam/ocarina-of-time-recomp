@@ -175,9 +175,12 @@ the game runs through the title loop with a black picture. Found on the way: NVN
 to the earlier ports, is a capability the game keeps as a flag and sizes its video surfaces by; answering 0 made the
 player abort in its surface setup, 1 (unverified) lets it through. Also seen: about one run in three dies right after
 the first frame with an access violation on a host thread at an address in no module (exit code 40 or 5, no FATAL
-line); `main.c`'s crash handler now dumps that thread's registers and stack for the next occurrence. Next: decode
-the AV1 stream on the host (dav1d, BSD-2) into the registered `VideoFrame`s, then the title's input
-(`OOT_INPUT_SCRIPT`) to reach the game proper.
+line); `main.c`'s crash handler now dumps that thread's registers and stack for the next occurrence. The next day the
+cinematic decodes on the host (dav1d, NV12 frames back to the game), and the picture is still black: the game's
+video path, like its rendering at 2560x1440, runs a neural upscaler on the tensor cores (HMMA, LDSM, MOVM in 19
+compute programs that the shader archives do not hold), which no Maxwell translator has. That lowering is the next
+step (`docs/phase3.md`, Status 2026-11-06), together with the crash after the first frame that the crash dump now
+traces to the asynchronous preemption's bookkeeping.
 
 
 ## Shared core
