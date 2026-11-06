@@ -205,6 +205,7 @@ static const int devinfo[] = {   // Tegra X1 values (nnheaders nvn_DeviceConstan
     [0x4E] = 1024, [0x4F] = 32, [0x50] = 4096, [0x51] = 65536, [0x52] = 65536, [0x53] = 256, [0x54] = 16384,
     [0x55] = 262144, [0x56] = 4096, [0x57] = 1, [0x58] = 4, [0x59] = 2, [0x5A] = 0, [0x5B] = 4096, [0x5C] = 16384,
     [0x5D] = 4096, [0x5E] = 128, [0x5F] = 4096,   // 0x5F (separate sampler bindings) from the sampler pool limit, unverified
+    [0x67] = 1,   // NVN2: a capability (OoT 1.1.1 keeps it as a flag bit and sizes its video surfaces by it; 0 aborts the movie player), unverified
 };
 
 // void nvnDeviceBuilderSetDefaults(NVNdeviceBuilder *b)

@@ -160,18 +160,6 @@ HOST_OVERRIDE("_ZN2nn6socket11EventFdReadEiPm", ov_eventfd_read);
 HOST_OVERRIDE("_ZN2nn6socket12EventFdWriteEim", ov_socket_ok);
 
 
-// movie (SDK 22's movie::VideoDecoder / AudioDecoder, not the movie::Decoder of ov_movie.c): their Initialize opens
-// the multimedia services this host does not serve and aborts in the SDK. Until a host decoder stands in, both fail
-// with a movie result so the game can skip the video (2026-11-05: the opening video, after the boot logo).
-#define MOVIE_R_UNAVAILABLE (342u | (1u << 9))   // module 342 (movie), description 1
-static void ov_movie_init_fail(Cpu *c) {
-    static volatile LONG said;
-    if (InterlockedIncrement(&said) <= 2) rt_log("movie: decoder Initialize refused (no host decoder for SDK 22's movie API yet)");
-    ret_x(c, MOVIE_R_UNAVAILABLE);
-}
-HOST_OVERRIDE("_ZN5movie12VideoDecoder10InitializeEPvmN2nn5movie13MediaMimeTypeENS_24VideoDecoderOutputFormatENS_14VideoCodecModeE", ov_movie_init_fail);
-HOST_OVERRIDE("_ZN5movie12AudioDecoder10InitializeEPvmN2nn5movie13MediaMimeTypeENS_24AudioDecoderOutputFormatENS_14AudioCodecModeE", ov_movie_init_fail);
-
 // nn::ssl: Initialize succeeds without ssl:s; making a context or reading the built-in certificates fails with an
 // ssl-module result (module 123). Context's constructor and destructor are local SDK code and stay lifted.
 #define SSL_R_UNAVAILABLE (123u | (1u << 9))

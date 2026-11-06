@@ -11,8 +11,27 @@ core survives a new console generation.
 
 ## Status
 
-Phase 0, the survey: nothing runs yet. The tree is metroid-prime-4-recomp's, renamed; the game-bound tables in it are
-still Metroid Prime 4's (see [docs/plan.md](docs/plan.md)).
+As of 2026-11-05 (details and dates in [docs/plan.md](docs/plan.md), the shader work in
+[docs/phase3.md](docs/phase3.md)):
+
+- The dump extracts (`tools/extract_nup.py`, the Switch 2's `.nup` container and zbic-compressed NSOs), the three
+  game modules lift to C and `oot.exe` builds and links (Phase 1).
+- The game runs its whole start-up without a crash: audio, saves, the NPLN services offline, 3,661 shader programs
+  loaded, and presents frames (Phase 2). On the way the port met the Switch 2 and SDK 22 differences listed in the
+  plan (new kernel queries, thread-local layout, PAC prologues, NVN2 entry points).
+- Phase 3, the shaders: the Switch 2's shaders are SM86 (Ampere) code in an NVN2 container, which the Maxwell
+  translator from the earlier ports cannot read. `tools/shader_census.py` pulls the 14,363 programs out of the game's
+  archives, `runtime/sm86_lower.c` lowers them to Maxwell in front of the unchanged translator (93.6% of the corpus
+  lowers, and every lowered program translates), and the host binds the lowered jump tables itself. With that the
+  boot logo renders at 60 fps through translated shaders.
+- Where it stops: the title screen, which in this version is a looping cinematic. SDK 22's movie library decodes
+  through console services this host does not serve; a null stand-in (`runtime/ov_movie22.c`) carries the game's
+  decoder protocol so it no longer aborts, but shows no picture: the title is AV1 at 1920x1080, and decoding it on
+  the host (dav1d) is the next step. After that: the 656 skinning vertex shaders the lowering still refuses (register
+  pressure), the surface stores and the mesh stages.
+
+Builds run with Windows Python and MSYS2 Clang (`tools/build_game.py`), the shader translator with .NET
+(`tools/build_xlate.py`); see the plan for the set-up.
 
 This repository contains no game content. You need your own dump of the game and the keys from your own console. The
 content check (`tools/check_content.py`, run by the pre-commit hook and CI) keeps it that way.

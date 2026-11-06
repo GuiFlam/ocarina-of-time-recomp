@@ -167,6 +167,18 @@ showed the main thread, pinned to core 2, waiting for that core, held by the NPL
 the host's `nnsocketPoll` override (`ov_oot.c`): a blocking host wait that did not give its virtual core up, as the
 NVN waits do through `kern_core_away`. Fixed there.
 
+The boot logo renders at 60 fps; then the title screen, which is a looping AV1 cinematic (1920x1080, 60 fps, 321
+samples per loop) played through SDK 22's `movie::VideoDecoder`, an API none of the earlier ports had: its
+`Initialize` opens the Switch 2's codec services and aborts in the SDK. `runtime/ov_movie22.c` replaces the decoder
+classes with a null decoder that carries the game's protocol (events, registered frames, end-of-stream buffers), and
+the game runs through the title loop with a black picture. Found on the way: NVN2 device property `0x67`, unknown
+to the earlier ports, is a capability the game keeps as a flag and sizes its video surfaces by; answering 0 made the
+player abort in its surface setup, 1 (unverified) lets it through. Also seen: about one run in three dies right after
+the first frame with an access violation on a host thread at an address in no module (exit code 40 or 5, no FATAL
+line); `main.c`'s crash handler now dumps that thread's registers and stack for the next occurrence. Next: decode
+the AV1 stream on the host (dav1d, BSD-2) into the registered `VideoFrame`s, then the title's input
+(`OOT_INPUT_SCRIPT`) to reach the game proper.
+
 
 ## Shared core
 

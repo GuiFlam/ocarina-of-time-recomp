@@ -446,6 +446,29 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
                 GetModuleFileNameW(m, name, MAX_PATH);
             rt_logf("exception %#lx at host %p (%ls+%#llx, thread %lu), left to its own handler\n", code, (void *)rip, name,
                     (unsigned long long)(m ? rip - (uintptr_t)m : 0), GetCurrentThreadId());
+            // Where it came from, for an address in no module (a jump through a bad pointer): the registers, the
+            // faulting address, and the stack's first words that point into the exe (tools/resolve_map.py names them).
+            const CONTEXT *cx = ep->ContextRecord;
+            uint64_t fault = ep->ExceptionRecord->NumberParameters >= 2 ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
+            rt_logf("  rsp %#llx rbp %#llx rax %#llx rcx %#llx rdx %#llx r8 %#llx r9 %#llx %s %#llx\n",
+                    (unsigned long long)cx->Rsp, (unsigned long long)cx->Rbp, (unsigned long long)cx->Rax,
+                    (unsigned long long)cx->Rcx, (unsigned long long)cx->Rdx, (unsigned long long)cx->R8,
+                    (unsigned long long)cx->R9, ep->ExceptionRecord->ExceptionInformation[0] == 8 ? "executing" : "address",
+                    (unsigned long long)fault);
+            MEMORY_BASIC_INFORMATION mb;
+            if (VirtualQuery((const void *)(uintptr_t)rip, &mb, sizeof mb))
+                rt_logf("  rip's region: base %p size %#llx state %#lx protect %#lx type %#lx\n", mb.BaseAddress,
+                        (unsigned long long)mb.RegionSize, mb.State, mb.Protect, mb.Type);
+            const uint64_t *st = (const uint64_t *)(uintptr_t)cx->Rsp;
+            int shown = 0;
+            for (int i = 0; i < 256 && shown < 12; i++) {
+                if (VirtualQuery(st + i, &mb, sizeof mb) == 0 || mb.State != MEM_COMMIT || (mb.Protect & (PAGE_GUARD | PAGE_NOACCESS))) break;
+                uint64_t v = st[i];
+                if (v - (uintptr_t)mi.lpBaseOfDll < mi.SizeOfImage) {
+                    rt_logf("  stack[%d] = exe+%#llx\n", i, (unsigned long long)(v - (uintptr_t)mi.lpBaseOfDll));
+                    shown++;
+                }
+            }
             fflush(stderr);
         }
         return EXCEPTION_CONTINUE_SEARCH;
