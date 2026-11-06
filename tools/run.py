@@ -26,6 +26,7 @@ movie pacing, tensor cores, crashes) and exits non-zero when the run failed or a
 """
 import argparse
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -34,8 +35,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# Windows: oot.exe, run from WSL through interop (WSLENV carries the OOT_* variables). Linux: the native binary.
-WIN = sys.platform == "win32"
+# Windows: oot.exe, also when this script runs in WSL, where it starts the program through interop (WSLENV carries the
+# OOT_* variables). Native Linux: the Linux binary.
+IS_WSL = "microsoft" in platform.uname().release.lower()
+WIN = sys.platform == "win32" or IS_WSL
 EXE = ROOT / "build" / "v131072" / ("oot.exe" if WIN else "oot")
 LOGS = ROOT / "build" / "logs"
 PATH_VARS = {"OOT_SHADER_CACHE", "OOT_INPUT_SCRIPT", "OOT_INPUT_RECORD", "OOT_DUMP_DIR", "OOT_XLATE", "OOT_PROFILE_DIR", "OOT_SHOTS_DIR",
