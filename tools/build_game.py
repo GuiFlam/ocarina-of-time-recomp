@@ -234,7 +234,7 @@ def runtime_sources(skip=()):
     return sorted(p for pat in pats for p in RUNTIME.glob(pat)
                   if p.name not in skip and p.name not in left_out
                   and (sys.platform == 'win32' or (p.suffix != '.rc' and not windows_only(p)))
-                  and (sys.platform != 'win32' or p.name != 'linux.c'))
+                  and (sys.platform != 'win32' or (p.name != 'linux.c' and not p.stem.endswith('_linux'))))
 
 
 def runtime_object(out, src):
