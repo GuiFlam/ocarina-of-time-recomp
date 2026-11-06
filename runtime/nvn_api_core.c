@@ -336,7 +336,7 @@ NVN_API(nvnMemoryPoolFinalize) {
     if (pool_gpu_visible(o)) index_del(o);
     gfx_backend()->pool_fini(o);
     if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
-    if (o->host) mem_shadow_release((uintptr_t)o->host), o->host = NULL;
+    if (o->host) mem_shadow_release((uintptr_t)o->host, o->size), o->host = NULL;
     o->mem = o->game_mem;
     o->span = 0;
     o->magic = 0;
