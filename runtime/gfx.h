@@ -94,7 +94,25 @@ typedef struct {
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
+    uint8_t bindless;           // TEX/IMG: a pool-indexed array (Ryujinx BindlessElimination: handle 0x40000000, cbuf 0)
+    uint8_t pool;               // TEX: GFX_POOL_* binding + 1 of that array in the pool set; 0: not one, or unsupported
 } GfxShaderRes;
+// Pool-indexed (bindless) sampling. The translator turns a sample through a handle loaded from a constant buffer into an
+// index into arrays standing for the bound pools: texture id (handle & 0xfffff) into an array of GFX_POOL_TEXTURES
+// separate images per view type, sampler id (handle >> 20) into an array of GFX_POOL_SAMPLERS samplers
+// (tools/xlate/Program.cs TexturePoolLength, SamplerPoolLength). gfx_shader.c moves those arrays to set GFX_POOL_SET,
+// one binding per view type below; a 2D shadow array shares the 2D binding (Vulkan ignores an image type's Depth
+// operand). Every pipeline layout carries the pool set there (vk_pipeline.c), and the replay keeps one persistent set
+// per bound pool pair (vk_exec_draw.c pool sets).
+#define GFX_POOL_SET 2
+#define GFX_POOL_TEXTURES 65536
+#define GFX_POOL_SAMPLERS 4096
+enum { GFX_POOL_SAMPLER, GFX_POOL_1D, GFX_POOL_2D, GFX_POOL_3D, GFX_POOL_CUBE, GFX_POOL_1D_ARRAY, GFX_POOL_2D_ARRAY,
+       GFX_POOL_CUBE_ARRAY, GFX_POOL_BINDINGS };
+// Sampling feedback: a storage buffer of one uint per texture id after the arrays. gfx_shader.c makes every access to a
+// pool texture array store 1 at its id first, and the replay creates only the textures the GPU asked for (creating
+// every live texture of OoT's pool took more than the 12 GB of VRAM).
+#define GFX_POOL_FEEDBACK GFX_POOL_BINDINGS
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res

@@ -125,6 +125,8 @@ static struct {
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
     VkDescriptorSetLayout ds_last_layout[2];
     int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
+    VkPipelineLayout pool_layout;        // graphics layout the pool set was last bound with (pool_bind)
+    VkDescriptorSet pool_set;
     int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
 } B;
 
@@ -382,12 +384,15 @@ static void dummies_init(void) {
 
 static void twins_release(VkCtx *c);
 
-// Releases the stand-ins and the depth twins. The device must be idle; the game path leaves them to process exit like
+static void pool_sets_release(VkCtx *c);
+
+// Releases the stand-ins, the depth twins and the pool sets. The device must be idle; the game path leaves them to process exit like
 // the pipelines.
 void vk_exec_draw_shutdown(void) {
     if (!Z.ready) return;
     VkCtx *c = vk_ctx();
     twins_release(c);
+    pool_sets_release(c);
     for (int i = 0; i < DV_COUNT; i++) {
         if (Z.img[i].sview != Z.img[i].view) vkDestroyImageView(c->device, Z.img[i].sview, NULL);
         vkDestroyImageView(c->device, Z.img[i].view, NULL);
@@ -1533,6 +1538,285 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
     if (v) out->imageView = v, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 }
 
+// ---- pool sets (gfx.h GFX_POOL_SET)
+// A shader that samples through a handle it loads from memory indexes arrays standing for the bound texture and
+// sampler pools (the translator's BindlessElimination). Writing those arrays per draw would be some 100,000
+// descriptors (OoT's texture pool holds 33068 entries), so each bound pool pair gets one persistent set, updated after
+// bind: element k of a view type's binding holds texture id k of the pool, or the stand-in of that view type; element
+// k of the sampler binding holds sampler id k.
+// Only ids the GPU sampled get their texture. Every pool texture access stores 1 at its id in the set's feedback buffer
+// (gfx_shader.c add_pool_feedback), a device-local buffer that each submission which bound the set copies into a
+// host-cached one at its end (vk_exec_pool_feedback); pool_sync reads that every FB_MS (uncached reads of the
+// device-local buffer through the BAR took 20 ms per sync): an id seen there joins the wanted list and is
+// resolved from then on. Creating the texture of every live id instead took more than the 12 GB of VRAM on the level
+// (images are made on first lookup and ASTC decodes to RGBA8). A newly sampled texture so shows the stand-in for a
+// frame or two. For wanted ids, pool_sync rewrites only elements whose slot resolves otherwise (vk_texture_slot_token)
+// and repeats the per-submit storage check of the lookup for CPU-written textures, which a per-draw binding made.
+// A binding is filled the first time a pipeline indexes it.
+// Not covered yet: a pool texture that is also an attachment of the open pass (the feedback scan sees bound slots
+// only), the depth-without-compare point sampler of bound slots (tex_info_lookup), and giving textures back once the
+// GPU stops sampling them (the feedback is never cleared).
+#define POOL_SETS 4
+#define POOL_FLUSH 1024
+#define FB_MS 30.0
+typedef struct {
+    int tbase, sbase, ntex, nsamp;           // slot bases and lengths of the texture and sampler pool
+    VkDescriptorPool dp;
+    VkDescriptorSet set;
+    VkBuffer fb, rb;                         // sampling feedback: one uint per texture id, and its host-cached copy
+    VmaAllocation fb_alloc, rb_alloc;
+    const uint32_t *rb_map;
+    uint64_t used;                           // the last submission (fence) that bound the set
+    double fb_read_ms;                       // when it was last read
+    uint32_t filled;                         // GFX_POOL_* bindings written in full
+    uint32_t tgen, sgen, epoch;              // vk_texture_slots_gen, vk_sampler_gen, vk_texture_epoch at the last sync
+    uint8_t *wanted;                         // per texture id: the GPU sampled it
+    int32_t *list;                           // the wanted ids, nwanted of them
+    int nwanted;
+    uint64_t *tok;                           // per texture id: its slot token at its last resolve (0: never registered)
+    uint8_t *recheck;                        // per texture id: 1 CPU-written (storage check per submit), 2 unresolved
+    VkImageView *view[GFX_POOL_BINDINGS];    // per image binding and id: the view the set holds
+    VkSampler *samp;                         // per sampler id: the sampler the set holds
+} PoolSet;
+static PoolSet PS[POOL_SETS];
+static int nps;
+static struct { uint64_t syncs, scans, resolves, writes, binds, fb_reads; double ms; } PST;   // OOT_TRACE=perf
+
+static const uint16_t pool_rtype[GFX_POOL_BINDINGS] = {0, 1, 3, 4, 5, 0x101, 0x103, 0x105};   // GfxShaderRes.type
+
+static double now_ms_qpc(void) {
+    static double inv;
+    LARGE_INTEGER t;
+    if (!inv) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        inv = 1000.0 / (double)f.QuadPart;
+    }
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * inv;
+}
+
+static struct { VkWriteDescriptorSet w[POOL_FLUSH]; VkDescriptorImageInfo ii[POOL_FLUSH]; uint32_t n; } PW;
+static void pw_flush(void) {
+    if (PW.n) vkUpdateDescriptorSets(vk_ctx()->device, PW.n, PW.w, 0, NULL);
+    PST.writes += PW.n;
+    PW.n = 0;
+}
+static void pw_add(VkDescriptorSet set, uint32_t b, uint32_t el, VkImageView v, VkSampler smp) {
+    if (PW.n == POOL_FLUSH) pw_flush();
+    PW.ii[PW.n] = (VkDescriptorImageInfo){smp, v, VK_IMAGE_LAYOUT_GENERAL};
+    PW.w[PW.n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b,
+                                        .dstArrayElement = el, .descriptorCount = 1,
+                                        .descriptorType = b == GFX_POOL_SAMPLER ? VK_DESCRIPTOR_TYPE_SAMPLER
+                                                                                : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                        .pImageInfo = &PW.ii[PW.n]};
+    PW.n++;
+}
+
+static VkImageView pool_dummy(int b) { return Z.img[dummy_index(res_view_type(pool_rtype[b]), 0)].view; }
+
+// The set of the pool pair bound at this point of the stream; NULL when the device has no pool layout or the table
+// is full. Texture lock held.
+static PoolSet *pool_set_of(const VkExec *ex) {
+    VkDescriptorSetLayout sl = vk_pipeline_pool_layout();
+    if (!sl) return NULL;
+    int tb = nvn_tpool_slot(ex->tex_pool, 0), sb = nvn_spool_slot(ex->samp_pool, 0);
+    for (int i = 0; i < nps; i++)
+        if (PS[i].tbase == tb && PS[i].sbase == sb) return &PS[i];
+    if (nps == POOL_SETS) {
+        warn_once(W_BIND, "more than %d texture and sampler pool pairs: pool-indexed samples of the others read stand-ins", POOL_SETS);
+        return NULL;
+    }
+    PoolSet *p = &PS[nps];
+    memset(p, 0, sizeof *p);
+    p->tbase = tb, p->sbase = sb;
+    p->ntex = ex->tex_pool && ex->tex_pool->n > 0 ? ex->tex_pool->n : GFX_POOL_TEXTURES;
+    p->nsamp = ex->samp_pool && ex->samp_pool->n > 0 ? ex->samp_pool->n : GFX_POOL_SAMPLERS;
+    if (p->ntex > GFX_POOL_TEXTURES || p->nsamp > GFX_POOL_SAMPLERS)
+        rt_log("vk_exec: a pool of %d textures and %d samplers: ids past %d and %d read stand-ins", p->ntex, p->nsamp,
+               GFX_POOL_TEXTURES, GFX_POOL_SAMPLERS);
+    if (p->ntex > GFX_POOL_TEXTURES) p->ntex = GFX_POOL_TEXTURES;
+    if (p->nsamp > GFX_POOL_SAMPLERS) p->nsamp = GFX_POOL_SAMPLERS;
+    VkCtx *c = vk_ctx();
+    VkDescriptorPoolSize sz[3] = {{VK_DESCRIPTOR_TYPE_SAMPLER, GFX_POOL_SAMPLERS},
+                                  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, (GFX_POOL_BINDINGS - 1) * GFX_POOL_TEXTURES},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                     .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, .maxSets = 1,
+                                     .poolSizeCount = 3, .pPoolSizes = sz};
+    if (vkCreateDescriptorPool(c->device, &pi, NULL, &p->dp) != VK_SUCCESS) rt_fatal("vk: the pool set's descriptor pool failed");
+    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = p->dp,
+                                      .descriptorSetCount = 1, .pSetLayouts = &sl};
+    if (vkAllocateDescriptorSets(c->device, &ai, &p->set) != VK_SUCCESS) rt_fatal("vk: the pool set could not be allocated");
+    // The feedback buffer, device-local (the shaders store into it at every pool sample), zeroed by the first copy into
+    // it; its readback copy, host-cached.
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFX_POOL_TEXTURES * 4,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo fa = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo ra = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(c->vma, &bi, &fa, &p->fb, &p->fb_alloc, NULL) != VK_SUCCESS ||
+        vmaCreateBuffer(c->vma, &bi, &ra, &p->rb, &p->rb_alloc, &info) != VK_SUCCESS || !info.pMappedData)
+        rt_fatal("vk: the pool set's feedback buffers failed");
+    memset(info.pMappedData, 0, GFX_POOL_TEXTURES * 4);
+    vmaFlushAllocation(c->vma, p->rb_alloc, 0, VK_WHOLE_SIZE);
+    p->rb_map = info.pMappedData;
+    VkCommandBuffer ucb = vk_upload_begin();   // outside any pass, ahead of this submission in queue order
+    vkCmdFillBuffer(ucb, p->fb, 0, VK_WHOLE_SIZE, 0);
+    vk_upload_end();
+    VkDescriptorBufferInfo dbi = {p->fb, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet fw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = p->set, .dstBinding = GFX_POOL_FEEDBACK,
+                               .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &dbi};
+    vkUpdateDescriptorSets(c->device, 1, &fw, 0, NULL);
+    p->tok = calloc(GFX_POOL_TEXTURES, sizeof *p->tok);
+    p->recheck = calloc(GFX_POOL_TEXTURES, 1);
+    p->wanted = calloc(GFX_POOL_TEXTURES, 1);
+    p->list = calloc(GFX_POOL_TEXTURES, sizeof *p->list);
+    if (!p->tok || !p->recheck || !p->wanted || !p->list) rt_fatal("vk: out of memory");
+    rt_log("vk_exec: pool set %d: texture pool at slot %d (%d ids), sampler pool at slot %d (%d ids)", nps, tb, p->ntex, sb,
+           p->nsamp);
+    nps++;
+    return p;
+}
+
+// Element id of the image bindings in mask: the view of the texture the slot resolves to now. Texture lock held.
+static void pool_resolve(VkExec *ex, PoolSet *p, int id, uint32_t mask) {
+    view_t v;
+    int hv;
+    const VkTexImage *img = vk_texture_live_by_id_locked(p->tbase + id, &v, &hv);
+    p->recheck[id] = img ? (img->mirrored && !img->gpu_owned) : p->tok[id] ? 2 : 0;   // 2: stale or not yet creatable
+    PST.resolves++;
+    for (int b = 1; b < GFX_POOL_BINDINGS; b++) {
+        if (!(mask >> b & 1)) continue;
+        VkImageView view = img ? get_view(ex, img, &v, hv, pool_rtype[b], 0) : VK_NULL_HANDLE;
+        if (!view) view = pool_dummy(b);
+        if (view != p->view[b][id]) p->view[b][id] = view, pw_add(p->set, (uint32_t)b, (uint32_t)id, view, VK_NULL_HANDLE);
+    }
+}
+
+// Brings the set up to the slots for the bindings in mask (filling new ones first). Texture lock held.
+static void pool_sync(VkExec *ex, PoolSet *p, uint32_t mask) {
+    uint32_t tg = vk_texture_slots_gen(), sg = vk_sampler_gen(), ep = vk_texture_epoch();   // before any lookup
+    uint32_t add = mask & ~p->filled;
+    double t0 = now_ms_qpc();
+    int read_fb = t0 - p->fb_read_ms >= FB_MS;
+    if (!add && !read_fb && tg == p->tgen && sg == p->sgen && ep == p->epoch) return;
+    PST.syncs++;
+    int all = 0;   // every wanted id again: a new image binding
+    for (int b = 0; b < GFX_POOL_BINDINGS; b++) {
+        if (!(add >> b & 1)) continue;
+        int n = b == GFX_POOL_SAMPLER ? GFX_POOL_SAMPLERS : GFX_POOL_TEXTURES;
+        VkDescriptorImageInfo *ii = malloc(sizeof *ii * (size_t)n);
+        void *shadow = calloc((size_t)n, sizeof(VkImageView));
+        if (!ii || !shadow) rt_fatal("vk: out of memory");
+        VkImageView dv = b == GFX_POOL_SAMPLER ? VK_NULL_HANDLE : pool_dummy(b);
+        for (int i = 0; i < n; i++) {
+            ii[i] = (VkDescriptorImageInfo){b == GFX_POOL_SAMPLER ? Z.samp : VK_NULL_HANDLE, dv, VK_IMAGE_LAYOUT_GENERAL};
+            if (b == GFX_POOL_SAMPLER) ((VkSampler *)shadow)[i] = Z.samp;
+            else ((VkImageView *)shadow)[i] = dv;
+        }
+        VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = p->set, .dstBinding = (uint32_t)b,
+                                  .descriptorCount = (uint32_t)n,
+                                  .descriptorType = b == GFX_POOL_SAMPLER ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                  .pImageInfo = ii};
+        vkUpdateDescriptorSets(vk_ctx()->device, 1, &w, 0, NULL);
+        free(ii);
+        if (b == GFX_POOL_SAMPLER) p->samp = shadow, p->sgen = 0;   // every sampler id below
+        else p->view[b] = shadow, all = 1;
+        p->filled |= 1u << b;
+    }
+    uint32_t imgs = p->filled & ~(1u << GFX_POOL_SAMPLER);
+    int first_new = p->nwanted;
+    if (read_fb) {   // ids the GPU sampled, as of the last completed copy, join the wanted list
+        p->fb_read_ms = t0;
+        PST.fb_reads++;
+        vmaInvalidateAllocation(vk_ctx()->vma, p->rb_alloc, 0, VK_WHOLE_SIZE);
+        for (int id = 0; id < p->ntex; id++)
+            if (p->rb_map[id] && !p->wanted[id]) p->wanted[id] = 1, p->list[p->nwanted++] = id;
+    }
+    if (imgs) {
+        int new_epoch = ep != p->epoch, scan = all || tg != p->tgen || new_epoch;
+        if (scan) PST.scans++;
+        for (int i = scan ? 0 : first_new; i < p->nwanted; i++) {
+            int id = p->list[i];
+            uint64_t t = vk_texture_slot_token(p->tbase + id);   // before the lookup it guards
+            if (i >= first_new || all || t != p->tok[id] || (p->recheck[id] == 2 && new_epoch)) {
+                p->tok[id] = t;
+                pool_resolve(ex, p, id, imgs);
+            } else if (p->recheck[id] == 1 && new_epoch) {
+                vk_texture_by_id_locked(p->tbase + id, NULL, NULL);   // the storage check of a CPU-written texture
+            }
+        }
+    }
+    if (p->samp && sg != p->sgen)
+        for (int id = 0; id < p->nsamp; id++) {
+            VkSampler smp = vk_sampler_by_id_locked(p->sbase + id);
+            if (!smp) smp = Z.samp;
+            if (smp != p->samp[id]) p->samp[id] = smp, pw_add(p->set, GFX_POOL_SAMPLER, (uint32_t)id, VK_NULL_HANDLE, smp);
+        }
+    pw_flush();
+    p->tgen = tg, p->sgen = sg, p->epoch = ep;
+    double t1 = now_ms_qpc();
+    PST.ms += t1 - t0;
+    static double logged;
+    if ((rt_trace & RT_TRACE_PERF) && t1 - logged >= 5000.0 && (logged = t1))
+        rt_log("vk_exec: pool sets: %d ids wanted; %llu syncs, %llu feedback reads, %llu scans, %llu resolves, "
+               "%llu descriptor writes, %llu binds, %.1f ms", p->nwanted, (unsigned long long)PST.syncs,
+               (unsigned long long)PST.fb_reads, (unsigned long long)PST.scans, (unsigned long long)PST.resolves,
+               (unsigned long long)PST.writes, (unsigned long long)PST.binds, PST.ms);
+}
+
+// Before a draw or dispatch whose shaders index the pools: syncs the bound pair's set and binds it at GFX_POOL_SET.
+// A graphics bind holds while later binds use the same layout (B.pool_layout); compute binds every time, as the ASTC
+// and FSR passes push their own compute sets into the same command buffers.
+static void pool_bind(VkExec *ex, const VkPipeInfo *info) {
+    int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
+    vk_texture_lock();
+    PoolSet *p = pool_set_of(ex);
+    if (p) pool_sync(ex, p, info->pool_mask);
+    vk_texture_unlock();
+    if (p) p->used = ex->fence;
+    if (!p || (gfx && B.pool_layout == info->layout && B.pool_set == p->set)) return;
+    vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, GFX_POOL_SET, 1, &p->set, 0, NULL);
+    PST.binds++;
+    RS.cmds++;
+    if (gfx) B.pool_layout = info->layout, B.pool_set = p->set;
+}
+
+// At the end of a submission, after its closing barrier: each pool set it bound copies its feedback into the readback
+// buffer, which the host reads once the copy completed (a read before sees the previous copy: ids join a little later).
+void vk_exec_pool_feedback(VkExec *ex) {
+    int n = 0;
+    for (int i = 0; i < nps; i++) {
+        PoolSet *p = &PS[i];
+        if (p->used != ex->fence) continue;
+        VkBufferCopy r = {0, 0, (VkDeviceSize)p->ntex * 4};
+        vkCmdCopyBuffer(ex->cb, p->fb, p->rb, 1, &r);
+        n++;
+    }
+    if (!n) return;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += n + 1;
+}
+
+static void pool_sets_release(VkCtx *c) {
+    for (int i = 0; i < nps; i++) {
+        vkDestroyDescriptorPool(c->device, PS[i].dp, NULL);
+        vmaDestroyBuffer(c->vma, PS[i].fb, PS[i].fb_alloc);
+        vmaDestroyBuffer(c->vma, PS[i].rb, PS[i].rb_alloc);
+        free(PS[i].tok), free(PS[i].recheck), free(PS[i].samp), free(PS[i].wanted), free(PS[i].list);
+        for (int b = 0; b < GFX_POOL_BINDINGS; b++) free(PS[i].view[b]);
+    }
+    memset(PS, 0, sizeof PS);
+    nps = 0;
+}
+
 static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
     CbRes *r = cb_res(ex);
     VkCtx *c = vk_ctx();
@@ -1753,6 +2037,10 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     PUT((uint64_t)vk_texture_slots_gen() << 32 | vk_texture_epoch());
     PUT((uint64_t)vk_sampler_gen() << 32 | (uint32_t)ex->nfbl);
     PUT(vk_mem_gen() + vk_usnap_gen());   // both only grow
+    if (info->pool_mask) {   // the pool set pool_bind binds
+        PUT((uintptr_t)ex->tex_pool);
+        PUT((uintptr_t)ex->samp_pool);
+    }
     for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
     if (l->sup) {
         float in[3];
@@ -1810,6 +2098,7 @@ static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, c
 // such a resource got slot -1 (gfx_shader.c handle_slot) and element k the texture bound to slot k - 1: the morph
 // ball's light sampled the depth buffer for its cookie, and the fog over its screen tiles turned dark.
 static uint64_t cbuf_handle(const VkExec *ex, int st, const GfxShaderRes *r, uint32_t k) {
+    if (r->bindless) return 0;   // a pool array the pool set does not support (gfx_shader.c add_res): the stand-in
     if (r->cbuf_slot == 0) {   // NVN2: the bound slot whose handle the bank-0 word carries
         int kind, slot;
         if (!nvn2_cs(ex, st)) return 0;
@@ -2010,6 +2299,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
         }
     }
+    if (info->pool_mask) pool_bind(ex, info);
+    else if (gfx && B.pool_layout != info->layout) B.pool_layout = VK_NULL_HANDLE;   // sets bound with another layout may
+                                                                                     // have disturbed set GFX_POOL_SET
     if (skip) {
         RS.rec = 0;
         // An equal next draw records nothing when every push set holds its push (OOT_PUSH_SKIP on) and nothing made

@@ -658,8 +658,23 @@ static void tex_raw_dump(const nvn_texdesc *d, const uint8_t *blocks, size_t siz
     }
 }
 
+// 1 when [p, p + n) is committed, readable host memory. The texture pool holds descriptors over storage the game has
+// unmapped or not mapped yet (OoT, 2026-11-06: ids nothing samples, over physical memory at 0x5864xxxxx), harmless on
+// the console while no shader reads them. Pool-indexed sampling (vk_exec_draw.c pool sets) resolves every id, so
+// their upload reads that memory, which faulted in tex_bl_copy.
+static int storage_readable(const void *p, size_t n) {
+    const uint8_t *a = p, *end = a + n;
+    while (a < end) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return 0;
+        a = (const uint8_t *)mi.BaseAddress + mi.RegionSize;
+    }
+    return 1;
+}
+
 static void upload(Tex *e) {
-    static volatile long n_bad, n_undecoded;
+    static volatile long n_bad, n_undecoded, n_unmapped;
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
@@ -683,6 +698,10 @@ static void upload(Tex *e) {
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
         }
+    int readable = storage_readable(t->mem, (size_t)t->L.size);
+    if (!readable)
+        log_limited(&n_unmapped, "texture %#llx fmt %#x (%ux%u): its storage is not mapped; uploaded as zeros",
+                    (unsigned long long)e->pub.addr, d->format, d->width, d->height);
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, rbuf = VK_NULL_HANDLE;
     VmaAllocation ralloc = NULL;
@@ -694,7 +713,9 @@ static void upload(Tex *e) {
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
             uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
-            if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
+            if (!readable) {
+                memset(tmp ? tmp : dst, 0, raw);
+            } else if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
@@ -1156,6 +1177,18 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     if (view) *view = has_view ? s->cview : s->v;
     if (has_view) *has_view = view ? s->chas_view : s->has_view;
     return e ? &e->pub : NULL;
+}
+
+// The lookup of pool-indexed sampling (vk_exec_draw.c pool sets), which resolves every id of a pool, sampled or not: NULL
+// unless a live texture object (initialized, not finalized: nvn_tex_live_at) has the slot's storage. The pool keeps
+// the descriptors of finalized textures; vk_texture_by_id_locked brings such a texture back as a new entry that is
+// never released again, and done for every stale id that filled the VRAM, which dropped released entries, which came
+// back the same way (OoT level, 2026-11-06: under 1 fps).
+const VkTexImage *vk_texture_live_by_id_locked(int id, view_t *view, int *has_view) {
+    if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
+    tex_t live;
+    if (!nvn_tex_live_at(tslots[id].t.mem, &live)) return NULL;
+    return vk_texture_by_id_locked(id, view, has_view);
 }
 
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.
