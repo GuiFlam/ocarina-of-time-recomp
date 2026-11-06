@@ -175,6 +175,9 @@ int plat_random(void *out, size_t n);
 enum { PLAT_PRIO_IDLE, PLAT_PRIO_BELOW, PLAT_PRIO_NORMAL };
 void plat_thread_priority(PlatThread *t, int level);       // t NULL: the calling thread
 
+// ---- SHA-256 (FIPS 180-4) of n bytes into out; 1 on success. BCrypt on Windows, portable C on Linux.
+int plat_sha256(const void *p, size_t n, uint8_t out[32]);
+
 // ---- auto-reset events: a set wakes one waiter, and a set with no waiter stays until the next wait consumes it (Windows:
 // CreateEvent without manual reset). A wait returns 1 when it consumed a set, 0 when its time ran out; ns UINT64_MAX
 // waits without a limit (INFINITE on Windows).
