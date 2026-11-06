@@ -920,8 +920,14 @@ static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32
     const uint8_t *ctl, *code;
     uint32_t len;
     if (!ex->prog || !vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
-    *base = 0x10 + ((ex->push_cc_len + 15u) & ~15u);
     *ns = ctl[0xb2], *nt = ctl[0xb3], *ni = ctl[0xb6];
+    // The tables end at the u16 at control +0xba (2026-11-06: eb67c232 1 storage + 2 textures ends at 0x40 and reads
+    // its storage slot at 0x20; 5d415995 5 storage, no push, ends at 0x60; c82d3cba ends at 0xd8): the shader's own
+    // layout. The game may push more bytes than the shader declares, and a base from the pushed length then moved the
+    // tables (the level's compute textures read no handle). The pushed length is the fallback.
+    uint32_t end = (uint32_t)ctl[0xba] | (uint32_t)ctl[0xbb] << 8, tables = 16 * *ns + 8 * *nt + 8 * *ni;
+    if (end >= 0x10 + tables && end <= VK_C0_BYTES) *base = end - tables;
+    else *base = 0x10 + ((ex->push_cc_len + 15u) & ~15u);
     return 1;
 }
 
@@ -2563,6 +2569,32 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
     vk_completion_add(ex->fence, cst_read, r);
 }
 
+// OOT_SKIP_CS=all|<hex>[,<hex>...]|!<hex>[,...] (diagnostic): compute dispatches of every shader, of those whose input
+// id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU timeout (2026-11-06: the
+// Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
+static int skip_cs(const GfxShader *cs) {
+    const char *e = getenv("OOT_SKIP_CS");
+    if (!e || !*e) return 0;
+    char hex[17];
+    const uint8_t *id = gfx_shader_input_id(cs);
+    for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
+    int invert = *e == '!', listed = 0;   // !<list>: every shader except those listed
+    for (const char *p = e + invert; *p && !listed;) {
+        size_t n = strcspn(p, ",");
+        if (n && n <= 16 && !strncmp(hex, p, n)) listed = 1;
+        p += n + (p[n] == ',');
+    }
+    int skip = !strcmp(e, "all") || (invert ? !listed : listed);
+    if (skip) {
+        static char seen[512][17];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen && !known; i++) known = !strcmp(seen[i], hex);
+        if (!known && nseen < 512) strcpy(seen[nseen++], hex), rt_log("vk_exec: OOT_SKIP_CS: dispatches of %s skipped", hex);
+    }
+    return skip;
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -2577,6 +2609,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
     if (!cs) return;
+    if (skip_cs(cs)) return;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
@@ -2593,6 +2626,54 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
 }
 
+// OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible
+// ring before the dispatch and logged with the shader once the submission completes (the first 200), and the device's
+// limit; for the Kokiri Forest GPU timeout (2026-11-06: kernels eb67c232 and c82d3cba together, one feeding the other).
+enum { IND_SLOTS = 256 };
+static VkBuffer ind_buf;
+static VmaAllocation ind_mem;
+static uint32_t *ind_map, ind_next;
+typedef struct { uint32_t slot; char hex[17]; } IndRead;
+static void ind_read(void *arg) {
+    IndRead *r = arg;
+    static volatile LONG n;
+    if (InterlockedIncrement(&n) <= 200) {
+        const uint32_t *v = ind_map + 4 * r->slot;
+        const uint32_t *lim = vk_ctx()->props.limits.maxComputeWorkGroupCount;
+        rt_log("vk_exec: OOT_IND_LOG: indirect dispatch of %s: %u x %u x %u groups%s", r->hex, v[0], v[1], v[2],
+               v[0] > lim[0] || v[1] > lim[1] || v[2] > lim[2] ? " (over the device's limit)" : "");
+    }
+    free(r);
+}
+static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("OOT_IND_LOG") != NULL;
+        if (on) {
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = IND_SLOTS * 16,
+                                     .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                          .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                          .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+            VmaAllocationInfo info;
+            if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &ind_buf, &ind_mem, &info) == VK_SUCCESS) ind_map = info.pMappedData;
+            else on = 0;
+        }
+    }
+    if (!on) return;
+    uint32_t slot = ind_next++ % IND_SLOTS;
+    VkBufferCopy cp = {ip->offset, (VkDeviceSize)slot * 16, 12};
+    vkCmdCopyBuffer(ex->cb, ip->buffer, ind_buf, 1, &cp);
+    ex->recorded++;
+    vk_exec_barrier(ex);
+    IndRead *r = malloc(sizeof *r);
+    if (!r) return;
+    r->slot = slot;
+    const uint8_t *id = gfx_shader_input_id(cs);
+    for (int i = 0; i < 8; i++) snprintf(r->hex + 2 * i, 3, "%02x", id[i]);
+    vk_completion_add(ex->fence, ind_read, r);
+}
+
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
@@ -2605,6 +2686,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
     if (!cs) return;
+    if (skip_cs(cs)) return;
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
@@ -2623,6 +2705,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         vk_exec_barrier(ex);
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
+    ind_log(ex, &ip, cs);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
