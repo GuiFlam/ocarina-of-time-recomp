@@ -3,11 +3,16 @@
 // From totk-pc-recomp runtime/vk.h @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), copied with totk renamed to fe3h only.
 // Vulkan-internal header of the graphics layer. Host code only; the guest never sees it.
 #pragma once
+// The Win32 surface header only on Windows: its include needs windows.h (the Linux build takes its surfaces elsewhere).
+#if defined(_WIN32)
 #ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #endif
+#endif
 #include <vulkan/vulkan.h>
+#if defined(_WIN32)
 #include <vulkan/vulkan_win32.h>
+#endif
 #include <stdint.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
@@ -124,7 +129,9 @@ void vk_queue_unlock(void);
 void vk_present_capture(int on);
 int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt);
 
+#if defined(_WIN32)
 HWND gfx_window_handle(void);                      // NULL before gfx_window_start
+#endif
 void gfx_window_resize(int client_w, int client_h);   // programmatic resize; returns after the swapchain is rebuilt
 void gfx_vsync_bind_counter(volatile long *counter);  // host-side stand-in for a bound event: incremented per tick
 unsigned gfx_window_focus_messages(void);          // OE_MSG_FOCUS_STATE_CHANGED pushes made by the window thread
