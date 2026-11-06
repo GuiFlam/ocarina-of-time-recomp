@@ -226,6 +226,22 @@ Open: spirv-val asks for the VulkanMemoryModel capability next to CooperativeMat
 modules; switching the translator's memory model touches every shader). The tools made tonight are in CLAUDE.md
 ("Running and checking") and the project skill `verify-shader-change`.
 
+## Status (2026-11-06, first play): into a game, then black
+
+The user played from the title into a new game with a Switch Pro Controller (`tools/run.py --seconds 3600`,
+build/logs/run-243.log). The title, menu and opening cutscene run at a steady 60 fps. Two problems:
+
+- **The opening's voice-over is silent.** The game is voiced: about 7,700 voice streams in nine languages, an English
+  voice bank for 99 cutscenes including `Dm_Kokiri_0000`, the Deku Tree's opening. No audio service was refused
+  and the renderer runs. Next: a run with `OOT_TRACE=fs` to see whether the game opens the voice bank and streams
+  (if not, suspect the language the host reports, `ov_system.c ov_language`).
+- **Gameplay is black.** When the opening hands over to the game, the screen goes black while the game keeps
+  presenting frames at 60 fps (no crash, no stall). In the same moment the game starts calling
+  `nvnCommandBufferDrawMeshTasks`, which is a stub that draws nothing, and only 51 distinct shaders were seen in the
+  whole session. The world is most likely drawn with mesh shaders: the mesh stages (listed as open since the
+  start of Phase 3) are now the blocker. Next: a frame dump of a gameplay frame (`tools/run.py --dump`) to confirm
+  what is drawn and how much goes through mesh tasks.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
