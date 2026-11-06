@@ -2730,6 +2730,29 @@ static void lower_imad_hi(L *l, const Insn *x) {
     emit(l, base(l, 0x5a00000000000000ull, rd, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)rc << 39) | sign | ((uint64_t)1 << 54));
 }
 
+// F2IP.U8.F32 (0x243, register form; tools/sm86_dis.py names it FCHK): two floats become bytes, Rb's in bits 0-7 and
+// Ra's (RZ: none) in bits 8-15 of Rd, each clamped to 0..255 with NaN as 0 and converted with the rounding mode at
+// 78-79 (the game's output packing after a multiplication by 255). Operand and mode fields as Lichii's Ampere front
+// end reads them (GPL, read for the field meanings only): w1 holds only Rb, w2 is 0x4ff plus the rounding in 78-79.
+// The rounding numbering is taken to be Maxwell F2I's (39-40), which no game data has settled. Maxwell: FMNMX against
+// 0.0 (max) and 255.0 (min) as the clamp, F2I.U32 with that rounding, ISCADD to merge the bytes.
+static void lower_f2ip(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8), round = bits(x, 78, 2);
+    if ((x->w[1] & ~0xffu) || (x->w[2] & ~0xc000u) != 0x4ffu || rd == RZ) return (void)fail(l, "F2IP mode");
+    uint32_t lo = S(l, 0), hi = S(l, 1), top = S(l, 2);
+    mov_imm(l, top, 0x437f0000u);
+    for (int i = 0; i < 2; i++) {
+        uint32_t src = i ? ra : rb, t = i ? hi : lo;
+        if (i && ra == RZ) break;
+        emit(l, base(l, 0x5c60000000000000ull, t, src) | ((uint64_t)RZ << 20) | ((uint64_t)15 << 39));            // max(src, 0)
+        emit(l, base(l, 0x5c60000000000000ull, t, t) | ((uint64_t)top << 20) | ((uint64_t)7 << 39));             // min(t, 255)
+        emit(l, base(l, 0x5cb0000000000000ull, t, 0) | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) | ((uint64_t)t << 20) |
+                    ((uint64_t)round << 39));                                                                       // F2I.U32
+    }
+    if (ra == RZ) mov_reg(l, rd, lo);
+    else emit(l, base(l, 0x5c18000000000000ull, rd, hi) | ((uint64_t)lo << 20) | ((uint64_t)8 << 39));              // (hi << 8) + lo
+}
+
 // IABS (0x013): max(x, -x), signed; b a register, an immediate or a constant (to_reg).
 static void lower_iabs(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8);
@@ -2983,7 +3006,8 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x230: case 0x430: case 0x630: return lower_hadd2(l, x, op);
     case 0x326: return lower_ipa(l, x);
     case 0x526: return lower_ipa_idx(l, x);
-    case 0x243: return lower_fchk(l, x);
+    case 0x243:   // FCHK has only a predicate destination (Rd = RZ); with an Rd it is the byte packing F2IP
+        return bits(x, 16, 8) != RZ ? lower_f2ip(l, x) : lower_fchk(l, x);
     case 0x321: return lower_ald_ast(l, x, 0);
     case 0x322: return lower_ald_ast(l, x, 1);
     case 0xb82: return lower_ldc(l, x);
