@@ -32,7 +32,6 @@ ALLOWED = {
     "vk_exec_probe.c": "probe",
     "gfx_shader_probe.c": "probe",
     "gfx_shader.c": "2.7b: threads, SRW locks, interlocked counters, tick count",
-    "kernel.c": "2.7a/b",
     "main.c": "2.7a/b",
     "dispatch.c": "2.7b",
     "svc.c": "2.7b",
