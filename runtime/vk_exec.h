@@ -86,6 +86,8 @@ typedef struct VkExec {
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
     p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
+    uint8_t push_cc[0x800];              // OP_PUSH_CC (VK_C0_BYTES, defined below): the compute kernels' pushed constants (NVN2), read as bank 0
+    uint32_t push_cc_len;                // bytes pushed so far (0: none, c0 is the driver bank)
 
     // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip
@@ -178,6 +180,7 @@ void vk_dump_indices(uint64_t addr, int itype, int count);   // the dump frame: 
 void vk_dump_draw_params(VkExec *ex, int indexed, int prim, int first, int count, int instances, int base_instance, int base_vertex);
 // vk_exec_draw.c: the control section, code and code length of NVN stage st of program p; 0 when it has none
 int vk_exec_find_stage(const prog_t *p, int st, const uint8_t **ctl, const uint8_t **code, uint32_t *len);
+uint64_t vk_exec_res_handle(const VkExec *ex, int st, const GfxShaderRes *r, uint32_t k, int img);   // the handle a declaration binds
 void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPipeInfo *info, const p_dispatch *d);
 void vk_dump_copy(VkExec *ex, uint32_t op, const void *payload);   // before a copy or texture clear is replayed
 void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump frame's copies and closes the logs

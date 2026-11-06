@@ -42,8 +42,11 @@ PACIBSP prologue, nn::oe and nn::vi additions in `ov_oot.c`, `nv::InitializeGrap
 presented; it then stalls because no SM86 shader translates (`docs/plan.md`, "Open: shader translation"), which is
 Phase 3: `docs/phase3.md` is the hand-off for it (what blocks, the measured NVN2 control-section fields, the lowering
 approach, the order of work). Start there, with its dated Status sections: as of 2026-11-06 the SM86 lowering covers
-94.1% of the corpus, the title cinematic decodes on the host (`runtime/ov_movie22.c`, dav1d), and the picture is
-black because the video path runs tensor-core shaders (HMMA, LDSM, MOVM) the lowering does not take yet. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the crash dump's memory
+94.1% of the corpus, the title cinematic decodes on the host (`runtime/ov_movie22.c`, dav1d) and reaches the GPU as a
+correct RGB frame, the tensor-core shaders (HMMA, LDSM, MOVM) of the video path are emulated by the lowering and
+NVN2's pushed compute constants fill bank 0, and the picture is black because the emulated upscaler's output is
+wrong. Test runs: `scratchpad/bin/run.sh` kills every run; one run in three dies after the first frame (an SDK
+abort in MultiWait, see the docs). Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the crash dump's memory
 and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`), `build/logs/nvn-proc-got.json`
 (GOT slot -> proc name, from the loader at `main+0x129e290`).
 

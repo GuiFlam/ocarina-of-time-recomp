@@ -467,6 +467,17 @@ NVN_API(nvnCommandBufferUpdateUniformBuffer) {
     r->dst = dst;
     r->size = n;
     memcpy(r->data, data, n);
+    if (getenv("OOT_BIND_LOG") && gfx_stats().frames >= 290) {   // DIAG: the inline uniform writes around the movie's dispatches
+        static volatile LONG lines;
+        if (InterlockedIncrement(&lines) <= 40) {
+            const uint64_t *q = data;
+            rt_log("bindlog: f%llu update_ub dst %#llx size %#llx: %#llx %#llx %#llx %#llx | +0x90.. %#llx %#llx %#llx %#llx %#llx",
+                   (unsigned long long)gfx_stats().frames, (unsigned long long)dst, (unsigned long long)n,
+                   (unsigned long long)(n >= 8 ? q[0] : 0), (unsigned long long)(n >= 16 ? q[1] : 0), (unsigned long long)(n >= 24 ? q[2] : 0),
+                   (unsigned long long)(n >= 32 ? q[3] : 0), (unsigned long long)(n >= 0x98 ? q[18] : 0), (unsigned long long)(n >= 0xa8 ? q[20] : 0),
+                   (unsigned long long)(n >= 0xc0 ? q[23] : 0), (unsigned long long)(n >= 0xd0 ? q[25] : 0), (unsigned long long)(n >= 0xd8 ? q[26] : 0));
+        }
+    }
 }
 
 // ---------- CommandBuffer: render state, payloads of nvn_obj.h
@@ -725,18 +736,39 @@ NVN_API(nvnCommandBufferBindVertexBuffer) {
     bind_vertex_buffers(cmd_of(c), (int)arg_x(c, 1), 1, &r);
 }
 // Uniform and storage buffers: one record per binding (CB_SIZE/ADDRESS 4 words + CB_BIND 1 on hardware).
+static void bind_log(const char *what, int st, int first, int n, uint64_t a, uint64_t b);
 static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n, const NVNbufferRange *ranges)
     cmd_t *o = cmd_of(c);
     int st = (int)arg_x(c, 1), first = (int)arg_x(c, 2), n = (int)arg_x(c, 3);
     const NVNbufferRange *rg = arg_p(c, 4);
     for (int i = 0; i < n; i++) {
         *REC(o, op, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
+        bind_log(op == OP_BIND_UBO ? "ubo[]" : "ssbo[]", st, first + i, n, rg[i].address, rg[i].size);
         hw_fix(o, 20);
+    }
+}
+// DIAG (NVN2 bank 0 layout): the compute stage's bindings and the start of a bound uniform buffer, a few times.
+static void bind_log(const char *what, int st, int first, int n, uint64_t a, uint64_t b) {
+    static volatile LONG lines;
+    if ((st != 5 && !(what[0] == 'u' && st <= 1)) || !getenv("OOT_BIND_LOG") || gfx_stats().frames < 290) return;
+    if (what[0] == 'u' && b == 0x100 && a && !*(const uint64_t *)(uintptr_t)a) return;   // the engine's dummy block, every frame
+    if (what[0] == 't' && a == 0x10200102) return;                                       // the dummy texture
+    if (InterlockedIncrement(&lines) > 240) return;
+    rt_log("bindlog: f%llu %s stage %d slot %d n %d %#llx %#llx", (unsigned long long)gfx_stats().frames, what, st, first, n,
+           (unsigned long long)a, (unsigned long long)b);
+    if (what[0] == 'u' && a && b >= 0x100 && *(const uint64_t *)(uintptr_t)a) {
+        const uint8_t *q = (const uint8_t *)(uintptr_t)a;
+        for (int off = 0; off < 0x100; off += 32) {
+            char line[3 * 32 + 1];
+            for (int k = 0; k < 32; k++) snprintf(line + 3 * k, 4, "%02x ", q[off + k]);
+            rt_log("bindlog:   +%#04x: %s", off, line);
+        }
     }
 }
 static void bind_buffer(const Cpu *c, uint32_t op) {    // (cmd, stage, index, NVNbufferAddress address, size_t size)
     cmd_t *o = cmd_of(c);
     *REC(o, op, p_bind_buf) = (p_bind_buf){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
+    bind_log(op == OP_BIND_UBO ? "ubo" : "ssbo", (int)arg_x(c, 1), (int)arg_x(c, 2), 1, arg_x(c, 3), arg_x(c, 4));
     hw_fix(o, 20);
 }
 NVN_API(nvnCommandBufferBindUniformBuffer) { bind_buffer(c, OP_BIND_UBO); }
@@ -749,6 +781,7 @@ NVN_API(nvnCommandBufferBindStorageBuffers) { bind_buffers(c, OP_BIND_SSBO); }
 // recording and before the submit (nvn_submit_prepare). hw_bytes: the hardware size of the plain variant.
 static void bind_handles(cmd_t *o, uint32_t op, int st, int first, int n, const uint64_t *h, int deferred, size_t hw_bytes) {
     if (n < 0 || n > 32) { rt_log("nvn: bind of %d handles", n); return; }
+    bind_log(op == OP_BIND_TEX ? "tex" : op == OP_BIND_IMG ? "img" : "handle", st, first, n, n ? h[0] : 0, n > 1 ? h[1] : 0);
     p_bind_handles *r = RECN(o, op, p_bind_handles, h, n);
     r->stage = st;
     r->first = first;
@@ -858,8 +891,28 @@ NVN_API(nvnCommandBufferDrawArraysIndirect) {
     *REC(cmd_of(c), OP_DRAW_IND, p_draw_ind) = (p_draw_ind){(int)arg_x(c, 1), 0, arg_x(c, 2)};
 }
 // void nvnCommandBufferDispatchCompute(NVNcommandBuffer *cmd, int x, int y, int z): caller = the game's return address
+// NVN2: void nvnCommandBufferPushComputeConstants(NVNcommandBuffer *cmd, int ?, int offset, size_t bytes, const void
+// *data): the next dispatch's pushed constants (the game's upscaler pushes 0x40 and 0x54 bytes before two of its
+// kernels), which the SM86 compute shader reads at constant bank 0 + 0x10 (vk_exec_draw.c nvn2_c0_fill_cs). Recorded
+// as OP_PUSH_CC, a p_update_ub whose dst is the byte offset.
+NVN_API(nvnCommandBufferPushComputeConstants) {
+    uint64_t offset = arg_x(c, 2), n = arg_x(c, 3), data = arg_x(c, 4);
+    static volatile LONG said;
+    if (InterlockedIncrement(&said) <= 2)
+        rt_log("nvn: PushComputeConstants(%#llx, %#llx, %#llx bytes at %#llx)", (unsigned long long)arg_x(c, 1),
+               (unsigned long long)offset, (unsigned long long)n, (unsigned long long)data);
+    if (n > 0x7f0 || offset > 0x7f0 - n || !data) {
+        rt_log("nvn: PushComputeConstants offset %#llx size %#llx data %#llx: dropped", (unsigned long long)offset, (unsigned long long)n, (unsigned long long)data);
+        return;
+    }
+    p_update_ub *r = rec(cmd_of(c), OP_PUSH_CC, offsetof(p_update_ub, data) + n);
+    r->dst = offset;
+    r->size = n;
+    memcpy(r->data, (const void *)(uintptr_t)data, n);
+}
 NVN_API(nvnCommandBufferDispatchCompute) {
     *REC(cmd_of(c), OP_DISPATCH, p_dispatch) = (p_dispatch){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), c->x[30]};
+    bind_log("dispatch", 5, (int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), c->x[30]);
 }
 // void nvnCommandBufferDispatchComputeIndirect(NVNcommandBuffer *cmd, NVNbufferAddress indirect): vkCmdDispatchIndirect
 NVN_API(nvnCommandBufferDispatchComputeIndirect) {
@@ -1061,7 +1114,7 @@ const char *nvn_op_name(uint32_t op) {
         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END",
+        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

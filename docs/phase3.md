@@ -78,6 +78,51 @@ shaders lowered so far: the game's video path runs on the tensor cores.
   Test: `OOT_ASYNC_PREEMPT=0` over several runs; then read the trampoline against a thread suspended inside host
   code.
 
+## Status (2026-11-06, later): the title frame decodes, the upscaler does not
+
+The movie frame reaches the GPU and converts correctly: the first compute pass of the game's video path writes a
+1920x1080 RGBA8 image of the title cinematic (Link on Epona by the river; dump `build/logs/dump-93`, pass 0000,
+147,050 distinct colours). What follows it, the neural upscaler's twelve kernels and the final 2560x1440 pass, still
+produces a near-constant image and then zeros, so the screen stays black. Found and done on the way:
+
+- The tensor-core instructions are emulated in the lowering (`runtime/sm86_lower.c`, "tensor-core instructions"):
+  LDSM (1, 2 or 4 matrices, plain or transposed) through SHFL.IDX of the row addresses and LDS; HMMA.16816.F16.F16
+  through the PTX fragment layouts (lane = 4g + t), SHFL.IDX and HFMA2 (f16 accumulation, the tensor core accumulates
+  wider); MOVM through two SHFL and a PRMT. Also added: SUST (bindless store, the handle a dword index in the
+  constant word as TEX's), HFMA2 (all forms, .RELU through HSET2.GT.BF and HMUL2), F2FP (two F2F.F16.F32 and a
+  PRMT), HMNMX2 (HSET2, HADD2, HFMA2), BAR.SYNC. All 19 kernels lower and translate; the corpus stays at 13,514
+  lowered, 0 translation failures.
+- NVN2's constant bank 0 for compute is not Maxwell's driver bank. `nvnCommandBufferPushComputeConstants(cmd, 0,
+  offset, bytes, data)` (an NVN2 entry point the host only stubbed) pushes the kernel's parameter block, and the bank
+  reads as: 0x10 reserved bytes (the dispatch size is put there), the pushed constants, then the bound resources in
+  slot order, storage buffers {u64 address, u32 size, u32 0} for control[0xb2] slots, texture handles (u64) for
+  control[0xb3] slots, image handles (u64) for control[0xb6] slots (the counts are bytes of the control section;
+  control[0xb8..0xba] holds the bank's size). Measured on the kernels: the final pass pushes 0x54 bytes and reads its
+  storage slot 2 at 0x90, textures 0 and 3 at 0xa0 and 0xb8, image 1 at 0xc8; the NV12 pass pushes 0x40 bytes and
+  reads textures 1 and 2 at 0x58 and 0x60, image 0 at 0x68; the kernels without a push read storage slots 0 and 1 at
+  0x10 and 0x20. The host records the push as OP_PUSH_CC, builds the bank at each dispatch (`vk_exec_draw.c`
+  nvn2_c0_fill_cs), consumes the push with the dispatch, and resolves the shader's bank-0 words back to the bound
+  slots for its descriptors (nvn2_c0_slot, cbuf_handle, ssbo_info). The graphics stages still get Maxwell's driver
+  bank; the game's vertex shaders read 64-bit addresses at c0+0x60, which is the same scheme and will need the push
+  (nvnCommandBufferPushGraphicsConstants is still a stub) when a draw depends on it.
+- Diagnostics added: `OOT_BIND_LOG=1` logs the compute stage's binds, pushes, dispatches and inline uniform updates
+  from frame 290 on; `OOT_PROG_DUMP=1` hex-dumps the memory around compute programs' control sections at
+  SetShaders; the frame dump prints each stage's bound texture, image and uniform slots per pass and resolves texture
+  declarations as the replay does (`vk_exec_res_handle`), so storage images written by dispatches get their PNGs.
+- The death after the first frame, one run in three, is the SDK's own abort in
+  `nn::os::detail::MultiWaitImpl::InternalWaitAnyImpl` (sdk+0x167be0): after a holder's virtual IsSignaled (vtable
+  +0x18) returns true, it aborts when its count of found holders reaches the caller's capacity (the compare before
+  the jump to sdk+0x167ec4, which calls `nn::diag::detail::AbortImpl()` through the GOT). The host then dies with
+  the abort's return address as the instruction pointer (`executing 0x7005367ec8`, the LR of that call, rcx holding
+  the Cpu), before `AbortImpl(const char *, ...)` is reached (an observer on it, `ov_oot.c` obs_abort_impl, never
+  fires). Two bugs: more holders report signalled than the game expects (an nn::os event or timer the host leaves
+  signalled at start-up, to find), and the abort path crashing instead of reporting. `OOT_ASYNC_PREEMPT=0` does not
+  prevent it.
+
+Next: find where the upscaler's values go wrong (`OOT_DUMP_BUF` snapshots of its feature-map buffers after each
+pass, the shapes of the HMMA operands against the PTX layouts, the LDSM addresses), then the frame rate (the decode
+on the game's thread and the emulated kernels).
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485

@@ -521,6 +521,19 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     prog_release(o);
     o->nstage = (uint32_t)n;
     if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
+    if (getenv("OOT_PROG_DUMP")) {   // DIAG: the memory around a compute program's control section (NVN2 bank 0 layout)
+        static volatile LONG shown;
+        for (int i = 0; i < n; i++) {
+            const uint8_t *ctl = sd[i].control;
+            if (!ctl || ctl[0x56] != 5 || InterlockedIncrement(&shown) > 6) continue;
+            rt_log("progdump: stage 5 data %#llx control %p", (unsigned long long)sd[i].data, (const void *)ctl);
+            for (int off = -0x80; off < 0x300; off += 32) {
+                char line[3 * 32 + 1];
+                for (int k = 0; k < 32; k++) snprintf(line + 3 * k, 4, "%02x ", ctl[off + k]);
+                rt_log("progdump: %+#06x: %s", off, line);
+            }
+        }
+    }
     o->serial = nvn_new_serial();
     NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;

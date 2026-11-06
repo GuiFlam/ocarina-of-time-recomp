@@ -61,7 +61,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 
 // ---- the lowering context
 
-#define NSCRATCH 8
+#define NSCRATCH 12
 #define RZ 255u
 #define PT 7u
 #define NOREG 0xffffffffu
@@ -471,6 +471,12 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
     if (c_reg || base == 0x122 || base == 0x189 || tex) set_run(use, f64, base == 0x025 ? 2 : tex ? 1 : 1);
     if (base == 0x122) set_run(use, f32, bits(x, 74, 2) + 1);     // AST data
     if (base == 0x121) set_run(use, f32, 1);                      // ALD vertex register
+    if (base == 0x03c) {                                          // HMMA: A 4, B 2, C 2 read; D 2 written (f16 accumulators)
+        set_run(use, f24, 4), set_run(use, f32, 2), set_run(use, f64, 2);
+        if (!predicated) set_run(def, f16, 2);
+        else set_run(use, f16, 2);
+    }
+    if (base == 0x03b && !predicated) set_run(def, f16, 1u << bits(x, 72, 2));   // LDSM: count registers
     if (base == 0x19b) {                                          // SUST: coordinates by the dimension, data by the mask
         static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
         set_run(use, f24, coords[bits(x, 61, 3)]);
@@ -823,6 +829,10 @@ static uint64_t b_slot(L *l, Src s, uint64_t op_r, uint64_t op_c, uint64_t op_i,
 }
 
 static uint64_t base(L *l, uint64_t op, uint32_t rd, uint32_t ra) { return op | l->pred | rd | ((uint64_t)ra << 8); }
+// Maxwell HFMA2 R (Ryujinx InstHfma2R): Rd = a(swizzle) * b + c on half pairs; a swizzle 2 = H0_H0, 3 = H1_H1.
+#define HFMA2_R(rd, ra, aswz, rb, rc) (0x5c80000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20) | \
+                                       ((uint64_t)(rc) << 39) | ((uint64_t)(aswz) << 47))
+static void h2_relu(L *l, uint32_t rd);
 
 // ---- the per-opcode lowerings
 
@@ -1526,19 +1536,151 @@ static void lower_stg(L *l, const Insn *x, uint32_t op) {
                 ((uint64_t)size << 48));
 }
 
-// SUST.P (0xb9b: the image handle from a constant-buffer word at 38-53 with its bank at 54-58, as the game's compute
-// shaders bind their images): coordinates at 24-31 (their count by the dimension at 61-63, NVN's order 1D, buffer,
-// 1D array, 2D, 2D array, 3D), data at 32-37, channel mask 72-75. Maxwell SUST.B (bindless, Ryujinx InstSustB):
+// SUST.P (0xb9b: the image handle from a constant-buffer word, its dword index at 40-53 and bank at 54-58 as TEX's,
+// as the game's compute shaders bind their images): coordinates at 24-31 (their count by the dimension at 61-63,
+// NVN's order 1D, buffer, 1D array, 2D, 2D array, 3D), data at 32-39, channel mask 72-75. Maxwell SUST.B (bindless, Ryujinx InstSustB):
 // data 0-7, coordinates 8-15, mask 20-23, dimension 33-35, handle register 39-46; the handle is loaded from the
 // constant word as TEX.B's is, and the translator's bindless elimination turns it back into the constant's slot.
 static void lower_sust(L *l, const Insn *x) {
-    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 6), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
-    if (bits(x, 38, 2) || bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 0) return (void)fail(l, "SUST mode");
-    Src h = srcn(l, x, 1, 0);
-    if (h.kind != 2 || !cbuf_ok(&h)) return (void)fail(l, "SUST handle");
+    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 8), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
+    if (bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 0) return (void)fail(l, "SUST mode");
+    Src h = {0};
+    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (!cbuf_ok(&h)) return (void)fail(l, "SUST handle");
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
                 ((uint64_t)hr << 39));
+}
+
+// ---- tensor-core instructions (Turing+), emulated with shuffles and half-precision FMAs
+//
+// The game's neural upscaler (NDSR) runs on them. The fragment layouts are PTX's (mma.m16n8k16, ldmatrix,
+// movmatrix): lane = 4 * g + t (g = lane >> 2, t = lane & 3); an 8x8 half matrix fragment gives lane the pair
+// (row g, columns 2t and 2t + 1) in one register. Lane constants come from S2R SR_LANEID each time (scratch is per
+// instruction). SHFL.IDX with a register lane and clamp 31 reads another lane's register.
+#define SHFL_IDX_R(rd, ra, lane) (0xef10000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(lane) << 20) | \
+                                  ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34))
+#define IADD_IMM(rd, ra, imm) (0x3810000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)((imm) & 0xfffff) << 20))
+#define SHL_IMM(rd, ra, sh) (0x3848000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(sh) << 20))
+#define SHR_IMM(rd, ra, sh) (0x3828000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(sh) << 20))
+#define SHR_R(rd, ra, rb) (0x5c28000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20))
+#define PRMT_IMM(rd, ra, sel, rc) (0x36c0000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(sel) << 20) | ((uint64_t)(rc) << 39))
+#define LDS(rd, ra, off, size) (0xef48000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)((off) & 0xffffff) << 20) | ((uint64_t)(size) << 48))
+#define S2R_LANEID(rd) (0xf0c8000000000000ull | (rd))
+// HFMA2_R (defined with lower_hfma2): Rd = a(swizzle) * b + c on half pairs; a swizzle 2 = H0_H0, 3 = H1_H1.
+
+static int overlaps(uint32_t a, uint32_t na, uint32_t b, uint32_t nb) { return a != RZ && b != RZ && a < b + nb && b < a + na; }
+
+// LDSM (0x83b): count 72-73 (1, 2, 4 matrices), transposed 78, row address register 24-31 (+ a uniform register
+// at 32-37 by 91), 24-bit offset 40-63, Rd..Rd+count-1. Matrix m's eight row addresses sit in lanes 8m..8m+7.
+// Plain: lane gets the 32-bit pair at row g, column 2t of each matrix (row address from lane 8m + g, + 4t).
+// Transposed: the pair is (row 2t, col g), (row 2t + 1, col g): two 16-bit loads from two rows' addresses, + 2g.
+static void lower_ldsm(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), offset = bits(x, 40, 24), count = 1u << bits(x, 72, 2), trans = bits(x, 78, 1);
+    if (bits(x, 74, 4) || bits(x, 79, 12) || count > 4 || rd == RZ || rd + count > 255) return (void)fail(l, "LDSM mode");
+    if (bits(x, 91, 1)) {
+        uint32_t u = to_reg(l, ur_src(l, bits(x, 32, 6)), 6, 0, 0);
+        emit(l, base(l, 0x5c10000000000000ull, S(l, 6), ra) | ((uint64_t)u << 20));
+        ra = S(l, 6);
+    } else if (overlaps(rd, count, ra, 1)) {
+        mov_reg(l, S(l, 6), ra);
+        ra = S(l, 6);
+    }
+    uint32_t g = S(l, 0), t = S(l, 1), idx = S(l, 2), addr = S(l, 3);
+    emit(l, l->pred | S2R_LANEID(g));
+    emit(l, l->pred | (uint64_t)(LOP32I | t | ((uint64_t)g << 8) | ((uint64_t)3 << 20)));            // t = lane & 3
+    emit(l, l->pred | SHR_IMM(g, g, 2));                                                              // g = lane >> 2
+    if (!trans) {
+        emit(l, l->pred | SHL_IMM(t, t, 2));                                                          // 4t
+        for (uint32_t m = 0; m < count; m++) {
+            emit(l, l->pred | IADD_IMM(idx, g, 8 * m));
+            emit(l, l->pred | SHFL_IDX_R(addr, ra, idx));
+            emit(l, base(l, 0x5c10000000000000ull, addr, addr) | ((uint64_t)t << 20));
+            emit(l, l->pred | LDS(rd + m, addr, offset, 4));
+        }
+        return;
+    }
+    uint32_t h0 = S(l, 4), h1 = S(l, 5);
+    emit(l, l->pred | SHL_IMM(t, t, 1));                                                              // 2t
+    emit(l, l->pred | SHL_IMM(g, g, 1));                                                              // 2g
+    for (uint32_t m = 0; m < count; m++) {
+        for (uint32_t i = 0; i < 2; i++) {
+            emit(l, l->pred | IADD_IMM(idx, t, 8 * m + i));
+            emit(l, l->pred | SHFL_IDX_R(addr, ra, idx));
+            emit(l, base(l, 0x5c10000000000000ull, addr, addr) | ((uint64_t)g << 20));
+            emit(l, l->pred | LDS(i ? h1 : h0, addr, offset, 2));
+        }
+        emit(l, l->pred | PRMT_IMM(rd + m, h0, 0x5410, h1));
+    }
+}
+
+// HMMA (0x23c): m16n8k16 (75-76 and 78-79 hold 1), f16 sources (82-84), f16 accumulators (76 clear): A in
+// Ra..Ra+3 (rows g / g+8, k 2t.. and 2t+8..), B in Rb..Rb+1 (k 2t.., 2t+8..; column g), C in Rc..Rc+1 and D in
+// Rd..Rd+1 (row g, columns 2t, 2t+1; row g+8). Lane computes its four outputs from the A rows of its group's
+// four lanes and the B columns 2t and 2t+1 of lanes 8t..8t+3 and 8t+4..8t+7, two k per step, with the products
+// fused into the f16 accumulators (the tensor core accumulates wider; the upscaler's network tolerates it).
+static void lower_hmma(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8), rc = bits(x, 64, 8);
+    if (bits(x, 72, 8) != 8 || bits(x, 80, 12) || rd == RZ || ra == RZ || rb == RZ || rd > 253 || ra > 251 || rb > 253 || (rc != RZ && rc > 253))
+        return (void)fail(l, "HMMA mode");
+    if (overlaps(rd, 2, ra, 4)) {                                 // the output reuses A's registers: A to scratch first
+        for (uint32_t i = 0; i < 4; i++) mov_reg(l, S(l, 8 + (int)i), ra + i);
+        ra = S(l, 8);
+    }
+    if (overlaps(rd, 2, rb, 2)) {
+        if (ra == S(l, 8)) return (void)fail(l, "HMMA destination over both sources");
+        mov_reg(l, S(l, 8), rb), mov_reg(l, S(l, 9), rb + 1);
+        rb = S(l, 8);
+    }
+    if (rc == RZ) mov_imm(l, rd, 0), mov_imm(l, rd + 1, 0);
+    else if (rd != rc) {
+        if (overlaps(rd, 2, rc, 2)) return (void)fail(l, "HMMA destination over the accumulator");
+        mov_reg(l, rd, rc), mov_reg(l, rd + 1, rc + 1);
+    }
+    uint32_t g4 = S(l, 0), t8 = S(l, 1), idx = S(l, 2), ta0 = S(l, 3), ta1 = S(l, 4), tb0 = S(l, 5), tb1 = S(l, 6), bk = S(l, 7);
+    emit(l, l->pred | S2R_LANEID(g4));
+    emit(l, l->pred | (uint64_t)(LOP32I | t8 | ((uint64_t)g4 << 8) | ((uint64_t)3 << 20)));
+    emit(l, l->pred | SHL_IMM(t8, t8, 3));                                                            // 8t
+    emit(l, l->pred | (uint64_t)(LOP32I | g4 | ((uint64_t)g4 << 8) | ((uint64_t)0x1c << 20)));       // 4g
+    for (uint32_t h = 0; h < 2; h++) {
+        for (uint32_t j = 0; j < 4; j++) {
+            emit(l, l->pred | IADD_IMM(idx, g4, j));
+            emit(l, l->pred | SHFL_IDX_R(ta0, ra + 2 * h, idx));          // A[g][k], A[g][k+1], k = 2j + 8h
+            emit(l, l->pred | SHFL_IDX_R(ta1, ra + 2 * h + 1, idx));      // A[g+8][k], A[g+8][k+1]
+            emit(l, l->pred | IADD_IMM(idx, t8, j));
+            emit(l, l->pred | SHFL_IDX_R(tb0, rb + h, idx));              // B[k][2t], B[k+1][2t]
+            emit(l, l->pred | IADD_IMM(idx, t8, 4 + j));
+            emit(l, l->pred | SHFL_IDX_R(tb1, rb + h, idx));              // B[k][2t+1], B[k+1][2t+1]
+            emit(l, l->pred | PRMT_IMM(bk, tb0, 0x5410, tb1));            // (B[k][2t], B[k][2t+1])
+            emit(l, l->pred | PRMT_IMM(tb0, tb0, 0x7632, tb1));           // (B[k+1][2t], B[k+1][2t+1])
+            emit(l, l->pred | HFMA2_R(rd, ta0, 2, bk, rd));
+            emit(l, l->pred | HFMA2_R(rd, ta0, 3, tb0, rd));
+            emit(l, l->pred | HFMA2_R(rd + 1, ta1, 2, bk, rd + 1));
+            emit(l, l->pred | HFMA2_R(rd + 1, ta1, 3, tb0, rd + 1));
+        }
+    }
+}
+
+// MOVM (0x23a) .MT88: the fragment of the transposed 8x8 half matrix: lane's pair becomes (M[2t][g], M[2t+1][g]),
+// held by lanes 8t + (g >> 1) and 8t + 4 + (g >> 1) in half g & 1.
+static void lower_movm(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8);
+    if (bits(x, 72, 20) || rd == RZ) return (void)fail(l, "MOVM mode");
+    uint32_t g = S(l, 0), t8 = S(l, 1), idx = S(l, 2), v0 = S(l, 3), v1 = S(l, 4), sh = S(l, 5);
+    emit(l, l->pred | S2R_LANEID(g));
+    emit(l, l->pred | (uint64_t)(LOP32I | t8 | ((uint64_t)g << 8) | ((uint64_t)3 << 20)));
+    emit(l, l->pred | SHL_IMM(t8, t8, 3));                                                            // 8t
+    emit(l, l->pred | SHR_IMM(g, g, 2));                                                              // g
+    emit(l, l->pred | (uint64_t)(LOP32I | sh | ((uint64_t)g << 8) | ((uint64_t)1 << 20)));
+    emit(l, l->pred | SHL_IMM(sh, sh, 4));                                                            // 16 * (g & 1)
+    emit(l, l->pred | SHR_IMM(g, g, 1));                                                              // g >> 1
+    emit(l, base(l, 0x5c10000000000000ull, idx, t8) | ((uint64_t)g << 20));                           // 8t + (g >> 1)
+    emit(l, l->pred | SHFL_IDX_R(v0, ra, idx));
+    emit(l, l->pred | IADD_IMM(idx, idx, 4));
+    emit(l, l->pred | SHFL_IDX_R(v1, ra, idx));
+    emit(l, l->pred | SHR_R(v0, v0, sh));
+    emit(l, l->pred | SHR_R(v1, v1, sh));
+    emit(l, l->pred | PRMT_IMM(rd, v0, 0x5410, v1));
 }
 
 // TEX (0xb60: handle from a constant-buffer word, its dword index at 40-53 and bank at 54-58; 0xf60: handle in a
@@ -1744,6 +1886,80 @@ static void lower_hadd2(L *l, const Insn *x, uint32_t op) {
     emit(l, base(l, 0x5d10000000000000ull, rd, a) | ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)b_abs << 30) |
                 ((uint64_t)b_neg << 31) | ((uint64_t)bits(x, 77, 1) << 32) | ((uint64_t)bits(x, 80, 1) << 39) |
                 ((uint64_t)a_neg << 43) | ((uint64_t)a_abs << 44) | ((uint64_t)a_swz << 47));
+}
+
+// HFMA2 (0x031): a * b + c on half pairs; a 24-31 (neg 72, abs 73, swizzle 74-75), b 32-39 register (neg 63,
+// abs 62, swizzle 60-61) / 32-bit immediate (0x431) / constant (0x631), c 64-71 (swizzle 81-82, abs 83, neg 84);
+// dnz 76, saturate 77, F32 output 78, ftz 80. Maxwell HFMA2 R (Ryujinx InstHfma2R): a 8, b 20, c 39, swizzles
+// a 47-48, b 28-29, c 35-36, NegA 31, NegC 30, Sat 32; no NegB (folded into a) and no abs.
+static void lower_hfma2(L *l, const Insn *x, uint32_t op) {
+    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), a_swz = bits(x, 74, 2), c = bits(x, 64, 8), c_swz = bits(x, 81, 2);
+    int a_neg = bits(x, 72, 1), c_neg = bits(x, 84, 1), sat = bits(x, 77, 1);
+    int relu = bits(x, 79, 1);                                   // .RELU (Ampere): max(result, 0), the network's activation
+    if (bits(x, 73, 1) || bits(x, 83, 1) || bits(x, 78, 1) || bits(x, 85, 2)) return (void)fail(l, "HFMA2 mode");
+    // Forms: 0x231 registers; 0x831 / 0xa31 an immediate / constant in b's slot; 0x431 / 0x631 in c's slot (then
+    // the register at 32-39 is b). The wide operand goes to scratch first.
+    uint32_t b, b_swz = 0; int b_neg = 0;
+    uint32_t form = op >> 9;
+    if (form == 1) {
+        b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_neg = bits(x, 63, 1);
+    } else if (form == 4 || form == 2) {
+        if (form == 2) b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_neg = bits(x, 63, 1), c = S(l, 0), mov_imm(l, c, x->w[1]);
+        else b = S(l, 0), mov_imm(l, b, x->w[1]);
+    } else if (form == 5 || form == 3) {
+        Src cb = {0}; cb.kind = 2, cb.cb_off = bits(x, 38, 16), cb.cb_bank = bits(x, 54, 5);
+        if (!cbuf_ok(&cb)) return (void)fail(l, "HFMA2 constant");
+        if (form == 3) b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_neg = bits(x, 63, 1), c = S(l, 0), mov_cbuf(l, c, &cb);
+        else b = S(l, 0), b_swz = bits(x, 60, 2), b_neg = bits(x, 63, 1), mov_cbuf(l, b, &cb);
+    } else {
+        return (void)fail(l, "HFMA2 form");
+    }
+    if (bits(x, 62, 1) && form != 4) return (void)fail(l, "HFMA2 absolute operand");
+    emit(l, base(l, 0x5c80000000000000ull, rd, a) | ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)c_neg << 30) |
+                ((uint64_t)(a_neg ^ b_neg) << 31) | ((uint64_t)sat << 32) | ((uint64_t)c_swz << 35) | ((uint64_t)c << 39) |
+                ((uint64_t)a_swz << 47));
+    if (relu) h2_relu(l, rd);
+}
+
+// Half pairs on Maxwell, which has no HMNMX2 and no .RELU: m = HSET2.GT.BF (a > b: 1.0 or 0.0 per half), then
+// max(a, b) = m * (a - b) + b through HADD2 and HFMA2; relu(x) = x * (x > 0) through HMUL2.
+#define HSET2_GT_BF(rd, ra, aswz, rb, bswz) (0x5d18000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20) | \
+                                             ((uint64_t)(bswz) << 28) | ((uint64_t)4 << 35) | ((uint64_t)7 << 39) | ((uint64_t)(aswz) << 47) | ((uint64_t)1 << 49))
+#define HMUL2_R(rd, ra, rb) (0x5d08000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20))
+#define HADD2_SUB_R(rd, ra, aswz, rb, bswz) (0x5d10000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20) | \
+                                             ((uint64_t)(bswz) << 28) | ((uint64_t)1 << 31) | ((uint64_t)(aswz) << 47))
+static void h2_relu(L *l, uint32_t rd) {
+    uint32_t m = S(l, 1);
+    emit(l, l->pred | HSET2_GT_BF(m, rd, 0, RZ, 0));
+    emit(l, l->pred | HMUL2_R(rd, rd, m));
+}
+
+// HMNMX2 (0x040, Ampere): min (predicate 87-90 true) or max of two half pairs; register form, plain operands.
+static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
+    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), b = bits(x, 32, 8), a_swz = bits(x, 74, 2), b_swz = bits(x, 60, 2);
+    int is_min = bits(x, 87, 3) == 7 ? !bits(x, 90, 1) : -1;
+    if (op != 0x240 || is_min < 0 || bits(x, 62, 2) || bits(x, 72, 2) || bits(x, 76, 11)) return (void)fail(l, "HMNMX2 mode");
+    uint32_t m = S(l, 1), d = S(l, 2);
+    emit(l, l->pred | (is_min ? HSET2_GT_BF(m, b, b_swz, a, a_swz) : HSET2_GT_BF(m, a, a_swz, b, b_swz)));
+    emit(l, l->pred | HADD2_SUB_R(d, a, a_swz, b, b_swz));
+    emit(l, l->pred | (HFMA2_R(rd, m, 0, d, b) | ((uint64_t)b_swz << 35)));
+}
+
+// F2FP (0x23e, Ampere) .PACK_AB: Rd = (half of Ra) << 16 | half of Rb, rounding 79-80 (round to nearest only).
+// Maxwell: two F2F.F16.F32 (the half in the low 16 bits) and a PRMT.
+static void lower_f2fp(L *l, const Insn *x, uint32_t op) {
+    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8);
+    if (op != 0x23e || bits(x, 72, 7) || bits(x, 79, 13) || bits(x, 64, 8) != RZ) return (void)fail(l, "F2FP mode");
+    uint32_t b = bits(x, 32, 8), hi = S(l, 0), lo = S(l, 1);
+    emit(l, base(l, 0x5ca8000000000000ull, hi, 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)a << 20));
+    emit(l, base(l, 0x5ca8000000000000ull, lo, 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)b << 20));
+    emit(l, l->pred | PRMT_IMM(rd, lo, 0x5410, hi));
+}
+
+// BAR (0xb1d): BAR.SYNC with barrier 0 and the whole workgroup (every other field 0). Maxwell BAR.SYNC 0x0.
+static void lower_bar(L *l, const Insn *x) {
+    if (bits(x, 16, 8) || bits(x, 24, 8) || x->w[1] || (x->w[2] & 0x0fffffffu)) return (void)fail(l, "BAR mode");
+    emit(l, 0xf0a81b8000000000ull | l->pred);
 }
 
 // PRMT (0x016): byte permute, selector in the b slot (immediate usually), mode 72-74.
@@ -2382,6 +2598,13 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x386: case 0x986: return lower_stg(l, x, op);
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
     case 0xb9b: return lower_sust(l, x);
+    case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
+    case 0x23e: return lower_f2fp(l, x, op);
+    case 0x240: return lower_hmnmx2(l, x, op);
+    case 0xb1d: return lower_bar(l, x);
+    case 0x83b: return lower_ldsm(l, x);
+    case 0x23c: return lower_hmma(l, x);
+    case 0x23a: return lower_movm(l, x);
     case 0xb63: case 0xf63: return lower_tld4(l, x, op);
     case 0xb66: case 0xf66: return lower_tld(l, x, op);
     case 0xb6f: case 0x370: return lower_txq(l, x, op);

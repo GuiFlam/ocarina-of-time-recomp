@@ -62,7 +62,6 @@ NVN2_STUBS = [
     "nvnCommandBufferMultiDrawMeshTasksIndirectCount",
     "nvnCommandBufferPopDebugGroupCompute",
     "nvnCommandBufferPopDebugGroupGraphics",
-    "nvnCommandBufferPushComputeConstants",
     "nvnCommandBufferPushComputeConstantsDeferred",
     "nvnCommandBufferPushDebugGroupCompute",
     "nvnCommandBufferPushDebugGroupGraphics",
@@ -199,6 +198,7 @@ NVN2_STUBS = [
 # (build/logs/nvn-missing-loaded.txt, 2026-11-05); runtime/nvn_api_nvn2.c and nvn_api_core.c implement them. The
 # game names 187 more NVN2 procs it has not asked for yet (docs/plan.md, "NVN2 survey").
 NVN2_OOT = [
+    "nvnCommandBufferPushComputeConstants",   # the compute kernels' parameter block, read as constant bank 0 (NVN2)
     "nvnDeviceGetFlags", "nvnDeviceRegisterFastClearColorIndex", "nvnDeviceRegisterFastClearColoriIndex",
     "nvnDeviceRegisterFastClearColoruiIndex", "nvnDeviceRegisterFastClearDepthIndex",
     "nvnDeviceRegisterFastClearStencil", "nvnDeviceRegisterFastClearStencilIndex",

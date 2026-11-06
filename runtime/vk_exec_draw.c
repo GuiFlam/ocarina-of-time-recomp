@@ -903,6 +903,57 @@ static int c0_on(void) {   // OOT_FIX_C0=0: c0 reads zeros instead of the driver
     return on;
 }
 
+// NVN2 (SM86) compute shaders read constant bank 0 as: 0x10 reserved bytes (the dispatch size here), the constants
+// pushed with nvnCommandBufferPushComputeConstants, then the driver's tables of the bound resources in slot order:
+// storage buffers {u64 address, u32 size, u32 0} for control[0xb2] slots, texture handles (u64) for control[0xb3]
+// slots, image handles (u64) for control[0xb6] slots (measured on the upscaler's kernels, docs/phase3.md
+// 2026-11-06: a kernel with a 0x54-byte push, 3 storage slots, 4 texture slots and 2 image slots reads its storage
+// slot 2 at 0x90, textures 0 and 3 at 0xa0 and 0xb8, image 1 at 0xc8; one with no push reads slots 0 and 1 at 0x10
+// and 0x20). The push is consumed by the next dispatch.
+static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32_t *nt, uint32_t *ni) {
+    const uint8_t *ctl, *code;
+    uint32_t len;
+    if (!ex->prog || !vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
+    *base = 0x10 + ((ex->push_cc_len + 15u) & ~15u);
+    *ns = ctl[0xb2], *nt = ctl[0xb3], *ni = ctl[0xb6];
+    return 1;
+}
+
+static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
+    memset(bank, 0, VK_C0_BYTES);
+    memcpy(bank, c0_dim, 12);
+    memcpy(bank + 0x10, ex->push_cc, ex->push_cc_len);
+    uint32_t base, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
+    uint32_t o = base;
+    for (uint32_t k = 0; k < ns && k < 16 && o + 16 <= VK_C0_BYTES; k++, o += 16) {
+        uint32_t size = (uint32_t)ex->ssbo[NVN_STAGE_CS][k].size;
+        memcpy(bank + o, &ex->ssbo[NVN_STAGE_CS][k].addr, 8);
+        memcpy(bank + o + 8, &size, 4);
+    }
+    for (uint32_t t = 0; t < nt && t < 128 && o + 8 <= VK_C0_BYTES; t++, o += 8) memcpy(bank + o, &ex->tex[NVN_STAGE_CS][t], 8);
+    for (uint32_t i = 0; i < ni && i < 32 && o + 8 <= VK_C0_BYTES; i++, o += 8) memcpy(bank + o, &ex->img[NVN_STAGE_CS][i], 8);
+}
+
+// The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image; -1 outside.
+static int nvn2_c0_slot(const VkExec *ex, uint32_t off, int *kind) {
+    uint32_t base, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni) || off < base) return -1;
+    off -= base;
+    if (off < 16 * ns) return *kind = 0, (int)(off / 16);
+    off -= 16 * ns;
+    if (off < 8 * nt) return *kind = 1, (int)(off / 8);
+    off -= 8 * nt;
+    if (off < 8 * ni) return *kind = 2, (int)(off / 8);
+    return -1;
+}
+
+static int nvn2_cs(const VkExec *ex, int st) {   // an SM86 compute program is bound: its bank 0 is the NVN2 one
+    const uint8_t *ctl, *code;
+    uint32_t len;
+    return st == NVN_STAGE_CS && ex->prog && vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len) && ctl[0x56] == 5;
+}
+
 // c0 from replay scratch; a bank equal to the stage's previous one reuses its range, so it costs no copy.
 static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
@@ -913,11 +964,13 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     memcpy(in.ssbo, ex->ssbo[st], sizeof in.ssbo);
     if (st == NVN_STAGE_CS) memcpy(in.ubo, ex->ubo[st], sizeof in.ubo), memcpy(in.dim, c0_dim, sizeof in.dim);
     else in.binst = c0_binst;
-    if (B.c0_valid[k] && !memcmp(&in, &B.c0_in[k], sizeof in))
+    int nvn2 = nvn2_cs(ex, st);   // its bank also depends on the push and the handles: compared by bytes below
+    if (!nvn2 && B.c0_valid[k] && !memcmp(&in, &B.c0_in[k], sizeof in))
         return (VkDescriptorBufferInfo){B.c0_buf[k], B.c0_off[k], VK_C0_BYTES};
     B.c0_in[k] = in;
     uint8_t tmp[VK_C0_BYTES];
-    vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
+    if (nvn2) nvn2_c0_fill_cs(ex, tmp);
+    else vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
     if (!B.c0_valid[k] || memcmp(tmp, B.c0[k], VK_C0_BYTES)) {
         memcpy(scratch(ex, VK_C0_BYTES, &B.c0_buf[k], &B.c0_off[k]), tmp, VK_C0_BYTES);
         memcpy(B.c0[k], tmp, VK_C0_BYTES);
@@ -1042,6 +1095,10 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     const p_bind_buf *b = NULL;
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
+    else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
+        int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
+        if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
+    }
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
@@ -1642,7 +1699,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
             } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
                        b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
                 int img = b->kind == GFX_RES_IMG, cap = img ? 32 : 128;
-                if (r->cbuf_slot >= 3) ok = 0;   // handles in a uniform block (cbuf_handle): its bytes are not compared
+                if (r->cbuf_slot >= 3 || r->cbuf_slot == 0) ok = 0;   // handles in a uniform block or the pushed constants (cbuf_handle): not compared
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
@@ -1736,6 +1793,13 @@ static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, c
 // such a resource got slot -1 (gfx_shader.c handle_slot) and element k the texture bound to slot k - 1: the morph
 // ball's light sampled the depth buffer for its cookie, and the fog over its screen tiles turned dark.
 static uint64_t cbuf_handle(const VkExec *ex, int st, const GfxShaderRes *r, uint32_t k) {
+    if (r->cbuf_slot == 0) {   // NVN2: the bound slot whose handle the bank-0 word carries
+        int kind, slot;
+        if (!nvn2_cs(ex, st)) return 0;
+        slot = nvn2_c0_slot(ex, (uint32_t)(r->handle & 0x3fff) * 4 + (uint32_t)k * 8, &kind);
+        if (slot < 0 || kind == 0) return 0;
+        return kind == 2 ? (slot < 32 ? ex->img[st][slot] : 0) : (slot < 128 ? ex->tex[st][slot] : 0);
+    }
     if (r->cbuf_slot < 3 || r->cbuf_slot - 3 >= 18) return 0;
     const p_bind_buf *u = &ex->ubo[st][r->cbuf_slot - 3];
     uint64_t off = (uint64_t)(r->handle & 0x3fff) * 4 + (uint64_t)k * 8, h = 0;
@@ -1745,6 +1809,15 @@ static uint64_t cbuf_handle(const VkExec *ex, int st, const GfxShaderRes *r, uin
     if (!p && vk_mem_resolve(u->addr + off, 8, &sp)) p = (const void *)(uintptr_t)(u->addr + off);
     if (p) memcpy(&h, p, 8);
     return h;
+}
+
+// The handle a texture or image declaration resolves to in the replay: its bound slot, or the word the shader reads
+// it from (a user uniform block, or NVN2's bank 0). For vk_dump.c.
+uint64_t vk_exec_res_handle(const VkExec *ex, int st, const GfxShaderRes *r, uint32_t k, int img) {
+    int slot = r->slot + (int)k;
+    if (r->cbuf_slot >= 3 || (r->cbuf_slot == 0 && slot < 0)) return cbuf_handle(ex, st, r, k);
+    if (img) return slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
+    return slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
 }
 
 static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
@@ -1821,7 +1894,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
-                    if (r->cbuf_slot >= 3) h = cbuf_handle(ex, st, r, k);
+                    if (r->cbuf_slot >= 3 || (r->cbuf_slot == 0 && slot < 0)) h = cbuf_handle(ex, st, r, k);
                     else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
@@ -2442,6 +2515,16 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
 }
 
+// OP_PUSH_CC (NVN2 nvnCommandBufferPushComputeConstants): the pushed bytes into the compute stage's block, which
+// c0_info serves as constant bank 0 (the SM86 compute shaders' parameter block: sizes, scales, buffer addresses and
+// texture and image handles, each at the offsets the shader reads).
+static void op_push_cc(VkExec *ex, const p_update_ub *u) {
+    if (!u->size || u->dst + u->size > VK_C0_BYTES) return;
+    memcpy(ex->push_cc + u->dst, u->data, u->size);
+    if (ex->push_cc_len < u->dst + u->size) ex->push_cc_len = (uint32_t)(u->dst + u->size);
+    B.c0_valid[2] = 0;
+}
+
 static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     if (!u->size) return;
     VkMemSpan sp;
@@ -2620,12 +2703,13 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
         break;
     }
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
+    case OP_PUSH_CC: op_push_cc(ex, payload); break;
     case OP_DRAW: op_draw(ex, payload); break;
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
-    case OP_DISPATCH: op_dispatch(ex, payload); break;
+    case OP_DISPATCH: op_dispatch(ex, payload); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DRAW_IND: op_draw_ind(ex, payload); break;
-    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); break;
+    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); ex->push_cc_len = 0; break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }

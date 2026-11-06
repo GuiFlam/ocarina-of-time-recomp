@@ -160,6 +160,19 @@ HOST_OVERRIDE("_ZN2nn6socket11EventFdReadEiPm", ov_eventfd_read);
 HOST_OVERRIDE("_ZN2nn6socket12EventFdWriteEim", ov_socket_ok);
 
 
+// nn::diag::detail::AbortImpl(condition, function, file, line): the SDK's assertion, seen once in three runs right
+// after the first frame from nn::os::detail::MultiWaitImpl::InternalWaitAnyImpl (2026-11-06). Logged before the SDK
+// goes on to its Break, which the host's fatal path does not survive on that thread yet.
+static void obs_abort_impl(Cpu *c) {
+    const char *cond = arg_p(c, 0), *func = arg_p(c, 1), *file = arg_p(c, 2);
+    char lr[128];
+    rt_log("nn::diag abort: \"%s\" in %s (%s:%d), from %s", cond ? cond : "?", func ? func : "?", file ? file : "?",
+           (int)arg_x(c, 3), ldr_describe(c->x[30] - 4, lr, sizeof lr));
+    fflush(stderr);
+    rt_original(c);
+}
+HOST_OBSERVER("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i", obs_abort_impl);
+
 // nn::ssl: Initialize succeeds without ssl:s; making a context or reading the built-in certificates fails with an
 // ssl-module result (module 123). Context's constructor and destructor are local SDK code and stay lifted.
 #define SSL_R_UNAVAILABLE (123u | (1u << 9))

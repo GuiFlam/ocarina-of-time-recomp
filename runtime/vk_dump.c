@@ -566,6 +566,16 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
     static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
+    if (info->n_bindings) {   // DIAG (NVN2 bank 0 layout): every bound texture, image and uniform slot of the stage
+        int st = nvn_stage(info->bindings[0].stage);
+        sp(b, "    %s bound tex:", stn[st]);
+        for (int k = 0; k < 128; k++) if (ex->tex[st][k]) sp(b, " %d=%#llx", k, (unsigned long long)ex->tex[st][k]);
+        sp(b, "; img:");
+        for (int k = 0; k < 32; k++) if (ex->img[st][k]) sp(b, " %d=%#llx", k, (unsigned long long)ex->img[st][k]);
+        sp(b, "; ubo:");
+        for (int k = 0; k < 16; k++) if (ex->ubo[st][k].addr) sp(b, " %d=%#llx+%#llx", k, (unsigned long long)ex->ubo[st][k].addr, (unsigned long long)ex->ubo[st][k].size);
+        sp(b, "\n");
+    }
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
         const GfxShaderRes *r = bd->res;
@@ -635,9 +645,9 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
         }
         for (uint32_t k = 0; k < (bd->count ? bd->count : 1u); k++) {
             int slot = r->slot + (int)k;
-            uint64_t h = handle_of(ex, st, slot, img);
-            sp(b, "    %s %s slot %d decl %s%s: ", stn[st], img ? "img" : "tex", slot, decl_type(r->type, dt),
-               img && (r->flags & 4) ? " store" : "");
+            uint64_t h = vk_exec_res_handle(ex, st, r, k, img);
+            sp(b, "    %s %s slot %d (c%d+%#x) decl %s%s: ", stn[st], img ? "img" : "tex", slot, r->cbuf_slot, (r->handle & 0x3fff) * 4,
+               decl_type(r->type, dt), img && (r->flags & 4) ? " store" : "");
             if (!h) { sp(b, "no handle (dummy)\n"); continue; }
             view_t v;
             int hv = 0;
@@ -1009,7 +1019,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
         const VkPipeBinding *bd = &info->bindings[i];
         if (!bd->res || bd->kind != GFX_RES_IMG || !(bd->res->flags & 4) || bd->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
             continue;
-        uint64_t h = handle_of(ex, 5, bd->res->slot, 1);
+        uint64_t h = vk_exec_res_handle(ex, 5, bd->res, 0, 1);
         view_t v;
         int hv = 0;
         const VkTexImage *t = h ? vk_texture_by_id(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
