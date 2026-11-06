@@ -510,7 +510,8 @@ static void open_window(void *arg) {
     density_update();
     note_applied();
     refresh_rate_update();
-    if (cfg_bool("OOT_BACKGROUND_WINDOW")) rt_log("gfx: OOT_BACKGROUND_WINDOW has no effect with SDL windows");
+    const char *bg = cfg_get("OOT_BACKGROUND_WINDOW");   // no row in the settings table: read it as gfx_window.c does
+    if (bg && atoi(bg)) rt_log("gfx: OOT_BACKGROUND_WINDOW has no effect with SDL windows");
     if (gfx_cfg_fullscreen()) SDL_SetWindowFullscreen(g_win, true);
     SDL_SyncWindow(g_win);
     input_sdl_window(g_win);
