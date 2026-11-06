@@ -186,3 +186,6 @@ PlatEvent *plat_event_new(void);                          // NULL on failure
 void plat_event_free(PlatEvent *e);
 void plat_event_set(PlatEvent *e);
 int plat_event_wait_ns(PlatEvent *e, uint64_t ns);
+
+// ---- yield: gives the rest of this thread's time slice to another thread that is ready (SwitchToThread, sched_yield).
+void plat_yield(void);

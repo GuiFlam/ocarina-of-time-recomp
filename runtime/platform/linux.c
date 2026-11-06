@@ -169,6 +169,8 @@ int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
     return got;
 }
 
+void plat_yield(void) { sched_yield(); }
+
 // Thread priority is not changed on Linux (see platform.h): an unprivileged thread cannot raise its priority back.
 void plat_thread_priority(PlatThread *t, int level) {
     (void)t;

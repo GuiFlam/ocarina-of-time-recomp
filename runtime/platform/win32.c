@@ -95,6 +95,8 @@ int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
     return WaitForSingleObject(e->h, wait) == WAIT_OBJECT_0;
 }
 
+void plat_yield(void) { SwitchToThread(); }
+
 void plat_thread_priority(PlatThread *t, int level) {
     static const int map[] = {THREAD_PRIORITY_IDLE, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
     if ((unsigned)level < 3) SetThreadPriority(t ? t->h : GetCurrentThread(), map[level]);
