@@ -179,6 +179,28 @@ Open: the frame rate (21 fps in the cinematic: the emulated kernels, and the dec
 start-up crash, now about one run in two (the SDK abort in MultiWait, see the previous section); the 656 skinning
 vertex shaders the lowering refuses; the mesh stages. The game has not yet been taken past the cinematic.
 
+## Status (2026-11-07): the title screen as the player sees it
+
+Watched with sound for the first time (the user), three things looked wrong. All three are settled:
+
+- **The game froze and its music stopped for a while.** It was out of focus: the host reports the window's focus to
+  the game as the console reports the HOME menu, and the game pauses itself. By design. `OOT_ASSUME_FOCUS=1` pins the
+  focus for watched test runs. The title movie has no sound track: no run has ever created a movie AudioDecoder.
+- **The cinematic ran at a third of its speed.** The game takes one movie picture per game frame and does not look at
+  the time stamps, so at 21 fps the 60 fps movie played at a third of its speed (a pacing line every 300 pictures:
+  5 s of video in 15 s). `ov_movie22.c` now hands pictures back on a playback clock and skips the ones already
+  late. dav1d runs on a host thread per decoder, which signals the output event; the events are interprocess
+  system events for that. The frame rate stays at about 22 fps. Decoding was not what limited it.
+- **The logo was pixelated.** Its ASTC blocks were decoded right (ARM's astcenc agrees texel for texel) but put in the
+  wrong places. Inside a GOB the Switch 2 puts the 16-byte column at 64 bytes and the second row bit at 32, the
+  reverse of the Tegra X1. This was found by matching each block's edges against every other block in the stored
+  order, and holds for the ASTC logo (16-byte blocks) and the BC4 masks (8-byte blocks). `tex_deswizzle.c` applies it
+  to elements of 8 and 16 bytes. Smaller elements keep the X1 order: no game data has settled them yet.
+  `OOT_GOB_SWITCH2_MIN=1` (or 2, 4) tries the Switch 2 order for them, and `OOT_TEX_RAW=<w>x<h>` writes a texture's
+  raw blocks for such checks. Frame dumps now also write the alpha of 8-bit RGBA images (`..._a.png`).
+
+Getting to the title menu needs an A press (`OOT_INPUT_SCRIPT` with `600 A 10`).
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
