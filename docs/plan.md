@@ -153,6 +153,21 @@ before `sdk` (`0x70050e0000`) when an exception is thrown; `QueryMemory` should 
 skips it. Not fixed yet, as nothing throws any more.
 
 
+## Phase 3: SM86 shaders
+
+Started 2026-11-05 from `docs/phase3.md` (the hand-off, which carries the measurements and the status). In short:
+the translator built; `tools/shader_census.py` reads the NVN2 archives (14,363 programs, the opcode histogram as the
+work list); `runtime/sm86_lower.c` lowers SM86 to Maxwell in front of the unchanged Ryujinx translator (93.6% of the
+corpus, every lowered program translates); the host reads the NVN2 control section, lowers before translating and
+binds the lowered jump tables as constant bank 1. The game presents its first frames through translated shaders.
+
+Found on the way, outside the shaders: during loading the frames came 10 to 50 s apart with every thread idle in a
+wait (the sampling profiler, `OOT_PROFILE`, `tools/prof_report.py`). The thread dump (`OOT_THREAD_DUMP=s25,s50`)
+showed the main thread, pinned to core 2, waiting for that core, held by the NPLN event-engine thread sleeping inside
+the host's `nnsocketPoll` override (`ov_oot.c`): a blocking host wait that did not give its virtual core up, as the
+NVN waits do through `kern_core_away`. Fixed there.
+
+
 ## Shared core
 
 The copy of 2026-11-05, from metroid-prime-4-recomp @ `586e91e`: 606 tracked files, 119 changed only by the rename of

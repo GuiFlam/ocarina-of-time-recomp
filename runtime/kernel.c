@@ -1622,6 +1622,7 @@ uint64_t kern_threads_created(void) {
 Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
 uint32_t kern_main_thread(Cpu **cpu) {
+    thread_dump_frame(0);   // starts the OOT_THREAD_DUMP s<seconds> timer at boot: a dump before the first present
     if (tcur) {
         if (!tcur->is_main) rt_fatal("kern_main_thread on guest thread %#x, not the main thread", tcur->handle);
         *cpu = tcur->cpu;

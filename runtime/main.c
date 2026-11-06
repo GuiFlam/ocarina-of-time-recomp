@@ -434,8 +434,22 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
     HMODULE self = GetModuleHandleW(NULL);
     MODULEINFO mi;
-    if (!GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi) || rip - (uintptr_t)mi.lpBaseOfDll >= mi.SizeOfImage)
-        return EXCEPTION_CONTINUE_SEARCH;   // not our code: leave it to the handler that expects it
+    if (!GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi) || rip - (uintptr_t)mi.lpBaseOfDll >= mi.SizeOfImage) {
+        // Not our code: left to the handler that expects it, but said once, as a process that dies in a driver or
+        // a DLL otherwise leaves no trace (2026-11-05: exit code 40 after frame 1, no FATAL line).
+        static volatile LONG foreign;
+        if (InterlockedIncrement(&foreign) <= 4) {
+            HMODULE m = NULL;
+            wchar_t name[MAX_PATH] = L"?";
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)rip, &m) && m)
+                GetModuleFileNameW(m, name, MAX_PATH);
+            rt_logf("exception %#lx at host %p (%ls+%#llx, thread %lu), left to its own handler\n", code, (void *)rip, name,
+                    (unsigned long long)(m ? rip - (uintptr_t)m : 0), GetCurrentThreadId());
+            fflush(stderr);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (InterlockedExchange(&busy, 1)) ExitProcess(71);
     char d[160];
     rt_logf("FATAL: exception %#lx at host %p (oot.exe+%#llx)", code, (void *)rip,
