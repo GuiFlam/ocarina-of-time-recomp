@@ -262,16 +262,21 @@ static uint32_t ur_dst(L *l, uint32_t n) { return ur_has_reg(l, n) ? ur(l, n) : 
 
 // Uniform registers n and n + 1 as an adjacent register pair, in scratch k, k + 1 when they are forwarded
 // constants or not adjacent in the mapping.
-static uint32_t ur_pair(L *l, uint32_t n, int k) {
+static uint32_t ur_pair_in(L *l, uint32_t n, int k, uint32_t hint, int even) {
     if (n >= 63) return fail(l, "uniform register pair"), NOREG;
     Src lo = ur_src(l, n), hi = ur_src(l, n + 1);
-    if (lo.kind == 0 && hi.kind == 0 && hi.reg == lo.reg + 1) return lo.reg;
-    uint32_t a = S(l, k), b = S(l, k + 1);
+    if (lo.kind == 0 && hi.kind == 0 && hi.reg == lo.reg + 1 && !(even && (lo.reg & 1))) return lo.reg;
+    // hint: two adjacent registers the caller can spare for the pair (a load's destination), used instead of scratch.
+    // even: the pair must start on an even register (RED's address); the scratch pair moves up by one when it does not.
+    uint32_t a = hint != NOREG ? hint : S(l, k);
+    if (hint == NOREG && even && (a & 1)) a = S(l, ++k);
+    uint32_t b = hint != NOREG ? hint + 1 : S(l, k + 1);
     if (b != a + 1) return fail(l, "scratch pair"), NOREG;
     if (lo.kind == 0 && lo.reg == RZ) mov_imm(l, a, 0); else to_reg_into(l, lo, a);
     if (hi.kind == 0 && hi.reg == RZ) mov_imm(l, b, 0); else to_reg_into(l, hi, b);
     return a;
 }
+static uint32_t ur_pair(L *l, uint32_t n, int k) { return ur_pair_in(l, n, k, NOREG, 0); }
 
 // Uniform register n read by a uniform-datapath op: its register, or a forwarded constant brought into scratch k.
 static uint32_t ur_in(L *l, uint32_t n, int k) {
@@ -1265,8 +1270,15 @@ static void lower_imad_wide(L *l, const Insn *x) {
     if (bits(x, 72, 1) || bits(x, 74, 7) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) ||
         bits(x, 87, 4) != 15 || rd >= 254 || (c != RZ && c >= 254))
         return (void)fail(l, "IMAD.WIDE mode");
-    uint32_t rb = to_reg(l, b, 1, 0, 0);
-    uint32_t lo = S(l, 2), hi = S(l, 3);
+    uint32_t rb = to_reg(l, b, 0, 0, 0);
+    // The result goes straight to Rd, Rd+1 when no source lies in them but a, which is read by the second word
+    // only (Rd+1 may be a source: it is read before the write); otherwise through two scratch registers. The
+    // direct form needs one scratch register at most, where a vertex shader with 247 live registers has few.
+    int direct = a.reg != rd && rb != rd && (c == RZ || (c != rd && c != rd + 1 && c + 1 != rd && c + 1 != rd + 1));
+    // Through scratch the multiplier's own scratch register (when b was an immediate or a constant) takes the high
+    // word, which is written by the instruction that last reads it: two scratch registers in all, not four.
+    int rb_scratch = b.kind != 0 && rb != RZ;
+    uint32_t lo = direct ? rd : S(l, rb_scratch ? 1 : 0), hi = direct ? rd + 1 : rb_scratch ? rb : S(l, 1);
     uint64_t sign = is_signed ? ((uint64_t)1 << 48) | ((uint64_t)1 << 53) : 0;
     emit(l, base(l, 0x5a00000000000000ull, lo, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)RZ << 39));
     emit(l, base(l, 0x5a00000000000000ull, hi, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
@@ -1274,6 +1286,7 @@ static void lower_imad_wide(L *l, const Insn *x) {
         emit(l, base(l, 0x5c10000000000000ull, lo, lo) | ((uint64_t)c << 20) | ((uint64_t)1 << 47));
         emit(l, base(l, 0x5c10000000000000ull, hi, hi) | ((uint64_t)(c + 1) << 20) | ((uint64_t)1 << 43));
     }
+    if (direct) return;
     mov_reg(l, rd, lo);
     mov_reg(l, rd + 1, hi);
 }
@@ -1404,7 +1417,9 @@ static void lower_mufu(L *l, const Insn *x) {
 }
 
 // IPA: the attribute field at 64-73 counts dwords (28 = position.x at a[0x70], 32 = a[0x80]); sample mode 76-77,
-// constant (.PASS) 78, the interpolation weight register in the b slot (RZ: the usual one).
+// constant (.PASS) 78, the interpolation weight register in the b slot (RZ: the usual one). Ra (an offset for the
+// offset mode, which is refused) is ignored, so IPA 0x526, whose Ra is a uniform register (bit 91; UR4 holding 0 in
+// the two fragment shaders that use it), lowers as 0x326 does.
 static void lower_ipa(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), attr = bits(x, 64, 10);
     if (bits(x, 32, 8) != RZ || bits(x, 76, 2) > 1 || bits(x, 79, 1) || bits(x, 81, 3) != 7 || attr * 4 > 0x3ff)
@@ -1499,7 +1514,12 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
     if (op == 0x381) {
         if ((x->w[2] & ~0x2e00u) != 0x001e8100u || (address & 1)) return (void)fail(l, "LDG register mode");
     } else {
-        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair(l, bits(x, 32, 6), 2);
+        // A wide load's destination (its first two registers, aligned) holds the uniform base while the address is
+        // formed when the pair is not already in registers: the address is read before the data is written, and a
+        // vertex shader with 247 live registers has no scratch run for the pair.
+        uint32_t spare = size >= 5 && rd != RZ && rd < 253 ? rd : NOREG;
+        if (spare != NOREG && address != RZ && address + 1 >= spare && address <= spare + 1) spare = NOREG;   // the address is in it
+        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair_in(l, bits(x, 32, 6), 2, spare, 0);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c1e1100u || x->w[2] == 0x0c1ebd00u;
         if ((!descriptor && (x->w[2] & ~(0x04000000u | 0x3fu | 0xe00u | 0x2000u)) != 0x081e8100u) || ubase == NOREG)
             return (void)fail(l, "LDG uniform mode");
@@ -1509,7 +1529,9 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
             address = ubase;
         } else {
             // 64-bit add of the uniform pair and the register (pair with bit 90, else zero-extended).
-            uint32_t lo = S(l, 0), hi = S(l, 1);
+            // In place over the base when it was brought into the spare registers.
+            int inplace = spare != NOREG && ubase == spare;
+            uint32_t lo = inplace ? ubase : S(l, 0), hi = inplace ? ubase + 1 : S(l, 1);
             if (ubase == RZ) return (void)fail(l, "LDG uniform zero base");
             emit(l, base(l, 0x5c10000000000000ull, lo, ubase) | ((uint64_t)address << 20) | ((uint64_t)1 << 47));
             emit(l, base(l, 0x5c10000000000000ull, hi, ubase + 1) | ((uint64_t)(bits(x, 90, 1) ? address + 1 : RZ) << 20) | ((uint64_t)1 << 43));
@@ -1524,7 +1546,15 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
 static void lower_stg(L *l, const Insn *x, uint32_t op) {
     uint32_t data = bits(x, 32, 8), size = bits(x, 73, 3), address = bits(x, 24, 8), offset = bits(x, 40, 24);
     if (size > 6 || bits(x, 16, 8)) return (void)fail(l, "STG mode");
-    if (data == RZ && size > 4) return (void)fail(l, "STG of wide zeros");
+    if (data == RZ && size > 4) {
+        // A wide store of zeros needs an aligned run of zeroed registers: scratch from index 4 on (0 to 3 serve the
+        // address), moved up to the alignment.
+        uint32_t n = size == 6 ? 4 : 2, first = S(l, 4);
+        int k = 4 + (int)((n - first % n) % n);
+        data = S(l, k);
+        for (uint32_t i = 0; i < n; i++) mov_imm(l, S(l, k + (int)i), 0);
+        if (l->failed) return;
+    }
     if (op == 0x986) {
         uint32_t ubase = ur_pair(l, bits(x, 64, 6), 2);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c101100u;
@@ -1738,7 +1768,8 @@ static void lower_movm(L *l, const Insn *x) {
 // uniform register at 40-45; 0x361 TEX.B: handle in the operand list). dimension 61-63, mask 72-75, second
 // destination 64-71, offsets 76, depth compare 78, fp16 results 79, lod mode 87-89, nodep 90. The operand list
 // is (array index), coordinates, [handle], [lod], [offsets], [reference], packed into Ra then Rb: up to four
-// values are split evenly (1+1, 2+1, 2+2), five or more as 4+n. Maxwell TEX takes the coordinates in Ra.. and
+// values are split evenly (1+1, 2+1, 2+2), five or more as 4+n; with bit 60 clear the coordinates are Ra's and the
+// rest Rb's. Maxwell TEX takes the coordinates in Ra.. and
 // the rest in Rb..; TEX.B takes the handle first in Rb. Values already lying that way are used in place, the
 // others go through scratch. Bank 2 is the game's texture constant buffer, which the translator knows as the
 // bound descriptors (TEX with the word index); another bank loads the handle for TEX.B.
@@ -1759,12 +1790,14 @@ static void lower_tex(L *l, const Insn *x, uint32_t op) {
     if (dim == 6 || bits(x, 77, 1) || bits(x, 81, 3) != 7 || bits(x, 59, 1) != (op == 0x361 ? 1u : 0u) ||
         (lod > 3 && lod != 6 && lod != 7) || (dc && mask != 1) || mask == 0)
         return (void)fail(l, "TEX mode");
-    if (!bits(x, 60, 1) && op != 0x361) return (void)fail(l, "TEX unpacked operands");
     uint32_t coords = coord_count[dim];
     int has_lod = lod == 2 || lod == 3 || lod == 6 || lod == 7;
     uint32_t handle_slot = op == 0x361 ? 1 : 0;
     uint32_t count = coords + handle_slot + has_lod + offsets + dc;
-    uint32_t in_a = op == 0x361 && !bits(x, 60, 1) ? coords : count <= 4 ? (count + 1) / 2 : op == 0x361 ? coords : 4;
+    // Bit 60 clear: Ra holds the coordinates and Rb everything after them, for TEX as for TEX.B (measured on the
+    // 3D fetches of one fragment shader, coordinates in Ra..Ra+2, then the LOD in Rb and the packed offsets in Rb+1;
+    // other combinations of unpacked operands are assumed to follow the same rule, not seen).
+    uint32_t in_a = !bits(x, 60, 1) ? coords : count <= 4 ? (count + 1) / 2 : op == 0x361 ? coords : 4;
     uint32_t tid = bits(x, 40, 14), bank = bits(x, 54, 5);
     uint32_t v[8];
     for (uint32_t i = 0; i < count && i < 8; i++)
@@ -2146,6 +2179,14 @@ static void lower_plop3(L *l, const Insn *x) {
         {0x80, 0, 0}, {0xfe, 1, 1}, {0xa8, 0, 1}, {0xea, 1, 0}, {0xf8, 0, 1}, {0xc0, 0, 0}, {0xfc, 1, 0}, {0x96, 2, 2},
         {0x78, 0, 2}, {0x3c, 1, 2}, {0xe8, 2, 1}, {0xb8, 0, 0},
     };
+    // An input that is PT (7) or !PT (15) is a constant: only the table rows where it has that value count, so a
+    // table of two inputs (a ^ b with c = PT, the usual 0x28) matches the three-input candidates that agree on them.
+    uint32_t care = 0xff;
+    for (uint32_t v = 0; v < 8; v++) {
+        if ((a & 7) == 7 && ((v >> 2 & 1) != !(a >> 3))) care &= ~(1u << v);
+        if ((b & 7) == 7 && ((v >> 1 & 1) != !(b >> 3))) care &= ~(1u << v);
+        if ((c & 7) == 7 && ((v & 1) != !(c >> 3))) care &= ~(1u << v);
+    }
     // The table of (a op_ab b) op_c c over inputs negated by n (bit 2 a, bit 1 b, bit 0 c) for each candidate.
     for (uint32_t n = 0; n < 8; n++) {
         for (unsigned i = 0; i < sizeof tables / sizeof tables[0]; i++) {
@@ -2156,7 +2197,7 @@ static void lower_plop3(L *l, const Insn *x) {
                 r = tables[i].op_c == 0 ? (ab & vc) : tables[i].op_c == 1 ? (ab | vc) : (ab ^ vc);
                 t |= r << v;
             }
-            if (t != lut) continue;
+            if ((t ^ lut) & care) continue;
             uint32_t na = a ^ ((n >> 2 & 1) << 3), nb = b ^ ((n >> 1 & 1) << 3), nc = c ^ ((n & 1) << 3);
             emit(l, 0x5090000000000000ull | l->pred | 7 | ((uint64_t)pd << 3) | ((uint64_t)(nc & 7) << 12) | ((uint64_t)(nc >> 3) << 15) |
                         ((uint64_t)tables[i].op_ab << 24) | ((uint64_t)(nb & 7) << 29) | ((uint64_t)(nb >> 3) << 32) |
@@ -2413,7 +2454,7 @@ static void lower_red(L *l, const Insn *x) {
     int32_t offset = (int32_t)(bits(x, 40, 24) << 8) >> 8;
     if ((x->w[2] & ~variable) != mode || (type != 0 && type != 1 && type != 3) || (type == 3 && operation != 0))
         return (void)fail(l, "RED mode");
-    uint32_t address = uniform ? ur_pair(l, bits(x, 64, 6), 2) : bits(x, 24, 8);
+    uint32_t address = uniform ? ur_pair_in(l, bits(x, 64, 6), 2, NOREG, 1) : bits(x, 24, 8);
     if (address == NOREG || (address & 1)) return (void)fail(l, "RED address");
     emit(l, 0xebf8000000000000ull | l->pred | data | ((uint64_t)address << 8) | ((uint64_t)type << 20) |
                 ((uint64_t)operation << 23) | ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48));
@@ -2761,7 +2802,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x309: case 0xd09: return lower_popc_flo(l, x, 0);
     case 0x301: return lower_brev(l, x);
     case 0x230: case 0x430: case 0x630: return lower_hadd2(l, x, op);
-    case 0x326: return lower_ipa(l, x);
+    case 0x326: case 0x526: return lower_ipa(l, x);
     case 0x321: return lower_ald_ast(l, x, 0);
     case 0x322: return lower_ald_ast(l, x, 1);
     case 0xb82: return lower_ldc(l, x);
