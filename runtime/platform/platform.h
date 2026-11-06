@@ -166,6 +166,9 @@ void plat_child_stop(PlatChild *c);                       // kills the child and
 int plat_child_write(PlatChild *c, const void *data, size_t n);   // 1 when all n bytes were written
 long plat_child_read(PlatChild *c, void *buf, size_t cap);        // bytes read (at least 1); 0 or negative: pipe broke
 
+// ---- entropy: n random bytes from the operating system into out; 1 on success (getrandom on Linux, BCryptGenRandom on Windows).
+int plat_random(void *out, size_t n);
+
 // ---- thread priority for background work: the pool's jobs and the warm-up run below the game's threads. Windows sets
 // THREAD_PRIORITY_IDLE / BELOW_NORMAL / NORMAL. Linux does nothing: an unprivileged thread can lower its scheduling
 // policy but never raise it back, so a lowered worker would stay low for good.
