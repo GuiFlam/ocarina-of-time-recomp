@@ -1101,7 +1101,7 @@ out:
 
 // A line of the replay's own in the frame's passes.txt (e.g. a draw left out for a shader that did not translate).
 void vk_dump_note(const char *fmt, ...) {
-    AcquireSRWLockExclusive(&rec_lock);
+    plat_mutex_lock(&rec_lock);
     if (active() && passes_f) {
         va_list ap;
         va_start(ap, fmt);
@@ -1110,7 +1110,7 @@ void vk_dump_note(const char *fmt, ...) {
         fputc('\n', passes_f);
         va_end(ap);
     }
-    ReleaseSRWLockExclusive(&rec_lock);
+    plat_mutex_unlock(&rec_lock);
 }
 
 void vk_dump_copy(VkExec *ex, uint32_t op, const void *payload) {
