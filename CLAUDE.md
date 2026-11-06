@@ -44,11 +44,36 @@ Phase 3: `docs/phase3.md` is the hand-off for it (what blocks, the measured NVN2
 approach, the order of work). Start there, with its dated Status sections: as of the night of 2026-11-06 the SM86
 lowering covers 94.1% of the corpus, the title cinematic decodes on the host (`runtime/ov_movie22.c`, dav1d) and
 plays on screen, upscaled to 2560x1440 by the game's neural network through the emulated tensor-core instructions
-(HMMA, LDSM, MOVM), at 21 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
-(`gfx_shader.c`): bump the latter after a lowering change. Test runs: `scratchpad/bin/run.sh` kills every run; the
-first run after a translator or lowering change spends a minute building the kernels' pipelines (the driver's disk
-cache keeps them); about one run in two dies right after the first frame (an SDK abort in MultiWait, see the docs),
-so run until one survives. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the
+(HMMA, LDSM, MOVM); HMMA runs on the host's tensor cores (VK_KHR_cooperative_matrix, translator patch 0016) and
+the title plays at 60 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
+(`gfx_shader.c`): bump the latter after a lowering change. The first run after a translator or lowering change spends
+a minute building the kernels' pipelines (the driver's disk cache keeps them); about one run in two dies right after
+the first frame (an SDK abort in MultiWait, see the docs).
+
+## Running and checking
+
+- Run the game with `python3 tools/run.py` (`--seconds`, `--shot`, `--press-a`, `--env OOT_X=V`, `--fresh-cache`,
+  `--dump`, `--expect REGEX`), never by hand: it names every `OOT_*` variable in WSLENV, retries the start-up crash,
+  numbers the log (`build/logs/run-<n>.log`), kills `oot.exe` and `oot_xlate.exe` afterwards and refuses to overlap
+  runs. `--expect` checks the log for a line proving a diagnostic switch applied.
+- After a change to the lowering, the translator or anything a shader computes, follow the project skill
+  `verify-shader-change` (`.claude/skills/`): probes, one kernel both ways, scored screenshots. A frame rate counts
+  only next to a screenshot that `tools/shot_diff.py` scores as a picture.
+- Shader tools: `tools/kernel.py` (list, stats, extract, lower, xlate, dis of a stored input),
+  `tools/bisect_kernels.py` (which kernel breaks the picture), `tools/xlate_patch.py` (start / save a translator
+  patch; `tools/build_xlate.py` takes any number of patches numbered without gaps). Image tools need Pillow and numpy:
+  for now `/mnt/c/dev/metroid-prime-4-recomp/.venv/bin/python3`.
+- What the game does on its own, found the slow way:
+  - The title shows a grass loop first (at 30 s, a good fixed scene); idle, it plays the castle and horse
+    cinematic. A at frame 600 (`--press-a`) brings up the menu.
+  - Out of focus the game pauses itself, music included, as on the console under the HOME menu; `tools/run.py` pins
+    the focus (`OOT_ASSUME_FOCUS=1`).
+  - The movies have no sound track: the music is the game's own audio.
+  - The input id known when a program is translated is not always its final input id (the `.in` name): a per-program
+    switch matches the code hash instead (`OOT_TENSOR_ONLY`, `tools/kernel.py` prints it).
+  - `--shot` builds pipelines synchronously, so screenshot runs are slower than normal ones.
+  - A relative `OOT_DUMP_DIR` or `OOT_SHADER_CACHE` is relative to the repo (run.py passes them with `/p`).
+  - `OOT_CS_TIME=1` logs the GPU time per compute shader; `OOT_TRACE=perf` the GPU time per frame and what bounds it. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the
 crash dump's memory and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`),
 `build/logs/nvn-proc-got.json` (GOT slot -> proc name, from the loader at `main+0x129e290`), `--probe-tensor` and
 `--probe-cs` (a kernel in isolation), `OOT_DUMP=dispatch`, `OOT_SKIP_DISPATCH_FROM`, `OOT_MQ_LOG`, `OOT_THREAD_DUMP`.

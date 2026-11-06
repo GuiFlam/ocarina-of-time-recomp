@@ -36,7 +36,8 @@ __pycache__/
 *.a
 
 # Coding-agent local setup and notes
-/.claude/
+/.claude/*
+!/.claude/skills/
 /CLAUDE.local.md
 /notes/
 
