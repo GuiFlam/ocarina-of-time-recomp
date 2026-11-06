@@ -120,8 +120,8 @@ static void update_voice(AudioRenderer *r, int i, const AudrenVoiceIn *in) {
     const int traced = (rt_trace & RT_TRACE_AUDIO) != 0;
     if (traced && was != v->state) {
         static const char *const states[] = {"stopped", "started", "paused", "stopping"};
-        rt_log("audren: voice %u %s -> %s (new %u, play state %u): fmt %u ch %u rate %u pitch %.2f vol %.2f mix %d splitter %u buffer index %u",
-               in->id, states[was & 3], states[v->state & 3], in->is_new, in->play_state, in->sample_format, in->channel_count,
+        rt_log("audren: %.3f voice %u %s -> %s (new %u, play state %u): fmt %u ch %u rate %u pitch %.2f vol %.2f mix %d splitter %u buffer index %u",
+               rt_uptime_s(), in->id, states[was & 3], states[v->state & 3], in->is_new, in->play_state, in->sample_format, in->channel_count,
                in->sample_rate, in->pitch, in->volume, in->mix_id, in->splitter_id, in->wave_buffer_index);
     }
     for (unsigned i = 0; i < 4; i++) {   // a new buffer waits until a render frame finds the voice playing

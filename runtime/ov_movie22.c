@@ -622,12 +622,13 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     *out = frame;
     if (index) *index = i;
     d->acquired++;
+    if (d->acquired == 1) rt_log("movie22: first picture handed back at %.3f s (pts %lld ns)", rt_uptime_s(), (long long)d->last_pts);
     if (!r.eos && d->acquired % 300 == 0) {                  // playback speed: time stamps against host time
         now = rt_ticks() * 625 / 12;
         if (d->pace_ns && d->last_pts > d->pace_pts)
-            rt_log("movie22: pacing: %llu pictures handed back; the last 300 cover %.2f s of video in %.2f s, %llu "
+            rt_log("movie22: pacing at %.2f s: %llu pictures handed back; the last 300 cover %.2f s of video in %.2f s, %llu "
                    "skipped, %.1f ms of decoding (on the decoding thread) per picture handed back",
-                   (unsigned long long)d->acquired, (d->last_pts - d->pace_pts) / 1e9, (now - d->pace_ns) / 1e9,
+                   rt_uptime_s(), (unsigned long long)d->acquired, (d->last_pts - d->pace_pts) / 1e9, (now - d->pace_ns) / 1e9,
                    (unsigned long long)(d->skipped - d->pace_skipped), (d->decode_ns - d->pace_decode_ns) / 300e6);
         d->pace_pts = d->last_pts, d->pace_ns = now, d->pace_skipped = d->skipped, d->pace_decode_ns = d->decode_ns;
     }

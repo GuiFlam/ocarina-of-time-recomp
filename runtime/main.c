@@ -358,6 +358,9 @@ void rt_udf(Cpu *c, uint64_t pc) {
 // CNTPCT_EL0: the Switch counter runs at 19.2 MHz. The scale is set before main, so no thread reads it half written.
 static PlatScale tick_scale;
 
+static uint64_t g_start_ns;
+double rt_uptime_s(void) { return (double)(plat_now_ns() - g_start_ns) / 1e9; }
+__attribute__((constructor)) static void uptime_init(void) { g_start_ns = plat_now_ns(); }
 __attribute__((constructor)) static void tick_scale_init(void) { tick_scale = plat_scale(19200000u, 1000000000u); }
 
 uint64_t rt_ticks(void) { return plat_scaled(tick_scale, plat_now_ns()); }

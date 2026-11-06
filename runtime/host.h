@@ -255,6 +255,7 @@ void account_uid(uint64_t out[2]);                         // the local user's n
                                                            // <profile>/account.uid; fs_host.c names save data after it
 
 // ---- movies (ov_movie.c)
+double rt_uptime_s(void);                                  // seconds since the process started (one clock for all traces)
 void movie_tick(Cpu *c);                                   // at every present, on the presenting guest thread: hands
                                                            // decoded movie frames over when due, signals their events
 // ---- game resolution (resolution.c): OOT_OUTPUT_RES, OOT_RENDER_SCALE
