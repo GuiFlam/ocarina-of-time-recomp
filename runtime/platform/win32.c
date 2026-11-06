@@ -863,3 +863,230 @@ int plat_sha256(const void *p, size_t n, uint8_t out[32]) {
     BCryptDestroyHash(h);
     return ok;
 }
+
+// ---- files and the host file system under the save data (fs_host.c; declared in platform.h). The Win32 calls that
+// fs_host.c made before the platform layer existed, moved here with the same flags: every file is opened with all
+// three share modes, a save file is flushed with FlushFileBuffers, and a rename into place is MoveFileEx with
+// MOVEFILE_WRITE_THROUGH when durable.
+#include <time.h>
+
+static wchar_t *fs_w(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
+    wchar_t *w = n > 0 ? malloc((size_t)n * sizeof *w) : NULL;
+    if (w && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n)) free(w), w = NULL;
+    if (!w) SetLastError(ERROR_INVALID_NAME);
+    return w;
+}
+
+// The reasons fs_host.c tells apart, from a Win32 error code. Access denied and sharing violations are BUSY: a save
+// commit retries those, and the other callers report them as invalid arguments.
+static int fs_win_err(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_DIRECTORY: return PLAT_FS_NOT_FOUND;
+    case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: return PLAT_FS_EXISTS;
+    case ERROR_DIR_NOT_EMPTY: return PLAT_FS_NOT_EMPTY;
+    case ERROR_ACCESS_DENIED: case ERROR_SHARING_VIOLATION: return PLAT_FS_BUSY;
+    default: return PLAT_FS_ERROR;
+    }
+}
+
+int plat_fs_os_error(void) { return (int)GetLastError(); }
+
+int plat_fs_kind(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_MISSING;
+    DWORD a = GetFileAttributesW(w);
+    free(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return PLAT_FS_MISSING;
+    if (a & FILE_ATTRIBUTE_REPARSE_POINT) return PLAT_FS_LINK;
+    return a & FILE_ATTRIBUTE_DIRECTORY ? PLAT_FS_DIR : PLAT_FS_FILE;
+}
+
+int plat_fs_mkdir(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_ERROR;
+    int r = CreateDirectoryW(w, NULL) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(w);
+    return r;
+}
+
+int plat_fs_rmdir(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_ERROR;
+    int r = RemoveDirectoryW(w) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(w);
+    return r;
+}
+
+int plat_fs_unlink(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_ERROR;
+    int r = DeleteFileW(w) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(w);
+    return r;
+}
+
+int plat_fs_rename(const char *from, const char *to, int durable) {
+    wchar_t *a = fs_w(from), *b = fs_w(to);
+    int r = PLAT_FS_ERROR;
+    if (a && b) r = MoveFileExW(a, b, durable ? MOVEFILE_WRITE_THROUGH : 0) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(a);
+    free(b);
+    return r;
+}
+
+// CreateHardLink names the new link first.
+int plat_fs_link(const char *existing, const char *path) {
+    wchar_t *a = fs_w(existing), *b = fs_w(path);
+    int r = PLAT_FS_ERROR;
+    if (a && b) r = CreateHardLinkW(b, a, NULL) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(a);
+    free(b);
+    return r;
+}
+
+int plat_fs_links(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return 0;
+    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    BY_HANDLE_FILE_INFORMATION fi;
+    int links = f != INVALID_HANDLE_VALUE && GetFileInformationByHandle(f, &fi) ? (int)fi.nNumberOfLinks : 0;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    return links;
+}
+
+void plat_fs_sync_dir(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return;
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+
+int plat_fs_list(const char *dir, int (*cb)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
+    size_t n = strlen(dir);
+    char *pattern = malloc(n + 3);
+    if (!pattern) return PLAT_FS_ERROR;
+    memcpy(pattern, dir, n);
+    memcpy(pattern + n, "/*", 3);
+    wchar_t *w = fs_w(pattern);
+    free(pattern);
+    if (!w) return PLAT_FS_ERROR;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW(w, &fd);
+    free(w);
+    if (f == INVALID_HANDLE_VALUE) return fs_win_err(GetLastError());
+    int r = PLAT_FS_OK;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        char name[1024];
+        if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof name, NULL, NULL)) continue;
+        int kind = fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT ? PLAT_FS_LINK
+                   : fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? PLAT_FS_DIR : PLAT_FS_FILE;
+        uint64_t size = kind == PLAT_FS_FILE ? (uint64_t)fd.nFileSizeHigh << 32 | fd.nFileSizeLow : 0;
+        if (!cb(name, kind, size, ctx)) break;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return r;
+}
+
+// A file is opened with all three share modes, so another process (a virus scanner, the save copy) may read it.
+static PlatFile *file_of_handle(HANDLE h, int *err) {
+    if (h != INVALID_HANDLE_VALUE) return (PlatFile *)h;
+    if (err) *err = fs_win_err(GetLastError());
+    return NULL;
+}
+
+PlatFile *plat_fs_open(const char *path, int write, int *err) {
+    wchar_t *w = fs_w(path);
+    if (!w) {
+        if (err) *err = PLAT_FS_ERROR;
+        return NULL;
+    }
+    HANDLE h = CreateFileW(w, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    return file_of_handle(h, err);
+}
+
+PlatFile *plat_fs_create(const char *path, int *err) {
+    wchar_t *w = fs_w(path);
+    if (!w) {
+        if (err) *err = PLAT_FS_ERROR;
+        return NULL;
+    }
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    return file_of_handle(h, err);
+}
+
+PlatFile *plat_file_open(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return NULL;
+    HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    return file_of_handle(h, NULL);
+}
+
+void plat_file_close(PlatFile *f) {
+    if (f) CloseHandle((HANDLE)f);
+}
+
+// Positional I/O on a synchronous handle: ReadFile and WriteFile with an OVERLAPPED offset.
+int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
+    OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
+    DWORD got = 0;
+    if (ReadFile((HANDLE)f, buf, n, &got, &ov)) return got;
+    DWORD e = GetLastError();
+    if (e == ERROR_HANDLE_EOF) return 0;
+    return e == ERROR_NOACCESS ? -2 : -1;   // a read-only page in the buffer
+}
+
+int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off) {
+    OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
+    DWORD put = 0;
+    return WriteFile((HANDLE)f, buf, n, &put, &ov) ? (int64_t)put : -1;
+}
+
+int plat_file_id(PlatFile *f, PlatFileId *out) {
+    BY_HANDLE_FILE_INFORMATION i;
+    if (!GetFileInformationByHandle((HANDLE)f, &i)) return 0;
+    *out = (PlatFileId){i.dwVolumeSerialNumber,
+                        (uint64_t)i.nFileIndexHigh << 32 | i.nFileIndexLow,
+                        (uint64_t)i.nFileSizeHigh << 32 | i.nFileSizeLow,
+                        (uint64_t)i.ftLastWriteTime.dwHighDateTime << 32 | i.ftLastWriteTime.dwLowDateTime,
+                        (uint64_t)i.ftCreationTime.dwHighDateTime << 32 | i.ftCreationTime.dwLowDateTime};
+    return 1;
+}
+
+int plat_file_set_size(PlatFile *f, uint64_t size) {
+    FILE_END_OF_FILE_INFO eof = {.EndOfFile.QuadPart = (LONGLONG)size};
+    return SetFileInformationByHandle((HANDLE)f, FileEndOfFileInfo, &eof, sizeof eof) ? PLAT_FS_OK
+                                                                                      : fs_win_err(GetLastError());
+}
+
+int plat_file_fsync(PlatFile *f) { return FlushFileBuffers((HANDLE)f) != 0; }
+
+int plat_temp_dir(char *out, size_t cap) {
+    wchar_t tmpw[MAX_PATH + 1];
+    DWORD n = GetTempPathW(MAX_PATH + 1, tmpw);
+    if (!n || n > MAX_PATH) return 0;
+    char tmp[MAX_PATH * 3];
+    if (!WideCharToMultiByte(CP_UTF8, 0, tmpw, -1, tmp, sizeof tmp, NULL, NULL)) return 0;
+    size_t k = strlen(tmp);
+    while (k > 0 && (tmp[k - 1] == '\\' || tmp[k - 1] == '/')) tmp[--k] = 0;
+    return snprintf(out, cap, "%s", tmp) < (int)cap;
+}
+
+void plat_utc_now(struct tm *out, unsigned *ms) {
+    SYSTEMTIME t;
+    GetSystemTime(&t);
+    *out = (struct tm){.tm_year = t.wYear - 1900, .tm_mon = t.wMonth - 1, .tm_mday = t.wDay, .tm_hour = t.wHour,
+                       .tm_min = t.wMinute, .tm_sec = t.wSecond, .tm_wday = t.wDayOfWeek};
+    *ms = t.wMilliseconds;
+}

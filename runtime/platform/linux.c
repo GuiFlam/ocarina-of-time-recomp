@@ -1107,3 +1107,151 @@ int plat_sha256(const void *data, size_t n, uint8_t out[32]) {
     }
     return 1;
 }
+
+// ---- files and the host file system under the save data (fs_host.c; declared in platform.h). Adapted from
+// totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin
+// Dzerakh): a PlatFile is the descriptor + 1, so descriptor 0 is not NULL.
+static int fd_of(PlatFile *f) { return (int)(intptr_t)f - 1; }
+static PlatFile *file_of_fd(int fd) { return fd < 0 ? NULL : (PlatFile *)(intptr_t)(fd + 1); }
+
+PlatFile *plat_file_open(const char *path) { return file_of_fd(open(path, O_RDONLY | O_CLOEXEC)); }
+
+void plat_file_close(PlatFile *f) {
+    if (f) close(fd_of(f));
+}
+
+int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
+    ssize_t k;
+    do k = pread(fd_of(f), buf, n, (off_t)off);
+    while (k < 0 && errno == EINTR);
+    return k >= 0 ? k : errno == EFAULT ? -2 : -1;
+}
+
+int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off) {
+    ssize_t k;
+    do k = pwrite(fd_of(f), buf, n, (off_t)off);
+    while (k < 0 && errno == EINTR);
+    return k;
+}
+
+int plat_file_id(PlatFile *f, PlatFileId *out) {
+    struct stat st;
+    if (fstat(fd_of(f), &st)) return 0;
+    *out = (PlatFileId){(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
+                        (uint64_t)st.st_mtim.tv_sec * 1000000000u + (uint64_t)st.st_mtim.tv_nsec,
+                        (uint64_t)st.st_ctim.tv_sec * 1000000000u + (uint64_t)st.st_ctim.tv_nsec};
+    return 1;
+}
+
+static int fs_err(int e);
+
+int plat_file_set_size(PlatFile *f, uint64_t size) { return ftruncate(fd_of(f), (off_t)size) ? fs_err(errno) : 0; }
+
+int plat_file_fsync(PlatFile *f) { return fsync(fd_of(f)) == 0; }
+
+int plat_fs_os_error(void) { return errno; }
+
+// ENOENT and ENOTDIR both mean the path is not there; EBUSY is the "try again" of the save commit.
+static int fs_err(int e) {
+    switch (e) {
+    case ENOENT: case ENOTDIR: return PLAT_FS_NOT_FOUND;
+    case EEXIST: return PLAT_FS_EXISTS;
+    case ENOTEMPTY: return PLAT_FS_NOT_EMPTY;
+    case EBUSY: case ETXTBSY: return PLAT_FS_BUSY;
+    default: return PLAT_FS_ERROR;
+    }
+}
+
+int plat_fs_kind(const char *path) {
+    struct stat st;
+    if (lstat(path, &st)) return PLAT_FS_MISSING;
+    return S_ISLNK(st.st_mode) ? PLAT_FS_LINK : S_ISDIR(st.st_mode) ? PLAT_FS_DIR : PLAT_FS_FILE;
+}
+
+int plat_fs_mkdir(const char *path) { return mkdir(path, 0755) ? fs_err(errno) : PLAT_FS_OK; }
+
+// A symbolic link goes as a file does (Windows: a directory link is removed with RemoveDirectory).
+int plat_fs_rmdir(const char *path) {
+    struct stat st;
+    if (!lstat(path, &st) && S_ISLNK(st.st_mode)) return unlink(path) ? fs_err(errno) : PLAT_FS_OK;
+    return rmdir(path) ? fs_err(errno) : PLAT_FS_OK;
+}
+
+int plat_fs_unlink(const char *path) { return unlink(path) ? fs_err(errno) : PLAT_FS_OK; }
+
+// RENAME_NOREPLACE keeps Windows' rule that a rename never replaces; a file system without it (EINVAL) gets a check
+// first, which another process could race but the save directories are ours.
+int plat_fs_rename(const char *from, const char *to, int durable) {
+    if (syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE)) {
+        if (errno != EINVAL && errno != ENOSYS) return fs_err(errno);
+        if (plat_fs_kind(to) != PLAT_FS_MISSING) return PLAT_FS_EXISTS;
+        if (rename(from, to)) return fs_err(errno);
+    }
+    if (durable) {
+        sync_dir_of(from);
+        sync_dir_of(to);
+    }
+    return PLAT_FS_OK;
+}
+
+int plat_fs_link(const char *existing, const char *path) { return link(existing, path) ? fs_err(errno) : PLAT_FS_OK; }
+
+int plat_fs_links(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? 0 : (int)st.st_nlink;
+}
+
+void plat_fs_sync_dir(const char *path) {
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+}
+
+int plat_fs_list(const char *dir, int (*cb)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
+    DIR *d = opendir(dir);
+    if (!d) return fs_err(errno);
+    for (struct dirent *e; (e = readdir(d));) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        struct stat st;
+        if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
+        int kind = S_ISLNK(st.st_mode) ? PLAT_FS_LINK : S_ISDIR(st.st_mode) ? PLAT_FS_DIR : PLAT_FS_FILE;
+        if (!cb(e->d_name, kind, kind == PLAT_FS_FILE ? (uint64_t)st.st_size : 0, ctx)) break;
+    }
+    closedir(d);
+    return PLAT_FS_OK;
+}
+
+PlatFile *plat_fs_open(const char *path, int write, int *err) {
+    struct stat st;
+    int fd = open(path, (write ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+    if (fd >= 0 && (fstat(fd, &st) || !S_ISREG(st.st_mode))) {
+        close(fd);
+        fd = -1, errno = ENOENT;
+    }
+    if (fd < 0 && err) *err = fs_err(errno);
+    return file_of_fd(fd);
+}
+
+PlatFile *plat_fs_create(const char *path, int *err) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0 && err) *err = fs_err(errno);
+    return file_of_fd(fd);
+}
+
+int plat_temp_dir(char *out, size_t cap) {
+    const char *t = getenv("TMPDIR");
+    if (!t || !*t) t = "/tmp";
+    size_t n = strlen(t);
+    while (n > 1 && t[n - 1] == '/') n--;
+    return snprintf(out, cap, "%.*s", (int)n, t) < (int)cap;
+}
+
+void plat_utc_now(struct tm *out, unsigned *ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    time_t s = ts.tv_sec;
+    gmtime_r(&s, out);
+    *ms = (unsigned)(ts.tv_nsec / 1000000);
+}

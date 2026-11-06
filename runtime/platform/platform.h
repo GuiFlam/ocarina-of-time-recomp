@@ -189,3 +189,39 @@ int plat_event_wait_ns(PlatEvent *e, uint64_t ns);
 
 // ---- yield: gives the rest of this thread's time slice to another thread that is ready (SwitchToThread, sched_yield).
 void plat_yield(void);
+
+// ---- files and the host file system under the save data (fs_host.c). Paths are UTF-8, with either separator; each
+// implementation converts them to what the OS wants. Calls that can fail return PLAT_FS_OK (0) or the reason. Shape
+// from totk-pc-recomp runtime/platform/platform.h @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026
+// Valiantsin Dzerakh), cut to what this game's fs_host.c calls.
+struct tm;
+typedef struct PlatFile PlatFile;
+enum { PLAT_FS_OK, PLAT_FS_NOT_FOUND, PLAT_FS_EXISTS, PLAT_FS_NOT_EMPTY, PLAT_FS_BUSY, PLAT_FS_ERROR };
+enum { PLAT_FS_MISSING = -1, PLAT_FS_FILE, PLAT_FS_DIR, PLAT_FS_LINK };   // plat_fs_kind; LINK: a symbolic link or
+                                                                         // reparse point, never followed
+typedef struct { uint64_t volume, file_id, size, write_time, create_time; } PlatFileId;
+int plat_fs_kind(const char *path);
+int plat_fs_os_error(void);                               // the OS error code of this thread's last failed plat_fs_* call
+int plat_fs_mkdir(const char *path);                      // PLAT_FS_EXISTS when something is there
+int plat_fs_rmdir(const char *path);                      // an empty directory, or a link to one
+int plat_fs_unlink(const char *path);                     // a file or a link; a read-only file is refused
+// Renames a file or directory; never replaces (PLAT_FS_EXISTS). durable: the change is on the disk at return.
+int plat_fs_rename(const char *from, const char *to, int durable);
+int plat_fs_link(const char *existing, const char *path); // a hard link named path to the file existing
+int plat_fs_links(const char *path);                      // the file's hard link count, 0 when unknown
+void plat_fs_sync_dir(const char *path);                  // a directory's entries to the disk, as far as the FS allows
+// cb(name, kind, size, ctx) for each entry of dir but "." and ".."; cb returns 0 to stop. The listing's error.
+int plat_fs_list(const char *dir, int (*cb)(const char *name, int kind, uint64_t size, void *ctx), void *ctx);
+// An existing file, for reading and with write for writing too; *err (may be NULL) gets the reason on failure.
+PlatFile *plat_fs_open(const char *path, int write, int *err);
+PlatFile *plat_fs_create(const char *path, int *err);     // a new file for writing; PLAT_FS_EXISTS when there
+PlatFile *plat_file_open(const char *path);               // read-only, for positional reads; NULL when missing
+void plat_file_close(PlatFile *f);
+// Bytes read at off (0 at or past the end), -1 on an I/O error, -2 when the OS refused to write into buf (read-only page).
+int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off);
+int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off);   // bytes written, -1 on error
+int plat_file_id(PlatFile *f, PlatFileId *out);           // the open file's identity and size; 0 on failure
+int plat_file_set_size(PlatFile *f, uint64_t size);       // PLAT_FS_*
+int plat_file_fsync(PlatFile *f);                         // the file's data to the disk; 1 on success
+int plat_temp_dir(char *out, size_t cap);                 // the temporary directory, no trailing separator; 1 on success
+void plat_utc_now(struct tm *out, unsigned *ms);          // the wall clock in UTC: the fields of out, milliseconds in ms
