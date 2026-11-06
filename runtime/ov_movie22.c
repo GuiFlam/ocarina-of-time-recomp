@@ -44,6 +44,7 @@
 
 #include "platform/platform.h"
 #include "dispatch.h"
+#include "cfg.h"
 #include "host.h"
 
 #define MAX_DECODERS 8
@@ -197,6 +198,12 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
         dav1d_default_settings(&s);
         s.n_threads = 4;
         s.max_frame_delay = 1;           // every sample's picture comes out at once: the game paces by time stamps
+        // Tuning (Linux test runs): OOT_MOVIE_THREADS, OOT_MOVIE_DELAY, OOT_MOVIE_GRAIN=0 (no film grain synthesis).
+        const char *e;
+        if ((e = cfg_get("OOT_MOVIE_THREADS")) && atoi(e) > 0) s.n_threads = atoi(e);
+        if ((e = cfg_get("OOT_MOVIE_DELAY")) && atoi(e) > 0) s.max_frame_delay = atoi(e);
+        if ((e = cfg_get("OOT_MOVIE_GRAIN")) && *e) s.apply_grain = atoi(e) != 0;
+        rt_log("movie22: dav1d %d threads, frame delay %d, film grain %d", s.n_threads, s.max_frame_delay, s.apply_grain);
         int r = dav1d_open(&d->dav, &s);
         if (r) rt_log("movie22: dav1d_open failed (%d): the cinematic shows no picture", r);
         plat_cond_init(&d->wake);
