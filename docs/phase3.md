@@ -258,8 +258,18 @@ passes, 744 draws and 126 dispatches a frame (run-257), for about ten frames, un
 timeout's pattern (one instruction pointer per killed warp: a shader that runs too long, as the upscaler's loop did).
 
 Open, in order:
-- The GPU timeout on the first level frames: find the dispatch or draw (`OOT_SKIP_DISPATCH_FROM`, `OOT_CS_TIME`,
-  `OOT_TENSOR_CORES=0` to rule the tensor path in or out).
+- (Done, the same night) The GPU timeout on the first level frames. `OOT_SKIP_CS=all` removed it (a compute kernel);
+  `OOT_SKIP_CS=!<list>` (run only those) and leaving one out at a time found a pair, eb67c232 (one thread copying
+  light data from its uniform block, sampling two textures) and c82d3cba (a volume kernel with counted loops), that
+  hung only together. The frame dump armed on eb67c232 (`OOT_DUMP=cs:<id>`) showed its two textures unbound: the
+  host placed NVN2's bank-0 resource tables after the pushed constants by the length the game pushed, but the shader's
+  layout ends the tables at the u16 at control +0xba (eb67c232 ends at 0x40 with 1 storage and 2 texture slots and
+  reads its storage slot at 0x20). With the base from +0xba every compute texture slot of the level frame resolves,
+  the level runs (662 frames, A/B against the old rule: device lost after 14) and the Deku Tree's dialogue plays
+  (subtitles over a still black scene). Also translator patch 0018: NMin/NMax/NClamp and a saturating, NaN-to-0 F2I,
+  as Maxwell defines them (not the cause, but SPIR-V left them undefined).
+- The scene behind the dialogue is black: 474 graphics texture slots of the dumped level frame read no handle
+  (as the compute ones did; check the graphics side of the bank-0 and bindless handle paths first).
 - 605 programs the lowering refuses in the level (`gfx_shader: translation failed`), so about 280 of 744 draws are
   skipped: unknown opcodes 261, `TEX unpacked operands` 128, scratch and predicate pressure 53, `RED address` 37,
   uniform datapath opcodes 35, and smaller groups (TLD, TLD4, HMNMX2, PLOP3, STG of wide zeros).

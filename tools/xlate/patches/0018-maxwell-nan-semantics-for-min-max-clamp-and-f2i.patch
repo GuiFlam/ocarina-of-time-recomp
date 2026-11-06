@@ -1,0 +1,63 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -334,7 +334,9 @@
+ 
+         private static OperationResult GenerateClamp(CodeGenContext context, AstOperation operation)
+         {
+-            return GenerateTernary(context, operation, context.Delegates.GlslFClamp, context.Delegates.GlslSClamp);
++            // OoT: NClamp, not FClamp: the Maxwell clamps (saturation, FMNMX pairs) give a number for a NaN operand, where
++            // FClamp's result is undefined (a driver may assume no NaN).
++            return GenerateTernary(context, operation, context.GlslNClamp, context.Delegates.GlslSClamp);
+         }
+ 
+         private static OperationResult GenerateClampU32(CodeGenContext context, AstOperation operation)
+@@ -954,7 +956,9 @@
+ 
+         private static OperationResult GenerateMaximum(CodeGenContext context, AstOperation operation)
+         {
+-            return GenerateBinary(context, operation, context.Delegates.GlslFMax, context.Delegates.GlslSMax);
++            // OoT: NMax, not FMax: Maxwell FMNMX returns the other operand when one is NaN (IEEE maxNum), which NMax
++            // defines and FMax leaves undefined.
++            return GenerateBinary(context, operation, context.GlslNMax, context.Delegates.GlslSMax);
+         }
+ 
+         private static OperationResult GenerateMaximumU32(CodeGenContext context, AstOperation operation)
+@@ -970,7 +974,8 @@
+ 
+         private static OperationResult GenerateMinimum(CodeGenContext context, AstOperation operation)
+         {
+-            return GenerateBinary(context, operation, context.Delegates.GlslFMin, context.Delegates.GlslSMin);
++            // OoT: NMin, not FMin (see GenerateMaximum).
++            return GenerateBinary(context, operation, context.GlslNMin, context.Delegates.GlslSMin);
+         }
+ 
+         private static OperationResult GenerateMinimumU32(CodeGenContext context, AstOperation operation)
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitConversion.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitConversion.cs
+@@ -201,6 +201,17 @@
+                 srcB = context.FPMaximum(srcB, c0, fpType);
+             }
+ 
++            // OoT: Maxwell F2I saturates to the integer range and gives 0 for NaN; SPIR-V leaves both undefined
++            // (a NaN can come back as a huge integer and a loop count with it). FP32: clamp, then NaN to 0.
++            Operand isNan = srcType == DstFmt.F64 ? null : context.IsNan(srcB, fpType);
++
++            if (srcType != DstFmt.F64)
++            {
++                srcB = isSignedInt
++                    ? context.FPMinimum(context.FPMaximum(srcB, ConstF(-2147483648f), fpType), ConstF(2147483520f), fpType)
++                    : context.FPMinimum(srcB, ConstF(4294967040f), fpType);
++            }
++
+             if (srcType == DstFmt.F64)
+             {
+                 srcB = isSignedInt
+@@ -212,6 +223,8 @@
+                 srcB = isSignedInt
+                     ? context.FP32ConvertToS32(srcB)
+                     : context.FP32ConvertToU32(srcB);
++
++                srcB = context.ConditionalSelect(isNan, Const(0), srcB);
+             }
+ 
+             if (isSmallInt)

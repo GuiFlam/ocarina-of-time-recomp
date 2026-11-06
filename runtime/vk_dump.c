@@ -55,6 +55,7 @@ static int skip_runs, dump_ubo;        // OOT_DUMP_SKIP_RUNS, OOT_DUMP_UBO (vec4
 static int arm_on_xfb;                 // OOT_DUMP=xfb: the dump frame is the one whose replay meets the first transform feedback begin
 static int arm_on_call;                // OOT_DUMP=when: the dump frame is set by vk_dump_arm (boot.c ring_shot, OOT_DUMP_WHEN)
 static int arm_on_dispatch;            // OOT_DUMP=dispatch: the frame of the first compute dispatch (OoT: the cinematic's upscaler)
+static char arm_cs[17];                // OOT_DUMP=cs:<hex>: ... of the first dispatch of a shader whose input id starts so
 static int draws_pass = -1, in_draw_copy;   // OOT_DUMP_DRAWS=<pass>: colour target 0 copied after every draw of that pass
 static int dump_vb;
 static int xfb_probe;                  // OOT_DUMP_XFB_PROBE=1: the vertex outputs of every draw of the OOT_DUMP_DRAWS pass, captured                    // OOT_DUMP_VB=1: the vertex streams of every draw of the dump frame, as guest memory holds them
@@ -1013,6 +1014,12 @@ out:
 void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPipeInfo *info, const p_dispatch *d) {
     (void)p;
     plat_mutex_lock(&rec_lock);
+    if (arm_on_dispatch && dump_frame == UINT64_MAX && arm_cs[0]) {
+        char hex[17];
+        const uint8_t *id = gfx_shader_input_id(cs);
+        for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
+        if (strncmp(hex, arm_cs, strlen(arm_cs))) goto out;
+    }
     if (arm_on_dispatch && dump_frame == UINT64_MAX) {   // OOT_DUMP=dispatch: this frame, from here on
         dump_frame = frame_now();
         rt_log("vk_dump: first compute dispatch: dumping frame %llu from here", (unsigned long long)dump_frame);
@@ -1140,6 +1147,10 @@ void vk_dump_init(void) {
     if (e && !strcmp(e, "xfb")) arm_on_xfb = 1, dump_frame = UINT64_MAX;
     else if (e && !strcmp(e, "when")) arm_on_call = 1, dump_frame = UINT64_MAX;
     else if (e && !strcmp(e, "dispatch")) arm_on_dispatch = 1, dump_frame = UINT64_MAX;
+    else if (e && !strncmp(e, "cs:", 3) && e[3]) {   // the frame of the first dispatch of that compute shader
+        arm_on_dispatch = 1, dump_frame = UINT64_MAX;
+        snprintf(arm_cs, sizeof arm_cs, "%s", e + 3);
+    }
     else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("OOT_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
