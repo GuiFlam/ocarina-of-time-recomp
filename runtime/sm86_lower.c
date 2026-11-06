@@ -107,6 +107,8 @@ typedef struct {
                                                    // swapped into Pn around each instruction naming it
     uint32_t up_reg;
     uint64_t pred;                                 // the current instruction's predicate, in Maxwell's bits 16-19
+    int tensor;                                    // HMMA to the MMA marker (sm86_lower_tensor_cores, compute)
+    int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
     uint32_t index;                                // the current native instruction
     int failed;
     char error[96];
@@ -1630,11 +1632,24 @@ static void lower_ldsm(L *l, const Insn *x) {
 // Rd..Rd+1 (row g, columns 2t, 2t+1; row g+8). Lane computes its four outputs from the A rows of its group's
 // four lanes and the B columns 2t and 2t+1 of lanes 8t..8t+3 and 8t+4..8t+7, two k per step, with the products
 // fused into the f16 accumulators (the tensor core accumulates wider; the upscaler's network tolerates it).
+int sm86_lower_tensor_cores;
+
 static void lower_hmma(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8), rc = bits(x, 64, 8);
     if (bits(x, 72, 8) != 8 || bits(x, 80, 12) || rd == RZ || ra == RZ || rb == RZ || rd > 253 || ra > 251 || rb > 253 || (rc != RZ && rc > 253))
         return (void)fail(l, "HMMA mode");
     if (stub_on("hmma")) { mov_imm(l, rd, 0), mov_imm(l, rd + 1, 0); return; }
+    // The tensor cores (2026-11-06): the translator's MMA marker, prefix 0xf7f (no Maxwell instruction uses it), Rd
+    // 0-7, Ra 8-15, Rb 20-27, Rc 39-46, which tools/xlate patch 0016 turns into a cooperative matrix multiply-add of
+    // the same fragments. It reads every source before it writes, so overlaps need no copies. Only unconditional
+    // ones: a matrix operation needs the whole subgroup, as HMMA itself does.
+    int hmma_n = l->hmma_count++;   // OOT_TENSOR_HMMA_MASK=<hex> (diagnostic): only the HMMAs whose index bit is set
+    const char *mask_env = getenv("OOT_TENSOR_HMMA_MASK");
+    int masked = mask_env && *mask_env && hmma_n < 64 && !((strtoull(mask_env, NULL, 16) >> hmma_n) & 1);
+    if (l->tensor && !masked && l->pred == (uint64_t)PT << 16) {
+        emit(l, 0xf7f0000000000000ull | (uint64_t)rc << 39 | (uint64_t)rb << 20 | (uint64_t)PT << 16 | (uint64_t)ra << 8 | rd);
+        return;
+    }
     if (overlaps(rd, 2, ra, 4)) {                                 // the output reuses A's registers: A to scratch first
         for (uint32_t i = 0; i < 4; i++) mov_reg(l, S(l, 8 + (int)i), ra + i);
         ra = S(l, 8);
@@ -2667,6 +2682,11 @@ void sm86_lower_free(Sm86Lowered *out) {
 }
 
 int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out) {
+    return sm86_lower_ex(code, code_size, control, control_size, out, sm86_lower_tensor_cores);
+}
+
+int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out,
+                  int tensor) {
     memset(out, 0, sizeof *out);
     Sm86Control c;
     if (!sm86_control_parse(control, control_size, &c) || c.code_size > code_size) {
@@ -2676,6 +2696,7 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
     L l = {0};
     l.stage = c.stage;
     l.graphics = c.stage != 5;
+    l.tensor = tensor && !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0;
     l.control = control, l.ctl_size = c.size, l.c1 = code + c.c1_off, l.c1_len = c.c1_len;
     uint32_t header = l.graphics ? SM86_HEADER : 0;
     l.in = (const Insn *)(code + header);

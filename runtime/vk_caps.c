@@ -24,6 +24,36 @@
 #include "host.h"
 #include "vk.h"
 
+// SM86 HMMA on the tensor cores (sm86_lower.c lower_hmma, tools/xlate patch 0016): VK_KHR_cooperative_matrix with
+// f16 16x8x16 subgroup matrices, half floats in shaders, and compute subgroups pinned to 32 lanes (the fragments are
+// per lane of a 32-lane warp). OOT_TENSOR_CORES=0 keeps the shuffle emulation.
+static int tensor_cores(VkCtx *c, int sg32) {
+    const char *e = cfg_get("OOT_TENSOR_CORES");
+    if (e && *e && !atoi(e)) { rt_log("vk caps: tensor cores off (OOT_TENSOR_CORES=0): HMMA emulated"); return 0; }
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
+    vkGetPhysicalDeviceFeatures2(c->phys, &f2);
+    int shape = 0;
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get = c->has_coopmat ?
+        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(
+            c->instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR") : NULL;
+    uint32_t n = 0;
+    if (get) get(c->phys, &n, NULL);
+    VkCooperativeMatrixPropertiesKHR *p = n ? calloc(n, sizeof *p) : NULL;
+    for (uint32_t i = 0; p && i < n; i++) p[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    if (p) get(c->phys, &n, p);
+    for (uint32_t i = 0; p && i < n; i++)
+        shape |= p[i].MSize == 16 && p[i].NSize == 8 && p[i].KSize == 16 && p[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                 p[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR && p[i].CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                 p[i].ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && p[i].scope == VK_SCOPE_SUBGROUP_KHR;
+    free(p);
+    int on = c->has_coopmat && shape && f12.shaderFloat16 && sg32;
+    rt_log("vk caps: tensor cores %s (cooperative matrix %d, f16 16x8x16 %d, shaderFloat16 %d, compute subgroups of 32 %d)",
+           on ? "on: HMMA as cooperative matrix multiplies" : "off: HMMA emulated", c->has_coopmat, shape,
+           (int)f12.shaderFloat16, sg32);
+    return on;
+}
+
 VkCaps vk_caps = {.float64 = 1, .sg_size = 32};
 static int f64_supported;
 static VkBool32 gpl_lib, gpl_fast;   // the driver's graphicsPipelineLibrary (feature), ...FastLinking (property)
@@ -111,6 +141,7 @@ void vk_caps_init(VkCtx *c) {
     uint32_t told[3];
     for (int i = 0; i < 3; i++) told[i] = vk_caps.sg_pin_stages & stage[i] ? want : sg.subgroupSize;
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told);
+    gfx_shader_set_tensor(tensor_cores(c, want == 32 && (vk_caps.sg_pin_stages & VK_SHADER_STAGE_COMPUTE_BIT)));
 
     char dv[32];
     driver_version(dv, sizeof dv, c->props.vendorID, c->props.driverVersion);

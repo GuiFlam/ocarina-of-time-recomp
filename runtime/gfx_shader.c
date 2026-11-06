@@ -56,7 +56,7 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 12                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 13                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs); translator changes are covered by its identity
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
@@ -342,6 +342,19 @@ void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgro
     memcpy(buf, xlate_id, 32);
     rt_sha256(buf, 32 + (size_t)n, xlate_id);
     rt_log("gfx_shader: host options %s: own shader cache keys", (char *)buf + 37);
+}
+
+// The tensor-core lowering (sm86_lower.h sm86_lower_tensor_cores, vk_caps.c): set before any translation; on, it is
+// mixed into the translator identity, so lowered programs that use it get their own cache keys.
+void gfx_shader_set_tensor(int on) {
+    paths();
+    sm86_lower_tensor_cores = on;
+    if (!on) return;
+    uint8_t buf[32 + 16];
+    memcpy(buf, xlate_id, 32);
+    memcpy(buf + 32, "TKTC tensor=1", 13);
+    rt_sha256(buf, 32 + 13, xlate_id);
+    rt_log("gfx_shader: HMMA runs on cooperative matrices: own shader cache keys");
 }
 
 // ---- the translator children
@@ -1312,6 +1325,27 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
 
 // ---- translation
 
+// OOT_TENSOR_ONLY=<hex>[,<hex>...] (diagnostic): the tensor-core lowering only for programs whose FNV-1a 64 of the
+// SM86 code (the length the translation is given, logged below) starts with one of these, for finding a kernel it
+// gets wrong. Use with a fresh OOT_SHADER_CACHE: the keys do not show it.
+static int tensor_for(const uint8_t *code, uint32_t len) {
+    if (!sm86_lower_tensor_cores) return 0;
+    const char *e = getenv("OOT_TENSOR_ONLY");
+    if (!e || !*e) return 1;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+    char hex[17];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    int on = 0;
+    for (const char *p = e; *p && !on;) {
+        size_t n = strcspn(p, ",");
+        if (n && n <= 16 && !strncmp(hex, p, n)) on = 1;
+        p += n + (p[n] == ',');
+    }
+    rt_log("gfx_shader: OOT_TENSOR_ONLY: program %s (%u bytes): %s", hex, len, on ? "tensor cores" : "emulated");
+    return on;
+}
+
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
                                       const GfxShaderAnswers *a) {
     const uint8_t *key = r->key;
@@ -1332,7 +1366,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     snprintf(res_path, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, hex);
     // The SM86 program lowered to Maxwell: the translator's input, with its moved jump tables as c1.
     Sm86Lowered low;
-    if (!sm86_lower(code, r->length, control, CONTROL_BOUND, &low)) {
+    if (!sm86_lower_ex(code, r->length, control, CONTROL_BOUND, &low, tensor_for(code, r->length))) {
         char msg[160], dump[PATH_CAP + 80];
         snprintf(msg, sizeof msg, "lowering failed at +%#x: %s", low.error_offset, low.error);
         // The program as the lowering saw it, for tools/sm86_dis.py (copy to the census ctl/ and code/ dirs).

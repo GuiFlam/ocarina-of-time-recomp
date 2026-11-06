@@ -201,6 +201,31 @@ Watched with sound for the first time (the user), three things looked wrong. All
 
 Getting to the title menu needs an A press (`OOT_INPUT_SCRIPT` with `600 A 10`).
 
+## Status (2026-11-06, end of the night): the title runs at 60 fps on the tensor cores
+
+The cinematic was GPU-bound: 48 ms of GPU time per frame, all of it the upscaler's kernels, each emulated HMMA about
+116 Maxwell instructions (32 shuffles, 32 half FMAs that the translator expands further). `OOT_CS_TIME=1` showed the
+time spread over seven kernels. HMMA now runs on the host's tensor cores through VK_KHR_cooperative_matrix:
+
+- `--probe-coopmat` found f16 16x8x16 subgroup matrices on the RTX 4070 and measured their per-lane element order:
+  HMMA's register fragments, except that A's four registers go in as 0, 2, 1, 3. No data moves between lanes.
+- The lowering (`sm86_lower.c lower_hmma`) emits a marker for an unconditional HMMA of a compute program with
+  whole-subgroup workgroups; translator patch 0016 decodes it into one IR operation with two results and emits
+  `OpCooperativeMatrixMulAddKHR` with element inserts and extracts. `vk_caps.c tensor_cores` turns it on when the
+  device has the shape, half floats and 32-lane compute subgroups (`OOT_TENSOR_CORES=0` keeps the emulation); the
+  choice is mixed into the cache keys.
+- The first full run drew garbage at 60 fps. Bisection (`tools/bisect_kernels.py`, after a first attempt whose
+  allow-list never matched) found kernel 5d415995, and the isolated kernel on random data found the cause in the
+  translator: its AST optimizer moved single-use memory loads to their use, past later stores, so the kernel read its
+  weights after it had reused that shared memory. Patch 0017 keeps memory reads in place. The emulation hid the bug
+  by luck of scheduling.
+- Result: 4.3 ms of GPU time per frame, 60 fps (the game's cap), the movie on its clock with no skipped pictures,
+  and screenshots scored as pictures (`build/logs/check-on.png` against the emulated `check-off.png`).
+
+Open: spirv-val asks for the VulkanMemoryModel capability next to CooperativeMatrixKHR (the driver accepts the
+modules; switching the translator's memory model touches every shader). The tools made tonight are in CLAUDE.md
+("Running and checking") and the project skill `verify-shader-change`.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485

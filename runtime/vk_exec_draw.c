@@ -2473,6 +2473,96 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 
 // ---- dispatch and uniform buffer updates
 
+// OOT_CS_TIME=1 (diagnostic): the GPU time of every compute dispatch, from timestamps around it, summed per shader
+// (its input id) and logged every CST_REPORT timed dispatches, the costliest first. For finding which kernel of a
+// frame the GPU spends its time in (the title cinematic's upscaler: 49 ms of GPU time per frame, 2026-11-06).
+enum { CST_PAIRS = 2048, CST_SHADERS = 64, CST_REPORT = 1400 };
+typedef struct { uint8_t iid[8]; uint32_t groups[3]; uint64_t n; double ns; } CstShader;
+typedef struct { uint32_t pair; uint8_t iid[8]; uint32_t groups[3]; } CstRead;
+static VkQueryPool cst_pool;
+static uint32_t cst_next;
+static volatile LONG cst_busy[CST_PAIRS];
+static CstShader cst_sh[CST_SHADERS];
+static int cst_nsh, cst_reads;
+static SRWLOCK cst_lock = SRWLOCK_INIT;
+
+static int cst_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_CS_TIME");
+        on = e && atoi(e) ? 1 : 0;
+        if (on) {
+            VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                        .queryCount = 2 * CST_PAIRS};
+            if (vkCreateQueryPool(vk_ctx()->device, &qi, NULL, &cst_pool) != VK_SUCCESS) on = 0;
+            rt_log("vk_exec: OOT_CS_TIME: %s", on ? "compute dispatches timed on the GPU" : "no query pool, not timed");
+        }
+    }
+    return on;
+}
+
+static int cst_cmp(const void *a, const void *b) {
+    double x = ((const CstShader *)a)->ns, y = ((const CstShader *)b)->ns;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void cst_read(void *arg) {   // completion thread
+    CstRead *r = arg;
+    uint64_t v[2];
+    VkPhysicalDeviceProperties pr;
+    static double period;
+    if (!period) vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pr), period = pr.limits.timestampPeriod;
+    int ok = vkGetQueryPoolResults(vk_ctx()->device, cst_pool, 2 * r->pair, 2, sizeof v, v, sizeof v[0],
+                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && v[1] >= v[0];
+    InterlockedExchange(&cst_busy[r->pair], 0);
+    if (!ok) { free(r); return; }
+    AcquireSRWLockExclusive(&cst_lock);
+    int i = 0;
+    while (i < cst_nsh && memcmp(cst_sh[i].iid, r->iid, 8)) i++;
+    if (i == cst_nsh && cst_nsh < CST_SHADERS) memcpy(cst_sh[cst_nsh++].iid, r->iid, 8);
+    if (i < cst_nsh) {
+        cst_sh[i].n++, cst_sh[i].ns += (double)(v[1] - v[0]) * period;
+        memcpy(cst_sh[i].groups, r->groups, sizeof r->groups);
+    }
+    if (++cst_reads >= CST_REPORT) {
+        qsort(cst_sh, (size_t)cst_nsh, sizeof *cst_sh, cst_cmp);
+        double all = 0;
+        for (int k = 0; k < cst_nsh; k++) all += cst_sh[k].ns;
+        rt_log("vk_exec: OOT_CS_TIME: %d dispatches, %.1f ms of GPU time in %d shaders:", cst_reads, all / 1e6, cst_nsh);
+        for (int k = 0; k < cst_nsh; k++) {
+            const CstShader *c = &cst_sh[k];
+            rt_log("vk_exec:   %02x%02x%02x%02x%02x%02x%02x%02x x%llu: %.3f ms each, %.1f%%, groups %ux%ux%u", c->iid[0],
+                   c->iid[1], c->iid[2], c->iid[3], c->iid[4], c->iid[5], c->iid[6], c->iid[7], (unsigned long long)c->n,
+                   c->ns / (double)c->n / 1e6, 100.0 * c->ns / all, c->groups[0], c->groups[1], c->groups[2]);
+        }
+        memset(cst_sh, 0, sizeof cst_sh);
+        cst_nsh = 0, cst_reads = 0;
+    }
+    ReleaseSRWLockExclusive(&cst_lock);
+    free(r);
+}
+
+// Around one dispatch: begin returns the pair (or -1), end writes the second timestamp and queues the read.
+static int cst_begin(VkExec *ex) {
+    if (!cst_on()) return -1;
+    uint32_t p = cst_next++ % CST_PAIRS;
+    if (InterlockedCompareExchange(&cst_busy[p], 1, 0)) return -1;
+    vkCmdResetQueryPool(ex->cb, cst_pool, 2 * p, 2);
+    vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cst_pool, 2 * p);
+    return (int)p;
+}
+
+static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t groups[3]) {
+    if (pair < 0) return;
+    vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cst_pool, 2 * (uint32_t)pair + 1);
+    CstRead *r = malloc(sizeof *r);
+    if (!r) rt_fatal("vk_exec: out of memory");
+    r->pair = (uint32_t)pair;
+    memcpy(r->iid, gfx_shader_input_id(cs), 8);
+    memcpy(r->groups, groups, sizeof r->groups);
+    vk_completion_add(ex->fence, cst_read, r);
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -2496,7 +2586,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    int tp = cst_begin(ex);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
 }

@@ -26,10 +26,10 @@ As of 2026-11-06 (details and dates in [docs/plan.md](docs/plan.md), the shader 
   boot logo renders at 60 fps through translated shaders.
 - The title screen, which in this version is a looping cinematic, plays. SDK 22's movie library decodes through
   console services this host does not serve; `runtime/ov_movie22.c` replaces it and decodes the AV1 stream with
-  dav1d, and the game's neural upscaler, which runs on the Switch 2's tensor cores (HMMA, LDSM, MOVM, emulated in
-  the lowering with shuffles and half-precision FMAs), upscales it to 2560x1440 at 21 fps. Next: the frame rate,
-  the start-up crash that hits about one run in two, the 656 skinning vertex shaders the lowering still refuses
-  (register pressure), the mesh stages, and whatever lies past the cinematic.
+  dav1d, and the game's neural upscaler, which runs on the Switch 2's tensor cores (HMMA, LDSM, MOVM), upscales it
+  to 2560x1440. HMMA runs on the host GPU's tensor cores through Vulkan cooperative matrices, and the title plays at
+  60 fps. Next: the start-up crash that hits about one run in two, the 656 skinning vertex shaders the lowering still
+  refuses (register pressure), the mesh stages, and whatever lies past the cinematic.
 
 Builds run with Windows Python and MSYS2 Clang (`tools/build_game.py`), the shader translator with .NET
 (`tools/build_xlate.py`); see the plan for the set-up.

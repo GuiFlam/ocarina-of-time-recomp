@@ -799,6 +799,10 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
             cfg.shot = argv[i];
+        } else if (!mode && !strcmp(argv[i], "--probe-coopmat")) {   // --probe-coopmat [shader.spv]: coopmat_probe.c
+            mode = argv[i];
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2)) cs_dir = argv[++i];
+            else cs_dir = NULL;
         } else if (!mode && !strcmp(argv[i], "--probe-cs")) {   // --probe-cs <dir>: vk_exec_probe.c probe_cs
             mode = argv[i];
             if (++i == argc) return usage(argv[0]);
@@ -834,6 +838,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
     if (!strcmp(mode, "--probe-tensor")) return probe_tensor();
     if (!strcmp(mode, "--probe-cs")) return probe_cs(cs_dir);
+    if (!strcmp(mode, "--probe-coopmat")) return probe_coopmat(cs_dir);
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();

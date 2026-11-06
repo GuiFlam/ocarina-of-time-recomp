@@ -21,6 +21,13 @@ typedef struct {
 // the control describes (graphics: 0x80-byte header, instructions, padding, the jump tables). Returns 1 and fills
 // out on success; 0 with out->error set otherwise. Free with sm86_lower_free either way.
 int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out);
+// Set by the host before any lowering (gfx_shader_set_tensor): 1 lowers an unconditional HMMA.16816.F16 of a compute
+// program whose workgroup is whole subgroups to the translator's MMA marker (tools/xlate patch 0016), which becomes a
+// cooperative matrix multiply on the tensor cores; 0 emulates it with shuffles and half FMAs.
+extern int sm86_lower_tensor_cores;
+// sm86_lower with the tensor-core choice made by the caller (tensor 0 or 1 instead of sm86_lower_tensor_cores).
+int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out,
+                  int tensor);
 void sm86_lower_free(Sm86Lowered *out);
 
 // The control section's fields the host needs (offsets measured over the game's archives, tools/shader_census.py).

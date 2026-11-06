@@ -932,7 +932,7 @@ int probe_vkexec(void) {
 // loads its 16 bytes of A (16x16 f16, row-major) and 8 bytes of B (16x8 f16, row-major) from storage buffer slot 0,
 // stores them to shared memory (A row r at r*32, B row k at 512 + k*16), LDSM.x4 loads the A fragment from the row
 // addresses the CPU tabulated at +768 (lane L: (L&15)*32 + (L&16)), LDSM.x2.trans the B fragment from +896
-// (512 + (L&15)*16), HMMA.16816.F16 multiplies them into zero accumulators, and the fragments go back to the
+// (512 + (L&15)*16), HMMA.16816.F16 multiplies them into zero accumulators, a second HMMA adds the product to that in place, and the fragments go back to the
 // buffer: D at +1024 (8 bytes per lane), A at +1280 (16 per lane), B at +1792 (8 per lane). The SM86 encodings
 // are the ones sm86_lower.c decodes (NAK's); word 3 holds scheduling bits the lowering ignores.
 
@@ -1014,6 +1014,7 @@ static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
     tn_emit(&p, 0x083b | 12 << 16 | 10 << 24, 0, 2 << 8);                      // LDSM.16.M88.4 R12, [R10]
     tn_emit(&p, 0x083b | 16 << 16 | 11 << 24, 0, 1 << 8 | 1 << 14);            // LDSM.16.MT88.2 R16, [R11]
     tn_emit(&p, 0x023c | 20 << 16 | 12 << 24, 16, 0xff | 8 << 8);              // HMMA.16816.F16 R20, R12, R16, RZ
+    tn_emit(&p, 0x023c | 20 << 16 | 12 << 24, 16, 20 | 8 << 8);                // HMMA.16816.F16 R20, R12, R16, R20: 2AB
     tn_emit(&p, 0x0986 | 2 << 24, 20 | 1024 << 8, 0x0810a100u | 4 | 5 << 9);   // STG.E.64 [R2 + UR4 + 1024], R20
     tn_emit(&p, 0x0986 | 1 << 24, 12 | 1280 << 8, 0x0810a100u | 4 | 6 << 9);   // STG.E.128 [R1 + UR4 + 1280], R12
     tn_emit(&p, 0x0986 | 2 << 24, 16 | 1792 << 8, 0x0810a100u | 4 | 5 << 9);   // STG.E.64 [R2 + UR4 + 1792], R16
@@ -1078,7 +1079,7 @@ static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
         float wa[8] = {A[g][2 * t], A[g][2 * t + 1], A[g + 8][2 * t], A[g + 8][2 * t + 1],
                        A[g][2 * t + 8], A[g][2 * t + 9], A[g + 8][2 * t + 8], A[g + 8][2 * t + 9]};
         float wb[4] = {B[2 * t][g], B[2 * t + 1][g], B[2 * t + 8][g], B[2 * t + 9][g]};
-        float wd[4] = {D[g][2 * t], D[g][2 * t + 1], D[g + 8][2 * t], D[g + 8][2 * t + 1]};
+        float wd[4] = {2 * D[g][2 * t], 2 * D[g][2 * t + 1], 2 * D[g + 8][2 * t], 2 * D[g + 8][2 * t + 1]};   // twice
         for (int i = 0; i < 8; i++)
             if (tn_h2f(fa[i]) != wa[i]) {
                 bad_a++;
