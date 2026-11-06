@@ -262,16 +262,18 @@ static uint32_t ur_dst(L *l, uint32_t n) { return ur_has_reg(l, n) ? ur(l, n) : 
 
 // Uniform registers n and n + 1 as an adjacent register pair, in scratch k, k + 1 when they are forwarded
 // constants or not adjacent in the mapping.
-static uint32_t ur_pair(L *l, uint32_t n, int k) {
+static uint32_t ur_pair_in(L *l, uint32_t n, int k, uint32_t hint) {
     if (n >= 63) return fail(l, "uniform register pair"), NOREG;
     Src lo = ur_src(l, n), hi = ur_src(l, n + 1);
     if (lo.kind == 0 && hi.kind == 0 && hi.reg == lo.reg + 1) return lo.reg;
-    uint32_t a = S(l, k), b = S(l, k + 1);
+    // hint: two adjacent registers the caller can spare for the pair (a load's destination), used instead of scratch.
+    uint32_t a = hint != NOREG ? hint : S(l, k), b = hint != NOREG ? hint + 1 : S(l, k + 1);
     if (b != a + 1) return fail(l, "scratch pair"), NOREG;
     if (lo.kind == 0 && lo.reg == RZ) mov_imm(l, a, 0); else to_reg_into(l, lo, a);
     if (hi.kind == 0 && hi.reg == RZ) mov_imm(l, b, 0); else to_reg_into(l, hi, b);
     return a;
 }
+static uint32_t ur_pair(L *l, uint32_t n, int k) { return ur_pair_in(l, n, k, NOREG); }
 
 // Uniform register n read by a uniform-datapath op: its register, or a forwarded constant brought into scratch k.
 static uint32_t ur_in(L *l, uint32_t n, int k) {
@@ -1557,9 +1559,12 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
     if (op == 0x381) {
         if ((x->w[2] & ~0x2e00u) != 0x001e8100u || (address & 1)) return (void)fail(l, "LDG register mode");
     } else {
-        // k 0: the scratch pair a forwarded base lands in is also the pair the add below writes in place, so a run
-        // of two dead registers is enough (k 2 asked for four: vertex shaders near R255 had no such run).
-        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair(l, bits(x, 32, 6), 0);
+        // A wide load's destination (its first two registers, aligned) holds the uniform base while the address is
+        // formed when the pair is not already in registers: the address is read before the data is written, and a
+        // vertex shader with 247 live registers has no scratch run for the pair.
+        uint32_t spare = size >= 5 && rd != RZ && rd < 253 ? rd : NOREG;
+        if (spare != NOREG && address != RZ && address + 1 >= spare && address <= spare + 1) spare = NOREG;   // the address is in it
+        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair_in(l, bits(x, 32, 6), 0, spare);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c1e1100u || x->w[2] == 0x0c1ebd00u;
         if ((!descriptor && (x->w[2] & ~(0x04000000u | 0x3fu | 0xe00u | 0x2000u)) != 0x081e8100u) || ubase == NOREG)
             return (void)fail(l, "LDG uniform mode");
@@ -1569,7 +1574,9 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
             address = ubase;
         } else {
             // 64-bit add of the uniform pair and the register (pair with bit 90, else zero-extended).
-            uint32_t lo = S(l, 0), hi = S(l, 1);
+            // In place over the base when it was brought into the spare registers.
+            int inplace = spare != NOREG && ubase == spare;
+            uint32_t lo = inplace ? ubase : S(l, 0), hi = inplace ? ubase + 1 : S(l, 1);
             if (ubase == RZ) return (void)fail(l, "LDG uniform zero base");
             emit(l, base(l, 0x5c10000000000000ull, lo, ubase) | ((uint64_t)address << 20) | ((uint64_t)1 << 47));
             emit(l, base(l, 0x5c10000000000000ull, hi, ubase + 1) | ((uint64_t)(bits(x, 90, 1) ? address + 1 : RZ) << 20) | ((uint64_t)1 << 43));
