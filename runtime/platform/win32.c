@@ -832,3 +832,32 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
 int plat_random(void *out, size_t n) {
     return BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
 }
+
+// SHA-256 through the system's BCrypt provider; the algorithm handle is opened once and kept (moved from main.c).
+int plat_sha256(const void *p, size_t n, uint8_t out[32]) {
+    static BCRYPT_ALG_HANDLE alg;
+    BCRYPT_ALG_HANDLE a = __atomic_load_n(&alg, __ATOMIC_ACQUIRE);
+    if (!a) {
+        if (BCryptOpenAlgorithmProvider(&a, BCRYPT_SHA256_ALGORITHM, NULL, 0)) return 0;
+        BCRYPT_ALG_HANDLE expected = NULL;
+        if (!__atomic_compare_exchange_n(&alg, &expected, a, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            BCryptCloseAlgorithmProvider(a, 0);
+            a = expected;
+        }
+    }
+    BCRYPT_HASH_HANDLE h;
+    if (BCryptCreateHash(a, &h, NULL, 0, NULL, 0, 0)) return 0;
+    const uint8_t *s = p;
+    while (n) {
+        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
+        if (BCryptHashData(h, (PUCHAR)s, k, 0)) {
+            BCryptDestroyHash(h);
+            return 0;
+        }
+        s += k;
+        n -= k;
+    }
+    int ok = BCryptFinishHash(h, out, 32, 0) == 0;
+    BCryptDestroyHash(h);
+    return ok;
+}
