@@ -129,9 +129,16 @@ static void update_voice(AudioRenderer *r, int i, const AudrenVoiceIn *in) {
         if (!w->sent) {
             v->buffers[i] = *w;
             v->pending[i] = 1;
-            if (traced && in->sample_format != FMT_ADPCM)
-                rt_log("audren: voice %u buffer %u: %#llx+%llu samples %u..%u loop %u eos %u", in->id, i,
-                       (unsigned long long)w->address, (unsigned long long)w->size, w->start, w->end, w->loop, w->end_of_stream);
+            if (traced && in->sample_format != FMT_ADPCM) {
+                int peak = -1;   // loudest 16-bit sample of the buffer; -1 when it is not 16-bit PCM
+                if (in->sample_format == FMT_PCM16 && w->address && w->size >= 2) {
+                    const int16_t *pcm = (const int16_t *)(uintptr_t)w->address;
+                    peak = 0;
+                    for (uint64_t k = 0; k < w->size / 2; k++) { int a = pcm[k] < 0 ? -pcm[k] : pcm[k]; if (a > peak) peak = a; }
+                }
+                rt_log("audren: voice %u buffer %u: %#llx+%llu samples %u..%u loop %u eos %u peak %d", in->id, i,
+                       (unsigned long long)w->address, (unsigned long long)w->size, w->start, w->end, w->loop, w->end_of_stream, peak);
+            }
         }
     }
     v->flush += in->flush_wave_buffer_count;
