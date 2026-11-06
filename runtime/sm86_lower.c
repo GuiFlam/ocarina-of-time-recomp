@@ -1437,7 +1437,9 @@ static void lower_mufu(L *l, const Insn *x) {
 }
 
 // IPA: the attribute field at 64-73 counts dwords (28 = position.x at a[0x70], 32 = a[0x80]); sample mode 76-77,
-// constant (.PASS) 78, the interpolation weight register in the b slot (RZ: the usual one).
+// constant (.PASS) 78, the interpolation weight register in the b slot (RZ: the usual one). Ra (an offset for the
+// offset mode, which is refused) is ignored, so IPA 0x526, whose Ra is a uniform register (bit 91; UR4 holding 0 in
+// the two fragment shaders that use it), lowers as 0x326 does.
 static void lower_ipa(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), attr = bits(x, 64, 10);
     if (bits(x, 32, 8) != RZ || bits(x, 76, 2) > 1 || bits(x, 79, 1) || bits(x, 81, 3) != 7 || attr * 4 > 0x3ff)
