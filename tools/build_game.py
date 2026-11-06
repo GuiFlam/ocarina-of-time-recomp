@@ -127,7 +127,7 @@ else:
     SDL3_DLLS = []
     RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
     LINK_FLAGS = ['-Xlinker', '"--Map=$builddir/oot.map"']
-    LINK_LIBS = ['-lvulkan', '-lopus', '-lm', '-lpthread', '-ldl'] + pkg_config_libs('sdl3', 'vpx')
+    LINK_LIBS = ['-lvulkan', '-lopus', '-lm', '-lpthread', '-ldl'] + pkg_config_libs('sdl3', 'vpx', 'dav1d') + ['-lstdc++']
     VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h from the VulkanMemoryAllocator-devel package
     LLVM_LINK_LIBS = LINK_LIBS
     AR = find_tool('llvm-ar') if shutil.which('llvm-ar') else find_tool('ar')
