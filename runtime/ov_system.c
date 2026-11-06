@@ -281,6 +281,28 @@ static void ov_report_save(Cpu *c) {   // Result PlayReport::Save() and Save(con
 }
 static void ov_result_ok(Cpu *c) { ret_x(c, 0); }   // RequestImmediateTransmission, AddInternetConnectionStatus
 
+// nn::prepo::AsyncContext (2026-11-06): on entering the game, after the opening cutscene, the game waits on a report's
+// context; the SDK's GetCompletionEvent asks the prepo service for the event's handle, finds none here and aborts
+// (run-251). A report is local and done at once: a new kernel event, signalled, whose readable end is attached to the
+// caller's os::SystemEvent (its SystemEventType first) by the SDK's AttachReadableHandleToSystemEvent. Binding the
+// caller's event in the kernel's table instead found a stale entry for a reused address (run-256). The result is
+// success, and the destructor has no service session to close.
+// void GetCompletionEvent(os::SystemEvent *)
+static void ov_prepo_async_event(Cpu *c) {
+    static uint64_t attach;
+    uint64_t ev = arg_x(c, 1);
+    if (!ev) rt_fatal("nn::prepo::AsyncContext::GetCompletionEvent: null event");
+    if (!attach) attach = ldr_symbol("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE");
+    if (!attach) rt_fatal("nn::prepo::AsyncContext::GetCompletionEvent: AttachReadableHandleToSystemEvent is not loaded");
+    uint32_t hw = kern_event_new(), hr = kern_event_readable(hw);
+    kern_event_signal(hw);
+    rt_call(c, attach, 4, ev, (uint64_t)hr, 1ull, 0ull);   // the event owns the handle; manual clear: stays signalled
+    static volatile LONG said;
+    if (!InterlockedExchange(&said, 1)) rt_log("prepo: an async report context completes at once (no service)");
+}
+static void ov_prepo_async_result(Cpu *c) { ret_x(c, 0); }   // Result GetResult()
+static void ov_prepo_async_dtor(Cpu *c) { (void)c; }          // ~AsyncContext()
+
 // nn::nfp: no NFC reader
 static volatile LONG nfp_state;
 static void ov_nfp_initialize(Cpu *c) { InterlockedExchange(&nfp_state, 1); ret_x(c, 0); }
@@ -867,6 +889,9 @@ HOST_OVERRIDE("_ZN2nn2oe22PopNotificationMessageEv", ov_pop);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SaveEv", ov_report_save);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", ov_report_save);
 HOST_OVERRIDE("_ZN2nn5prepo28RequestImmediateTransmissionEv", ov_result_ok);
+HOST_OVERRIDE("_ZN2nn5prepo12AsyncContext18GetCompletionEventEPNS_2os11SystemEventE", ov_prepo_async_event);
+HOST_OVERRIDE("_ZN2nn5prepo12AsyncContext9GetResultEv", ov_prepo_async_result);
+HOST_OVERRIDE("_ZN2nn5prepo12AsyncContextD1Ev", ov_prepo_async_dtor);
 HOST_OVERRIDE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", ov_result_ok);
 HOST_OVERRIDE("_ZN2nn3nfp10InitializeEv", ov_nfp_initialize);
 HOST_OVERRIDE("_ZN2nn3nfp8FinalizeEv", ov_nfp_finalize);

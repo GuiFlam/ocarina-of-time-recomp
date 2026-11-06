@@ -17,8 +17,10 @@
 // The game's protocol (OoT 1.1.1, main+0x3b5f0c4): C1, Initialize(work memory, size, mime type, output format, codec
 // mode), Configure(MediaProperty, codec data, size), the three event getters, RegisterVideoFrame(frames, count),
 // Start, then DecodeAsync(nn::movie::Buffer) per extracted sample and AcquireVideoFrame / ReleaseVideoFrame per
-// output; Stop, Flush, Finalize, D1 at the end; after the last sample an end-of-stream buffer (flag 4, as
-// MediaCodec's BUFFER_FLAG_END_OF_STREAM), and for the title loop the samples start over. The track's MediaProperty
+// output; Stop, Flush, Finalize, D1 at the end; after the last sample an empty end-of-stream buffer (flag 8; flag 4
+// marks the first sample of a stream, also each restart of the title loop), and for the title loop the samples start
+// over. 2026-11-06: the end was taken for flag 4, so no movie ever ended: after the 154 s opening cutscene the game
+// waited for the end-of-stream frame and gameplay stayed black (run-248 logged the empty flag-8 buffer). The track's MediaProperty
 // (read by the game before Configure through nn::movie::MediaProperty::Get*, observed below) carries "mime",
 // "width", "height", "frame-rate", "color-standard", "color-range", "color-transfer".
 //
@@ -46,7 +48,8 @@
 #define MAX_FRAMES 16
 #define MAX_READY 16
 #define SYSEVENT_BYTES 0x100             // nn::os::SystemEventType is 0x28 bytes on SDK 22; room to spare
-#define FLAG_END_OF_STREAM 4u
+#define FLAG_END_OF_STREAM 8u
+#define FLAG_STREAM_START 4u
 #define MOVIE_R_NO_FRAME (342u | (2u << 9))   // module 342 (movie): nothing to acquire
 
 typedef struct { Dav1dPicture pic; int eos; } Ready;
@@ -75,7 +78,8 @@ typedef struct {
     int64_t pace_pts; uint64_t pace_ns;  // pacing log: the picture time stamp and host time at the last line
     uint64_t skipped, pace_skipped, decode_ns, pace_decode_ns;
     int64_t clock_pts; uint64_t clock_ns;  // playback clock: the picture time stamp shown at host time clock_ns
-    int skip, skip_sent;                 // OOT_MOVIE_SKIP: this movie ends at once (open_dec, acquire)
+    int skip, skip_sent, skip_end;       // OOT_MOVIE_SKIP: no pictures; the end once the game sent its end buffer
+    int64_t skip_pts;                    // the last sample's time stamp, for that end frame
     HANDLE worker;                       // the host thread that runs dav1d (decode_thread)
     CONDITION_VARIABLE wake;             // under lock: a sample queued, a ring slot freed, or quit
     SRWLOCK dav_lock;                    // held around every dav1d call
@@ -178,7 +182,8 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
             const char *e = getenv("OOT_MOVIE_SKIP");
             int from = e ? atoi(e) : 0;
             d->skip = from > 0 && ++opened >= from;
-            if (d->skip) rt_log("movie22: video decoder %d skipped (OOT_MOVIE_SKIP=%d): its first frame is the end of stream", opened, from);
+            if (d->skip) rt_log("movie22: video decoder %d skipped (OOT_MOVIE_SKIP=%d): no pictures, its end as soon as "
+                                "the game has sent all samples", opened, from);
         }
     }
     ReleaseSRWLockExclusive(&lock);
@@ -289,6 +294,9 @@ static void ov_start(Cpu *c) {
 static void ov_stop(Cpu *c) {
     Dec *d = find(arg_x(c, 0));
     if (d) {
+        rt_log("movie22: Stop/Flush of the %s decoder %#llx after %llu buffers in, %llu frames handed back, %d ready, "
+               "%d queued", d->video ? "video" : "audio", (unsigned long long)d->guest, (unsigned long long)d->decoded,
+               (unsigned long long)d->acquired, d->rcount, d->qcount);
         AcquireSRWLockExclusive(&lock);
         d->started = 0;
         d->gen++;                                            // a picture the worker is decoding now is discarded
@@ -445,20 +453,22 @@ static void ov_decode(Cpu *c) {                              // DecodeAsync(cons
     int64_t ts = buffer ? (int64_t)LD64(buffer + 0x18) : 0;
     uint32_t flags = buffer ? LD32(buffer + 0x20) : 0;
     d->decoded++;
-    int eos = (flags & FLAG_END_OF_STREAM) && !size;         // the first sample of a (re)started stream carries flag 4 too
+    int eos = (flags & FLAG_END_OF_STREAM) != 0;
     if (flags || !size) {
         static volatile LONG said;
         const uint8_t *p = (const uint8_t *)(uintptr_t)data;
-        if (InterlockedIncrement(&said) <= 12)
+        if (InterlockedIncrement(&said) <= 12 || !size || (flags & ~FLAG_STREAM_START))   // ends and odd flags: always
             rt_log("movie22: %s buffer %llu: flags %#x, %llu bytes, pts %lld ns%s%s", d->video ? "video" : "audio",
                    (unsigned long long)d->decoded, flags, (unsigned long long)size, (long long)ts, eos ? " (end of stream)" : "",
                    size >= 4 && p ? "" : " (empty)");
         if (size >= 8 && p && said <= 12)
             rt_log("movie22:   starts %02x %02x %02x %02x %02x %02x %02x %02x", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
-    if (d->video && d->skip) {                               // OOT_MOVIE_SKIP: nothing decoded, the end is ready
+    if (d->video && d->skip) {                               // OOT_MOVIE_SKIP: nothing decoded
+        if (eos) d->skip_end = 1;
+        else if (size) d->skip_pts = ts;
         event_signal(c, d->ev_in);
-        event_signal(c, d->ev_out);
+        if (d->skip_end) event_signal(c, d->ev_out);
     } else if (d->video) {
         AcquireSRWLockExclusive(&lock);
         if ((data && size) || eos) {
@@ -516,11 +526,12 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     uint64_t *out = arg_p(c, 1);
     int *index = with_index ? arg_p(c, 2) : NULL;
     if (!d || !out || !d->nframes) { ret_x(c, MOVIE_R_NO_FRAME); return; }
-    if (d->video && d->skip) {                               // OOT_MOVIE_SKIP: one end-of-stream frame, then nothing
-        if (d->skip_sent || (d->busy & 1)) { ret_x(c, MOVIE_R_NO_FRAME); return; }
+    if (d->video && d->skip) {   // OOT_MOVIE_SKIP: the end-of-stream frame once the game sent its end (flag 8) buffer
+        // (2026-11-06: an end handed back before that is ignored by the game, which then waits for one forever)
+        if (!d->skip_end || d->skip_sent || (d->busy & 1)) { ret_x(c, MOVIE_R_NO_FRAME); return; }
         uint64_t frame = d->frames[0];
         d->busy |= 1, d->skip_sent = 1, d->acquired++;
-        rt_call(c, G.set_ts, 2, frame, 0ull);
+        rt_call(c, G.set_ts, 2, frame, (uint64_t)d->skip_pts);
         rt_call(c, G.video_eos, 2, frame, 1ull);
         *out = frame;
         if (index) *index = 0;

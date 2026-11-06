@@ -11,7 +11,7 @@ What it takes care of, each a mistake made by hand at least once:
   - oot.exe and oot_xlate.exe are killed after every run (the exit path can hang), and a run refuses to start while
     one is alive (two runs share the shader cache and the window; --kill-existing kills it first).
   - The start-up crash (an SDK abort in MultiWait, about one run in two, docs/phase3.md) is retried: a run that exits
-    non-zero before its time, or without its --shot, is run again, up to --retry times.
+    non-zero within its first 45 s is run again, up to --retry times. A later crash is reported, not retried.
   - The window keeps focus as far as the game knows (OOT_ASSUME_FOCUS=1): out of focus the game pauses itself, as on
     the console under the HOME menu. --no-focus-pin to test that.
   - --press-a presses A at frame 600, which brings up the title menu over the cinematic. --record FILE writes what
@@ -153,12 +153,13 @@ def run_game(seconds: int = 60, shot: str | None = None, env: dict | None = None
         left = running()
         with open(log, "a") as f:
             f.write(f"exit {rc}\nprocesses left: {len(left)}\n")
-        early = rc != 0 and took < seconds
+        # The start-up crash comes within the first frames; a crash later is a result, not a reason to run again.
+        early = rc != 0 and took < min(seconds, 45)
         missing_shot = bool(shot_path) and not shot_path.exists()
         result = {"ok": not early and not missing_shot and rc in (0,), "log": str(log), "exit": rc,
                   "shot": str(shot_path) if shot_path and shot_path.exists() else None, "seconds_run": round(took),
                   "summary": summary(log), "run": n}
-        if result["ok"] or not (early or missing_shot):
+        if result["ok"] or not early:
             break
         if not quiet:
             print(f"run: run-{n} ended early (exit {rc} after {took:.0f} s{', no shot' if missing_shot else ''}); "

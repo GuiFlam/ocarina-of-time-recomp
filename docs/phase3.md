@@ -247,6 +247,28 @@ build/logs/run-243.log). The title, menu and opening cutscene run at a steady 60
   show at their edges. Not yet measured whether the emulated HMMA shows them too (tensor cores round once, the
   emulation per step) or whether a tile border is handled wrongly.
 
+## Status (2026-11-06, past the opening): the level renders, then the GPU times out
+
+The black screen after the opening cutscene was not the mesh stages. The game marks a movie's end with an empty
+buffer of flag 8 (flag 4 marks the first sample of a stream); `ov_movie22.c` took 4 for the end, so no movie ever
+ended and the game waited for the end-of-stream frame forever (run-248 logged the flag-8 buffer). Past it, the game
+aborted in `nn::prepo::AsyncContext::GetCompletionEvent` (a play report's context; `ov_system.c` now completes it at
+once with a signalled kernel event attached through the SDK). With both, the Kokiri Forest level renders: about 80
+passes, 744 draws and 126 dispatches a frame (run-257), for about ten frames, until a device loss with the GPU
+timeout's pattern (one instruction pointer per killed warp: a shader that runs too long, as the upscaler's loop did).
+
+Open, in order:
+- The GPU timeout on the first level frames: find the dispatch or draw (`OOT_SKIP_DISPATCH_FROM`, `OOT_CS_TIME`,
+  `OOT_TENSOR_CORES=0` to rule the tensor path in or out).
+- 605 programs the lowering refuses in the level (`gfx_shader: translation failed`), so about 280 of 744 draws are
+  skipped: unknown opcodes 261, `TEX unpacked operands` 128, scratch and predicate pressure 53, `RED address` 37,
+  uniform datapath opcodes 35, and smaller groups (TLD, TLD4, HMNMX2, PLOP3, STG of wide zeros).
+- The mesh stages: the level draws with `DrawMeshTasksIndirect` too (stubs).
+- The movie start stutters for about 8 s (every other frame ~160 ms while the GPU needs 5-13 ms: CPU side), and the
+  cutscene's audio stream runs 10-20 s off the picture (the user); the opening's voice lines are silent.
+- `OOT_MOVIE_SKIP` hands its end back before the game has sent its own end and the game ignores it; it needs to wait
+  for the flag-8 buffer (until then a run sits through the 154 s opening).
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
