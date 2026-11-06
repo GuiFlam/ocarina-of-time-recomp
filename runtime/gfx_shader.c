@@ -47,16 +47,21 @@
 #include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "sm86_lower.h"
 
-#define CONTROL_SIZE 0x880
-#define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
+// OoT: the program is NVN2's (sm86_lower.h): the control section's own size is at +0xd4 and the code block holds
+// the 0x80-byte header, the SM86 instructions, padding and the jump-table constants (c1). The cache key and the
+// stored inputs cover the control section and the whole code block as the game hands them over; the translator
+// gets the Maxwell program sm86_lower makes of them, with its c1 (echoed in the .res.json, bound by the draw path).
+#define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 4                                      // in every cache key; bump when the key layout or the use of the
-                                                           // output changes here (4: translator identity, input ids);
-                                                           // translator changes are covered by its identity
-#define IN_VERSION 1                                       // in every input id and .in file: bump when the answers layout
-                                                           // or the program hash changes (drops every stored input)
+#define KEY_VERSION 5                                      // in every cache key; bump when the key layout or the use of the
+                                                           // output changes here (4: translator identity, input ids;
+                                                           // 5: NVN2 programs); translator changes are covered by its identity
+#define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout
+                                                           // or the program hash changes (drops every stored input;
+                                                           // 2: the control section's own size, the whole code block)
 #define USE_MAGIC 0x4d554b54u                              // "TKUM", .use files
 #define USE_VERSION 2                                      // 2: slots include the sampler format query (integer textures)
 #define IN_MAGIC 0x49534b54u                               // "TKSI", .in files
@@ -90,6 +95,8 @@ struct GfxShader {
     uint32_t in_mask, out_mask;                            // user Locations of Input / Output variables
     GfxShaderIo in[32], out[32];
     uint32_t local[3];
+    uint8_t *c1;                                           // the lowered program's constant bank 1 (.res.json "c1")
+    uint32_t c1_len;
 };
 
 static SRWLOCK cache_lock = SRWLOCK_INIT;                  // memory cache
@@ -510,7 +517,7 @@ static GfxShader *mem_find(const uint8_t key[32]) {
 
 static void shader_free(GfxShader *s) {
     for (int k = 0; k < GFX_RES_KINDS; k++) free(s->res[k]);
-    free(s->spirv), free(s->reflection), free(s);
+    free(s->spirv), free(s->reflection), free(s->c1), free(s);
 }
 
 static void reflect(GfxShader *s);
@@ -787,8 +794,23 @@ static void reflect(GfxShader *s) {
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
         json_objects(js, kinds[k], add_res, s, k);
     }
+    // "c1": the lowered program's constant bank 1 as hex (tools/xlate/Program.cs echoes the job's).
+    const char *c1 = json_key(js, js + strlen(js), "c1");
+    if (c1 && *c1 == '"') {
+        const char *e = strchr(c1 + 1, '"');
+        size_t n = e ? (size_t)(e - c1 - 1) / 2 : 0;
+        s->c1 = n ? malloc(n) : NULL;
+        for (size_t i = 0; s->c1 && i < n; i++) {
+            unsigned v = 0;
+            sscanf(c1 + 1 + 2 * i, "%2x", &v);
+            s->c1[i] = (uint8_t)v;
+        }
+        s->c1_len = s->c1 ? (uint32_t)n : 0;
+    }
     reflect_spirv(s);
 }
+
+const uint8_t *gfx_shader_c1(const GfxShader *s, uint32_t *len) { return *len = s->c1_len, s->c1; }
 
 // ---- use masks (see the cache key at the top)
 
@@ -993,17 +1015,17 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
     return (size_t)(p - o);
 }
 
-static int build_code_hash(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
-                           const uint8_t *c1, uint32_t c1_len, uint8_t hash[32]) {
-    size_t total = 4 + CONTROL_SIZE + 8 + (size_t)code_size + 4 + c1_len;
+// sha256 over the stage, the control section (its own size) and the whole code block (its c1 included).
+static int build_code_hash(int stage, const uint8_t *control, uint32_t ctl_size, const uint8_t *code, uint64_t code_size,
+                           uint8_t hash[32]) {
+    size_t total = 4 + 4 + ctl_size + 8 + (size_t)code_size;
     uint8_t *buf = malloc(total), *p = buf;
     if (!buf) return 0;
     put_u32(&p, (uint32_t)stage);
-    memcpy(p, control, CONTROL_SIZE), p += CONTROL_SIZE;
+    put_u32(&p, ctl_size);
+    memcpy(p, control, ctl_size), p += ctl_size;
     memcpy(p, &code_size, 8), p += 8;
     memcpy(p, code, (size_t)code_size), p += code_size;
-    put_u32(&p, c1_len);
-    if (c1_len) memcpy(p, c1, c1_len);
     rt_sha256(buf, total, hash);
     free(buf);
     return 1;
@@ -1057,7 +1079,7 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
@@ -1098,13 +1120,12 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};
         if (a && (a->local[0] | a->local[1] | a->local[2])) l[0] = a->local[0], l[1] = a->local[1], l[2] = a->local[2];
-        else memcpy(l, control + 0x748, 12);
+        else for (int k = 0; k < 3; k++) l[k] = ctl->local[k] ? ctl->local[k] : 1;
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
     }
-    /* Control byte +0x718 of a fragment shader: early fragment tests (the NVN driver's early-Z-force, MacNativeGames
-       ae8f4f4). Without it a shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test
-       after the depth prepass fails along contour lines. Already part of the code hash (the whole control section). */
-    if (!strcmp(stage, "ps") && (control[0x718] & 1)) o += sprintf(o, ",\"early_fragment_tests\":true");
+    /* Switch 1's control byte +0x718 bit 0 was the driver's early-Z-force (MacNativeGames ae8f4f4: without it a
+       shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test after the depth prepass
+       fails along contour lines). Its NVN2 equivalent is not identified yet (candidates: +0xa4 bits 0 and 8). */
     int si = !strcmp(stage, "vs") ? 0 : !strcmp(stage, "cs") ? 2 : 1;   // gfx_shader_set_host answers
     if (!host_f64) o += sprintf(o, ",\"softfloat64\":true");
     if (host_sbuf) o += sprintf(o, ",\"sbuf_align\":%u", host_sbuf);
@@ -1169,19 +1190,22 @@ typedef struct {
     uint8_t key[32];                                       // cache key, or the provisional one with final 0
     uint8_t iid[32];                                       // input id with final 1
     int final;
+    Sm86Control ctl;                                       // the NVN2 control section's fields
 } Req;
 
+// control: the NVN2 control section (CONTROL_BOUND bytes readable); code: the code block, code_size bytes available
+// (the control says how many it uses: r->length). c1 is ignored (it lies inside the code block).
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
+    (void)c1;
     r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
-    uint32_t c1_off;
-    memcpy(&c1_off, control + 0x700, 4), memcpy(&r->length, control + 0x704, 4);
-    uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
-    if (!code || r->length > code_size || c1_off > r->length || skip >= r->length) return fail("bad control section", NULL), 0;
-    r->c1_len = r->length - c1_off;
-    r->c1 = c1 ? c1 : code + c1_off;
-    if (!build_code_hash(stage, control, code, r->length, r->c1, r->c1_len, r->code_hash))
+    if (!control || !sm86_control_parse(control, CONTROL_BOUND, &r->ctl)) return fail("bad control section", NULL), 0;
+    r->length = r->ctl.code_size;
+    if (!code || r->length > code_size) return fail("code block shorter than its control section says", NULL), 0;
+    r->c1_len = r->ctl.c1_len;
+    r->c1 = code + r->ctl.c1_off;
+    if (!build_code_hash(stage, control, r->ctl.size, code, r->length, r->code_hash))
         return fail("out of memory", NULL), 0;
     paths();
     UseMask m;
@@ -1220,8 +1244,8 @@ const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t
 // ---- stored inputs (<cache>/in/<input id>.in, see the top)
 
 typedef struct {
-    uint32_t magic, version, stage, length, c1_len, answers_size;
-} InHeader;                                                // then GfxShaderAnswers, control, code[length], c1[c1_len]
+    uint32_t magic, version, stage, length, ctl_size, answers_size;
+} InHeader;                                                // then GfxShaderAnswers, control[ctl_size], code[length]
 
 typedef struct {
     uint8_t *buf;                                          // the file; the pointers below point into it
@@ -1244,15 +1268,14 @@ static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, c
     in_path(iid, p);
     if (pack_find(PACK_IN, iid) || file_exists(p)) return;
     GfxShaderAnswers zero = {0};
-    InHeader h = {IN_MAGIC, IN_VERSION, (uint32_t)stage, r->length, r->c1_len, sizeof(GfxShaderAnswers)};
-    size_t n = sizeof h + sizeof zero + CONTROL_SIZE + r->length + r->c1_len;
+    InHeader h = {IN_MAGIC, IN_VERSION, (uint32_t)stage, r->length, r->ctl.size, sizeof(GfxShaderAnswers)};
+    size_t n = sizeof h + sizeof zero + r->ctl.size + r->length;
     uint8_t *buf = malloc(n), *o = buf;
     if (!buf) return;
     memcpy(o, &h, sizeof h), o += sizeof h;
     memcpy(o, a ? a : &zero, sizeof zero), o += sizeof zero;
-    memcpy(o, control, CONTROL_SIZE), o += CONTROL_SIZE;
+    memcpy(o, control, r->ctl.size), o += r->ctl.size;
     memcpy(o, code, r->length), o += r->length;
-    if (r->c1_len) memcpy(o, r->c1, r->c1_len);
     snprintf(tmp, PATH_CAP + 120, "%s\\in", cache_dir);
     mkdir_p(tmp);
     plat_file_write_atomic(p, buf, n);
@@ -1270,14 +1293,20 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
     if (!f || n < sizeof h) return free(f), 0;
     memcpy(&h, f, sizeof h);
     if (h.magic != IN_MAGIC || h.version != IN_VERSION || h.answers_size != sizeof(GfxShaderAnswers) ||
-        n != sizeof h + sizeof(GfxShaderAnswers) + CONTROL_SIZE + (uint64_t)h.length + h.c1_len)
+        h.ctl_size < SM86_CONTROL_MIN || h.ctl_size > CONTROL_BOUND ||
+        n != sizeof h + sizeof(GfxShaderAnswers) + h.ctl_size + (uint64_t)h.length)
         return free(f), 0;
+    // The control is read through CONTROL_BOUND bytes: give it that room.
+    uint8_t *g = realloc(f, (size_t)n + CONTROL_BOUND);
+    if (!g) return free(f), 0;
+    f = g;
+    memset(f + n, 0, CONTROL_BOUND);
     const uint8_t *o = f + sizeof h;
     memcpy(&in->a, o, sizeof in->a), o += sizeof in->a;
-    in->control = o, o += CONTROL_SIZE;
+    in->control = o, o += h.ctl_size;
     in->code = o, o += h.length;
-    in->c1 = o;
-    in->buf = f, in->stage = (int)h.stage, in->length = h.length, in->c1_len = h.c1_len;
+    in->c1 = NULL;
+    in->buf = f, in->stage = (int)h.stage, in->length = h.length, in->c1_len = 0;
     return 1;
 }
 
@@ -1295,18 +1324,25 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     if (look && (s = mem_find(look))) return InterlockedIncrement64(&n_hits), s;
     if (look && (s = disk_load(look, look_iid))) return InterlockedIncrement64(&n_hits), mem_insert(s);
 
-    uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
     char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
     key_hex(key, hex);
     mkdir_p(cache_dir);
     snprintf(code_path, PATH_CAP + 80, "%s\\%s.code", cache_dir, hex);
     snprintf(spv_path, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
     snprintf(res_path, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, hex);
-    if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
-    size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
+    // The SM86 program lowered to Maxwell: the translator's input, with its moved jump tables as c1.
+    Sm86Lowered low;
+    if (!sm86_lower(code, r->length, control, CONTROL_BOUND, &low)) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "lowering failed at +%#x: %s", low.error_offset, low.error);
+        return fail(msg, hex);
+    }
+    if (!write_file(code_path, low.code, low.code_size)) return sm86_lower_free(&low), fail("cannot write the code file", hex);
+    size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)low.c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
-    if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
+    if (!req) return sm86_lower_free(&low), plat_file_delete(code_path), fail("out of memory", hex);
+    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl);
+    sm86_lower_free(&low);
     int ok = svc_request(req, reply, sizeof reply);
     free(req);
     plat_file_delete(code_path);
@@ -1434,7 +1470,7 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
 
     XJob *j = calloc(1, sizeof *j);
     XWait *e = calloc(1, sizeof *e);
-    uint8_t *ctl = malloc(CONTROL_SIZE), *cd = malloc(r.length);
+    uint8_t *ctl = calloc(1, CONTROL_BOUND), *cd = malloc(r.length);
     AcquireSRWLockExclusive(&X.lock);
     if (!X.started) {
         int n = 0;
@@ -1450,9 +1486,9 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     int raced = *slot != NULL;                             // another thread queued it between the checks
     int queued = !raced && X.started == 1 && j && e && ctl && cd;
     if (queued) {
-        memcpy(ctl, control, CONTROL_SIZE), memcpy(cd, code, r.length);
+        memcpy(ctl, control, r.ctl.size), memcpy(cd, code, r.length);
         *j = (XJob){.stage = stage, .r = r, .control = ctl, .code = cd, .a = *a};
-        j->r.c1 = cd + (r.length - r.c1_len);
+        j->r.c1 = cd + r.ctl.c1_off;
         memcpy(e->key, r.key, 32);
         *slot = e;
         if (X.tail) X.tail->next = j;
@@ -1693,8 +1729,8 @@ void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local
 #define ANS_VERSION 1
 #define ANS_PACKED 147                                     // pack_answers' size
 #define ANS_REC (4 + 32 + 32 + ANS_PACKED + 1)
-#define PRG_VERSION 1
-#define PRG_HEAD (12 + 32 + CONTROL_SIZE)
+#define PRG_VERSION 2                                      // 2: {stage, code length, control size}, hash, control, code
+#define PRG_HEAD (12 + 32)
 typedef struct { char magic[8]; uint32_t version, rec_size; } RecHeader;
 typedef struct { uint64_t *v; uint32_t cap, n; } Set64;    // open addressing, 0 empty
 typedef struct { uint8_t *p; size_t n, cap; } Bytes;
@@ -1787,10 +1823,10 @@ static int rec_read(const char *path, const char *magic, uint32_t version, uint3
 static size_t prg_walk(const uint8_t *b, size_t n, void (*fn)(const uint8_t *rec, void *ctx), void *ctx) {
     size_t o = 0;
     while (n - o >= PRG_HEAD) {
-        uint32_t len, c1;
-        memcpy(&len, b + o + 4, 4), memcpy(&c1, b + o + 8, 4);
-        size_t size = PRG_HEAD + (size_t)len + c1;
-        if (len > (64u << 20) || c1 > len || size > n - o) break;
+        uint32_t len, cs;
+        memcpy(&len, b + o + 4, 4), memcpy(&cs, b + o + 8, 4);
+        size_t size = PRG_HEAD + (size_t)len + cs;
+        if (len > (64u << 20) || cs < SM86_CONTROL_MIN || cs > CONTROL_BOUND || size > n - o) break;
         if (fn) fn(b + o, ctx);
         o += size;
     }
@@ -1842,10 +1878,9 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
         memcpy(rec, &st, 4), memcpy(rec + 4, r->code_hash, 32), memcpy(rec + 36, s->iid, 32);
         pack_answers(rec + 68, a);
         if (set_add(&RC.progs, hash8(r->code_hash))) {
-            uint32_t head[3] = {st, r->length, r->c1_len};
+            uint32_t head[3] = {st, r->length, r->ctl.size};
             bytes_put(&RC.prg, head, 12), bytes_put(&RC.prg, r->code_hash, 32);
-            bytes_put(&RC.prg, control, CONTROL_SIZE), bytes_put(&RC.prg, code, r->length);
-            bytes_put(&RC.prg, r->c1, r->c1_len);
+            bytes_put(&RC.prg, control, r->ctl.size), bytes_put(&RC.prg, code, r->length);
         }
         bytes_put(&RC.ans, rec, sizeof rec);
         RC.pairs_new++;
@@ -1923,12 +1958,17 @@ static DWORD WINAPI prep_worker(void *arg) {
             InterlockedIncrement64(&p->missing), InterlockedIncrement64(&p->done);
             continue;
         }
-        uint32_t st, len;
-        memcpy(&st, e->rec, 4), memcpy(&len, e->rec + 4, 4);
-        const uint8_t *control = e->rec + 44, *code = control + CONTROL_SIZE, *c1 = code + len;
+        uint32_t st, len, cs;
+        memcpy(&st, e->rec, 4), memcpy(&len, e->rec + 4, 4), memcpy(&cs, e->rec + 8, 4);
+        // The control is read through CONTROL_BOUND bytes: a copy with that room.
+        uint8_t *control = calloc(1, CONTROL_BOUND);
+        if (!control) { InterlockedIncrement64(&p->failed), InterlockedIncrement64(&p->done); continue; }
+        memcpy(control, e->rec + 44, cs);
+        const uint8_t *code = e->rec + 44 + cs;
         GfxShaderAnswers a;
         unpack_answers(r + 68, &a);
-        const GfxShader *s = gfx_shader_get((int)st, control, code, len, c1, &a);
+        const GfxShader *s = gfx_shader_get((int)st, control, code, len, NULL, &a);
+        free(control);
         if (!s) InterlockedIncrement64(&p->failed);
         else if (p->iid) memcpy(p->iid[i], s->iid, 32);
         InterlockedIncrement64(&p->done);

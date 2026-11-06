@@ -86,6 +86,19 @@ typedef struct {
     uint8_t ur_map[64];                            // uniform register -> general register (0 = unmapped)
     struct { uint8_t kind, bank; uint32_t value; } ur_def[64];   // 0 none, 1 a constant word (bank, offset),
                                                    // 2 an immediate, 3 several definitions or a computed one
+    const uint8_t *control, *c1;                   // the control section and jump tables (BRX successors)
+    uint32_t ctl_size, c1_len;
+    uint8_t *leader;                               // [n]: the instruction starts a basic block
+    uint64_t (*live_out)[4];                       // [n]: registers live after the instruction (liveness mode)
+    int liveness;                                  // scratch comes from the registers dead at each instruction
+    uint32_t scratch_len;                          // registers in the scratch block (liveness mode: per instruction)
+    uint64_t reserved[4];                          // registers the lowering holds for the program's length
+    struct { uint8_t kind, bank; uint32_t value; } cur_def[64];   // local forwarding: the constant uniform
+                                                   // register n holds at this point of its block (kind as ur_def)
+    uint8_t needs_reg[64];                         // uniform register n has a use no forwarding covers
+    uint32_t ur_first[64], ur_last[64];            // the instructions a uniform register is touched at, first and last
+    uint8_t ur_whole[64];                          // a use before its first definition: live over the whole program
+    int scanned;                                   // needs_reg is final: a read of another register is a scan bug
     uint32_t used_preds;                           // predicates the program touches (bit n = Pn)
     uint8_t up_map[8];                             // uniform predicate -> predicate (0xff unmapped, 7 = UPT)
     int up_swap;                                   // no predicate is free: UPn lives in bit n of up_reg and is
@@ -133,12 +146,14 @@ static void reloc(L *l, uint32_t target) {
 
 static uint32_t alloc_gpr(L *l) {
     if (l->ur_next >= l->scratch_base) return fail(l, "no general register free for a uniform register"), NOREG;
+    l->reserved[l->ur_next / 64] |= 1ull << (l->ur_next % 64);
     return l->ur_next++;
 }
 
 // Scratch register k of the current expansion: scratch_base + k, the block growing on first use.
 static uint32_t S(L *l, int k) {
-    if (k >= NSCRATCH || l->scratch_base + (uint32_t)k > 254) return fail(l, "no general register free for scratch"), RZ;
+    if (k >= NSCRATCH || l->scratch_base + (uint32_t)k > 254 || (l->liveness && (uint32_t)k >= l->scratch_len))
+        return fail(l, "no general register free for scratch"), RZ;
     if (l->nscratch <= k) l->nscratch = k + 1;
     return l->scratch_base + (uint32_t)k;
 }
@@ -158,9 +173,26 @@ static Src reg_src(uint32_t r) { Src s = {0}; s.reg = r; return s; }
 static uint32_t ur(L *l, uint32_t n) {
     if (n == 63) return RZ;
     if (n > 63) return fail(l, "uniform register number"), RZ;
+    if (l->scanned && !l->needs_reg[n]) return fail(l, "uniform register read the scan did not see"), RZ;
     if (!l->ur_map[n]) {
-        uint32_t r = alloc_gpr(l);
-        if (r == NOREG) return RZ;
+        uint32_t r = NOREG;
+        if (l->ur_next < l->scratch_base) r = alloc_gpr(l);
+        else if (l->liveness) {
+            // No room above the program's registers: one dead over the instructions the uniform register spans
+            // (the whole program when it is read before any definition).
+            uint32_t a = l->ur_whole[n] || !l->ur_first[n] ? 0 : l->ur_first[n] - 1;
+            uint32_t b = l->ur_whole[n] || !l->ur_last[n] ? l->n - 1 : l->ur_last[n] - 1;
+            uint64_t busy[4];
+            memcpy(busy, l->reserved, sizeof busy);
+            for (uint32_t i = a; i <= b && i < l->n; i++)
+                for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w];
+            for (uint32_t c = 0; c < 255 && r == NOREG; c++)
+                if (!(busy[c / 64] >> (c % 64) & 1)) r = c;
+            if (r == NOREG) return fail(l, "no general register dead over a uniform register's span"), RZ;
+            l->reserved[r / 64] |= 1ull << (r % 64);
+        } else {
+            return fail(l, "no general register free for a uniform register"), RZ;
+        }
         l->ur_map[n] = (uint8_t)r;
     }
     return l->ur_map[n];
@@ -172,8 +204,16 @@ static Src ur_src(L *l, uint32_t n) {
     Src s = {0};
     if (n < 63 && l->ur_def[n].kind == 1) { s.kind = 2, s.cb_bank = l->ur_def[n].bank, s.cb_off = l->ur_def[n].value; return s; }
     if (n < 63 && l->ur_def[n].kind == 2) { s.kind = 1, s.imm = l->ur_def[n].value; return s; }
+    if (n < 63 && l->cur_def[n].kind == 1) { s.kind = 2, s.cb_bank = l->cur_def[n].bank, s.cb_off = l->cur_def[n].value; return s; }
+    if (n < 63 && l->cur_def[n].kind == 2) { s.kind = 1, s.imm = l->cur_def[n].value; return s; }
     return reg_src(ur(l, n));
 }
+
+// Does uniform register n have a register at all (false: every use forwards a constant, or there is no use)?
+static int ur_has_reg(const L *l, uint32_t n) { return n < 63 && l->ur_def[n].kind == 3 && l->needs_reg[n]; }
+
+// The register a definition of uniform register n writes: RZ when it has none (the value is never read as such).
+static uint32_t ur_dst(L *l, uint32_t n) { return ur_has_reg(l, n) ? ur(l, n) : RZ; }
 
 // Uniform registers n and n + 1 as an adjacent register pair, in scratch k, k + 1 when they are forwarded
 // constants or not adjacent in the mapping.
@@ -213,6 +253,11 @@ static uint32_t up(L *l, uint32_t n) {
 
 // ---- register scan: which general registers the program uses (the pool for the lowering lies above them)
 
+static int uniform_op(uint32_t op);
+static uint32_t up_fields(const Insn *x);
+static int successors(const L *l, uint32_t i, uint32_t *out, uint32_t cap);
+static void scratch_at(L *l, uint32_t i);
+
 static int uniform_op(uint32_t op) {
     uint32_t base = op & 0x1ff;
     return (base >= 0x080 && base < 0x100) || base == 0x1c2 || base == 0x1c3 || base == 0x1c4 || op == 0x958;
@@ -237,6 +282,205 @@ static void scan_registers(L *l) {
     }
     l->max_gpr = m;
     l->ur_next = m + 4 > 255 ? 255 : m + 4;                        // + 3 for 128-bit operands behind a field
+}
+
+// ---- control flow: basic blocks and successors
+
+static int64_t branch_target_of(uint32_t index, const Insn *x, int bra) {
+    uint64_t raw = (bra ? (x->w[1] & ~3u) : x->w[1]) | ((uint64_t)(x->w[2] & 0x3ffff) << 32);
+    return (int64_t)index * 16 + 16 + sext(raw, 50);
+}
+
+// The jump-table record of the BRX at native index i (the records name it by its offset from the first
+// instruction): its entries as native indices (count returned, 0 unknown).
+static uint32_t brx_targets(const L *l, uint32_t i, uint32_t *out, uint32_t cap) {
+    uint32_t count = 0;
+    if (!l->control || l->ctl_size < SM86_CONTROL_MIN + 4) return 0;
+    memcpy(&count, l->control + SM86_CONTROL_MIN, 4);
+    if (count > 64 || SM86_CONTROL_MIN + 4 + count * 16 > l->ctl_size) return 0;
+    for (uint32_t r = 0; r < count; r++) {
+        uint32_t rec[4];
+        memcpy(rec, l->control + SM86_CONTROL_MIN + 4 + r * 16, 16);
+        if (rec[0] != i * 16) continue;                       // the offset counts from the first instruction
+        uint32_t n = 0;
+        for (uint32_t e = 0; e < rec[1] && n < cap; e++) {
+            uint32_t v;
+            if (rec[3] + e * 4 + 4 > l->c1_len) return 0;
+            memcpy(&v, l->c1 + rec[3] + e * 4, 4);
+            if (v % 16 || v / 16 >= l->n) return 0;
+            out[n++] = v / 16;
+        }
+        return n;
+    }
+    return 0;
+}
+
+// Successors of native instruction i (count; -1 when they cannot be known: a jump table without its record).
+static int successors(const L *l, uint32_t i, uint32_t *out, uint32_t cap) {
+    const Insn *x = &l->in[i];
+    uint32_t op = x->w[0] & 0xfff, g = bits(x, 12, 4);
+    int n = 0;
+    if (g == 15) { if (i + 1 < l->n) out[n++] = i + 1; return n; }
+    switch (op) {
+    case 0x947: case 0x944: {
+        int64_t t = branch_target_of(i, x, op == 0x947);
+        if (t < 0 || t % 16 || (uint64_t)t / 16 > l->n) return -1;
+        uint32_t mode = op == 0x947 ? bits(x, 32, 2) : 0;
+        if (mode != 2 && (uint64_t)t / 16 < l->n) out[n++] = (uint32_t)(t / 16);
+        if ((g != 7 || op == 0x944 || mode == 2) && i + 1 < l->n) out[n++] = i + 1;
+        return n;
+    }
+    case 0x94d:
+        if (g != 7 && i + 1 < l->n) out[n++] = i + 1;
+        return n;
+    case 0x949: case 0x958: {
+        uint32_t t = brx_targets(l, i, out, cap);
+        if (!t) return -1;
+        n = (int)t;
+        if (g != 7 && i + 1 < l->n && n < (int)cap) out[n++] = i + 1;
+        return n;
+    }
+    case 0x950:
+        // RET.REL.NODEC returns to the instruction after some CALL: every call site's successor.
+        for (uint32_t k = 0; k < l->n && n < (int)cap; k++)
+            if ((l->in[k].w[0] & 0xfff) == 0x944 && k + 1 < l->n) out[n++] = k + 1;
+        return n;
+    default:
+        if (i + 1 < l->n) out[n++] = i + 1;
+        return n;
+    }
+}
+
+// Block leaders: the entry, every branch target, every instruction after a branch, call, return or exit.
+// Returns 0 when a jump table's targets are unknown.
+static int build_blocks(L *l) {
+    l->leader = calloc(l->n, 1);
+    if (!l->leader) return fail(l, "out of memory"), 0;
+    l->leader[0] = 1;
+    uint32_t t[72];
+    for (uint32_t i = 0; i < l->n; i++) {
+        uint32_t op = l->in[i].w[0] & 0xfff;
+        if (!(op == 0x947 || op == 0x944 || op == 0x94d || op == 0x949 || op == 0x958 || op == 0x950)) continue;
+        int n = successors(l, i, t, 72);
+        if (n < 0) return 0;
+        for (int k = 0; k < n; k++) if (t[k] != i + 1) l->leader[t[k]] = 1;
+        if (i + 1 < l->n) l->leader[i + 1] = 1;
+    }
+    return 1;
+}
+
+// ---- the registers an instruction reads and writes (for liveness; reads over-approximated by three registers,
+// the width a 128-bit operand reaches; the write is the destination's first register, none when predicated)
+
+static void set_bit(uint64_t m[4], uint32_t r) { if (r < 255) m[r / 64] |= 1ull << (r % 64); }
+static void set_run(uint64_t m[4], uint32_t r, uint32_t w) { for (uint32_t k = 0; k < w; k++) set_bit(m, r + k); }
+static int get_bit(const uint64_t m[4], uint32_t r) { return r < 255 && (m[r / 64] >> (r % 64) & 1); }
+
+static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
+    uint32_t op = x->w[0] & 0xfff, base = op & 0x1ff, form = op >> 9, g = bits(x, 12, 4);
+    uint32_t f16 = bits(x, 16, 8), f24 = bits(x, 24, 8), f32 = bits(x, 32, 8), f64 = bits(x, 64, 8);
+    int predicated = g != 7;
+    if (g == 15) return;
+    if (uniform_op(op)) {
+        if (op == 0x3c2) set_run(use, f24, 1);                     // R2UR reads a general register
+        return;
+    }
+    if (base >= 0x140 && base < 0x160) {
+        if (op == 0x949) set_run(use, f24, 1);
+        return;
+    }
+    // A register at 32-39: ALU and conversion ops in form 1 (the others carry an immediate, a constant or a uniform
+    // register there); texture ops always (Rb); stores and atomics (the data); loads and LDC never.
+    int b_reg = base < 0x140 ? (form == 1) : base >= 0x160 && base < 0x180;
+    if (base == 0x186 || base == 0x187 || base == 0x188 || base == 0x122 || base == 0x18e || base == 0x18c || base == 0x18d ||
+        base == 0x1a8 || base == 0x1a9 || base == 0x189 || base == 0x127 || base >= 0x19b)
+        b_reg = 1;
+    int c_reg = base < 0x100 ? 1 : 0;                              // ALU: a register at 64 in every form
+    int store = base == 0x186 || base == 0x187 || base == 0x188 || base == 0x122 || base == 0x18e || base == 0x127 ||
+                base == 0x19b || base == 0x19c || base == 0x19e;
+    int no_dst = store || base == 0x118 || base == 0x11a || base == 0x192 || base == 0x11d || base == 0x004 || base == 0x01c ||
+                 (base == 0x00b) || (base == 0x00c);
+    // The destination's width: loads by their size (73-75: 6 = 128 bits, 5 = 64), texture ops by their mask (the
+    // first two components to Rd, the rest to the second destination at 64-71 when given), IMAD.WIDE and a 64-bit
+    // CS2R two registers; else one. Over-stating a write is unsafe (it frees a live register), so packed-half
+    // texture results count as fewer. Reads are exact where the width is known and generous (four) where it is not
+    // (texture coordinates); an over-stated read only keeps a register live longer.
+    uint32_t w = 1, size = bits(x, 73, 3), by_size = size == 6 ? 4 : size == 5 ? 2 : 1;
+    int load = base == 0x181 || base == 0x183 || base == 0x184 || base == 0x182;
+    int tex = base >= 0x160 && base < 0x180, tex2 = 0;
+    if (load) w = by_size;
+    else if (tex) {
+        uint32_t count = (uint32_t)__builtin_popcount(bits(x, 72, 4)), half = bits(x, 79, 1) && base != 0x16f && base != 0x170;
+        if (half) count = (count + 1) / 2;
+        if (f64 != RZ && count > 2) tex2 = (int)count - 2, count = 2;
+        w = count;
+    }
+    else if (base == 0x025 || (base == 0x005 && bits(x, 80, 1))) w = 2;
+    if (!no_dst && !predicated) {
+        set_run(def, f16, w);
+        if (tex2) set_run(def, f64, (uint32_t)tex2);
+    }
+    if (predicated && !no_dst) set_run(use, f16, w);               // a partial write keeps the old value live
+    // Reads.
+    int no_a = base == 0x002 || (base >= 0x100 && base <= 0x109) || base == 0x119 || base == 0x005 || base == 0x11a || base == 0x118 ||
+               base == 0x126 || base == 0x121 || base == 0x01c || base == 0x003 || base == 0x006;
+    uint32_t a_w = tex ? 4 : (load || store || base == 0x18c || base == 0x18d || base == 0x1a8 || base == 0x1a9 || base == 0x18e) ?
+                   (bits(x, 72, 1) || base == 0x1a8 || base == 0x3a8 || base == 0x18e ? 2 : 1) : (base == 0x025 ? 1 : 1);
+    if (!no_a) set_run(use, f24, a_w);
+    if (b_reg) set_run(use, f32, tex ? 4 : store ? by_size : 1);
+    if (c_reg || base == 0x122 || base == 0x189 || tex) set_run(use, f64, base == 0x025 ? 2 : tex ? 1 : 1);
+    if (base == 0x122) set_run(use, f32, bits(x, 74, 2) + 1);     // AST data
+    if (base == 0x121) set_run(use, f32, 1);                      // ALD vertex register
+}
+
+// ---- uniform registers: definitions, forwarding and the registers they need
+
+// The uniform registers an instruction reads: list of (number, count) pairs; returns how many.
+static int ur_reads(const Insn *x, uint32_t out[8][2]) {
+    uint32_t op = x->w[0] & 0xfff, base = op & 0x1ff, form = op >> 9;
+    int n = 0;
+    if (bits(x, 12, 4) == 15) return 0;
+    if (base >= 0x080 && base < 0x100) {
+        int one_source = base == 0x0bd || base == 0x0be || base == 0x0bf || base == 0x082 || base == 0x086 || base == 0x0b9;
+        if (!one_source) out[n][0] = bits(x, 24, 8), out[n++][1] = 1;
+        if (form == 1 || (base == 0x082 && op == 0xc82)) out[n][0] = bits(x, 32, 8) & 63, out[n++][1] = 1;
+        if (base != 0x08c && base != 0x087 && base != 0x082 && base != 0x086 && base != 0x0b9 && base != 0x0bd && base != 0x0be &&
+            base != 0x0bf && base != 0x085 && base != 0x09a && (form == 1 || form == 4 || form == 5 || form == 6))
+            out[n][0] = bits(x, 64, 8), out[n++][1] = 1;
+        if (base == 0x0b9 && op == 0xabb) out[n][0] = bits(x, 24, 8), out[n++][1] = 1;
+    } else if ((form == 6 || form == 7) && base < 0x120) {
+        out[n][0] = bits(x, 32, 6), out[n++][1] = 1;
+    } else if (op == 0xf60 || op == 0xf63 || op == 0xf66 || op == 0xf69) {
+        out[n][0] = bits(x, 40, 6), out[n++][1] = 1;
+    } else if (op == 0x981 && bits(x, 91, 1) && !bits(x, 38, 2)) {
+        out[n][0] = bits(x, 32, 6), out[n++][1] = 2;
+    } else if ((op == 0x986 || op == 0x9a8 || op == 0x98e || op == 0x987 || op == 0x988) && bits(x, 91, 1)) {
+        out[n][0] = bits(x, 64, 6), out[n++][1] = op == 0x987 || op == 0x988 ? 1 : 2;
+    } else if ((op == 0x983 || op == 0x984) && bits(x, 91, 1)) {
+        out[n][0] = bits(x, 32, 6), out[n++][1] = 1;
+    }
+    return n;
+}
+
+// What an instruction defines for the local forwarding: the uniform register (63 none), its pair, and the
+// constant it loads (kind 1 constant word, 2 immediate, 3 computed).
+static uint32_t ur_write(const Insn *x, int *pair, uint8_t *kind, uint8_t *bank, uint32_t *value) {
+    uint32_t op = x->w[0] & 0xfff, base = op & 0x1ff, dst = bits(x, 16, 8), g = bits(x, 12, 4);
+    *pair = 0, *kind = 3, *bank = 0, *value = 0;
+    if (g == 15) return 63;
+    if (base >= 0x080 && base < 0x100 && base != 0x08c && base != 0x09c) {
+        if (op == 0x882 && g == 7) *kind = 2, *value = x->w[1];
+        if (op == 0xab9 && g == 7 && bits(x, 76, 2) == 0 && bits(x, 80, 11) == 0 && bits(x, 54, 5) < 18 &&
+            (bits(x, 73, 3) == 4 || bits(x, 73, 3) == 5) && bits(x, 38, 16) % 4 == 0 && bits(x, 38, 16) / 4 < 0x4000) {
+            *kind = 1, *bank = (uint8_t)bits(x, 54, 5), *value = bits(x, 38, 16), *pair = bits(x, 73, 3) == 5;
+        } else if (op == 0xab9 || op == 0xabb) {
+            *pair = bits(x, 73, 3) == 5;
+        }
+        if (base == 0x0a5) *pair = 1;
+        return dst & 63;
+    }
+    if (op == 0x3c2 || op == 0x9c3 || op == 0x3c4) return dst & 63;
+    return 63;
 }
 
 // Uniform register definitions: a register with one definition that is a direct 32-bit ULDC (or a pair, or a
@@ -275,35 +519,41 @@ static void scan_uniform(L *l) {
     for (uint32_t n = 0; n < 64; n++)
         if (count[n] > 1 || (l->ur_def[n].kind == 1 && (l->ur_def[n].value % 4 || l->ur_def[n].value / 4 >= 0x4000)))
             l->ur_def[n].kind = count[n] ? 3 : 0;
-    // Uniform registers read anywhere without a forwarded definition need a register each: the scratch block
-    // starts above them.
-    uint64_t needed = 0;
-    for (uint32_t i = 0; i < l->n; i++) {
-        const Insn *x = &l->in[i];
-        uint32_t op = x->w[0] & 0xfff, base = op & 0x1ff, form = op >> 9;
-        if (bits(x, 12, 4) == 15) continue;
-        if (base >= 0x080 && base < 0x100) {
-            needed |= 1ull << (bits(x, 24, 8) & 63) | 1ull << (bits(x, 64, 8) & 63) | 1ull << (bits(x, 16, 8) & 63);
-            if (form == 1) needed |= 1ull << (bits(x, 32, 8) & 63);
-            if (base == 0x0a5) needed |= 1ull << ((bits(x, 16, 8) + 1) & 63);
-        } else if ((form == 6 || form == 7) && base < 0x120) {
-            needed |= 1ull << bits(x, 32, 6);
-        } else if (op == 0xf60 || op == 0xf63 || op == 0xf66 || op == 0xf69) {
-            needed |= 1ull << bits(x, 40, 6);
-        } else if (op == 0x981 && bits(x, 91, 1) && !bits(x, 38, 2)) {
-            needed |= 3ull << bits(x, 32, 6);
-        } else if ((op == 0x986 || op == 0x9a8 || op == 0x98e) && bits(x, 91, 1)) {
-            needed |= 3ull << bits(x, 64, 6);
-        } else if (op == 0x3c2 || op == 0x9c3 || op == 0x3c4 || op == 0xab9 || op == 0xabb) {
-            needed |= 1ull << (bits(x, 16, 8) & 63);
-            if (op == 0xabb) needed |= 1ull << (bits(x, 24, 8) & 63);
-            if ((op == 0xab9 || op == 0xabb) && bits(x, 73, 3) == 5) needed |= 1ull << ((bits(x, 16, 8) + 1) & 63);
+    // Local forwarding: within a basic block, a use after a ULDC / UMOV of the same uniform register takes the
+    // constant. A uniform register whose every use forwards (globally or locally) needs no register; the others
+    // get one each, above the program's registers, and the scratch block starts above them.
+    {
+        struct { uint8_t kind, bank; uint32_t value; } cur[64];
+        memset(cur, 0, sizeof cur);
+        for (uint32_t i = 0; i < l->n; i++) {
+            const Insn *x = &l->in[i];
+            if (l->leader && l->leader[i]) memset(cur, 0, sizeof cur);
+            uint32_t reads[8][2];
+            int nr = ur_reads(x, reads);
+            for (int k = 0; k < nr; k++)
+                for (uint32_t c = 0; c < reads[k][1]; c++) {
+                    uint32_t n = reads[k][0] + c;
+                    if (n >= 63) continue;
+                    int forwards = l->ur_def[n].kind == 1 || l->ur_def[n].kind == 2 || cur[n].kind == 1 || cur[n].kind == 2;
+                    if (!forwards) l->needs_reg[n] = 1;
+                    if (!l->ur_first[n] && !l->ur_last[n]) l->ur_whole[n] = 1;   // read before any definition
+                    if (!l->ur_first[n]) l->ur_first[n] = i + 1;
+                    l->ur_last[n] = i + 1;
+                }
+            int pair;
+            uint8_t kind, bank;
+            uint32_t value;
+            uint32_t w = ur_write(x, &pair, &kind, &bank, &value);
+            for (int k = 0; w < 63 && k <= pair && w + k < 63; k++) {
+                if (!l->ur_first[w + k]) l->ur_first[w + k] = i + 1;
+                l->ur_last[w + k] = i + 1;
+            }
+            if (w < 63) {
+                cur[w].kind = kind, cur[w].bank = bank, cur[w].value = value;
+                if (pair && w + 1 < 63) cur[w + 1].kind = kind == 1 ? 1 : 3, cur[w + 1].bank = bank, cur[w + 1].value = value + 4;
+            }
         }
     }
-    uint32_t nur = 0;
-    for (uint32_t n = 0; n < 63; n++)
-        if ((needed >> n & 1) && l->ur_def[n].kind != 1 && l->ur_def[n].kind != 2) nur++;
-    l->scratch_base = l->ur_next + nur > 255 ? 255 : l->ur_next + nur;
     for (uint32_t i = 0; i < l->n; i++) {
         const Insn *x = &l->in[i];
         uint32_t op = x->w[0] & 0xfff, base = op & 0x1ff, g = bits(x, 12, 4);
@@ -335,6 +585,16 @@ static void scan_uniform(L *l) {
     }
     memset(l->up_map, 0xff, sizeof l->up_map);
     l->up_swap = (l->used_preds & 0x7f) == 0x7f;
+    // The registers the lowering needs for the program's length: one per uniform register no forwarding covers,
+    // one for the uniform predicates when they are swapped through a register. The scratch block starts above them.
+    uint32_t nur = 0;
+    for (uint32_t n = 0; n < 63; n++)
+        if (l->ur_def[n].kind == 3 && l->needs_reg[n]) nur++;
+    if ((l->used_preds & 0x7f) == 0x7f)                           // the uniform predicates' register (up_swap)
+        for (uint32_t i = 0; i < l->n; i++) if (up_fields(&l->in[i])) { nur++; break; }
+    l->scratch_base = l->ur_next + nur > 255 ? 255 : l->ur_next + nur;
+    for (uint32_t r = l->ur_next; r < l->scratch_base; r++) l->reserved[r / 64] |= 1ull << (r % 64);
+    l->scanned = 1;
 }
 
 // The uniform predicates an instruction names (bit n = UPn), for the swap around it.
@@ -361,6 +621,62 @@ static uint32_t up_fields(const Insn *x) {
         if (v != 7) m |= 1u << v;
     }
     return m;
+}
+
+// ---- liveness (only for programs whose registers leave no room for the static pools)
+
+static int compute_liveness(L *l) {
+    uint32_t n = l->n;
+    uint64_t (*use)[4] = calloc(n, sizeof *use), (*def)[4] = calloc(n, sizeof *def);
+    uint64_t (*in)[4] = calloc(n, sizeof *in);
+    l->live_out = calloc(n, sizeof *l->live_out);
+    if (!use || !def || !in || !l->live_out) { free(use), free(def), free(in); return fail(l, "out of memory"), 0; }
+    for (uint32_t i = 0; i < n; i++) insn_regs(&l->in[i], use[i], def[i]);
+    // Backward dataflow to a fixed point: out(i) = union of in(s) over successors; in(i) = use | (out & ~def).
+    uint32_t succ[72];
+    int changed = 1, rounds = 0;
+    while (changed && rounds++ < 200) {
+        changed = 0;
+        for (uint32_t i = n; i-- > 0;) {
+            uint64_t out[4] = {0, 0, 0, 0};
+            int ns = successors(l, i, succ, 72);
+            if (ns < 0) { free(use), free(def), free(in); return 0; }
+            for (int k = 0; k < ns; k++)
+                for (int w = 0; w < 4; w++) out[w] |= in[succ[k]][w];
+            uint64_t ni[4];
+            for (int w = 0; w < 4; w++) ni[w] = use[i][w] | (out[w] & ~def[i][w]);
+            if (memcmp(ni, in[i], sizeof ni)) changed = 1, memcpy(in[i], ni, sizeof ni);
+            memcpy(l->live_out[i], out, sizeof out);
+        }
+    }
+    // The scratch block of an instruction must also leave its own operands and destination alone: fold them in.
+    for (uint32_t i = 0; i < n; i++) {
+        for (int w = 0; w < 4; w++) l->live_out[i][w] |= use[i][w];
+        for (uint32_t r = 0; r < 255; r++) if (get_bit(def[i], r)) set_run(l->live_out[i], r, 4);
+    }
+    free(use), free(def), free(in);
+    return rounds < 200;
+}
+
+// The longest run of registers free at instruction i, as the scratch block.
+static void scratch_at(L *l, uint32_t i) {
+#ifdef SM86_TOOL
+    if (getenv("SM86_LIVE")) {
+        int live = 0;
+        for (uint32_t r = 0; r < 255; r++) live += get_bit(l->live_out[i], r);
+        fprintf(stderr, "live %u: %d registers live after instruction %u (op %03x):", i, live, i, l->in[i].w[0] & 0xfff);
+        if (i < 2) for (uint32_t r = 0; r < 255; r++) if (get_bit(l->live_out[i], r)) fprintf(stderr, " %u", r);
+        fprintf(stderr, "\n");
+    }
+#endif
+    uint32_t best = 0, best_len = 0, run = 0;
+    for (uint32_t r = 0; r < 255; r++) {
+        int busy = get_bit(l->live_out[i], r) || get_bit(l->reserved, r);
+        if (busy) run = 0;
+        else if (++run > best_len) best_len = run, best = r + 1 - run;
+        if (best_len >= NSCRATCH) break;
+    }
+    l->scratch_base = best, l->scratch_len = best_len > NSCRATCH ? NSCRATCH : best_len, l->nscratch = 0;
 }
 
 // ---- operands
@@ -1023,9 +1339,10 @@ static void lower_ldc(L *l, const Insn *x) {
 static void lower_uldc(L *l, const Insn *x, uint32_t op) {
     uint32_t dst = bits(x, 16, 8), width = bits(x, 73, 3), bank = bits(x, 54, 5), off = bits(x, 38, 16);
     if (bits(x, 76, 2) || bits(x, 80, 11) || bits(x, 91, 1) != (op == 0xabb) || bank >= 18 || width > 5) return (void)fail(l, "ULDC mode");
-    if (dst < 63 && l->ur_def[dst].kind == 1 && op == 0xab9 && (width == 4 || width == 5)) return;   // forwarded as the constant
-    uint32_t target = ur(l, dst);
-    uint32_t index = op == 0xabb ? ur(l, bits(x, 24, 8)) : RZ;
+    if (dst < 63 && !ur_has_reg(l, dst) && (width == 4 || width == 5) && (dst + 1 >= 63 || width == 4 || !ur_has_reg(l, dst + 1)))
+        return;                                               // every use forwards the constant
+    uint32_t target = ur_dst(l, dst);
+    uint32_t index = op == 0xabb ? ur_in(l, bits(x, 24, 8), 5) : RZ;
     if (target == RZ) return;
     if (width == 4 && index == RZ) {
         Src s = {0}; s.kind = 2, s.cb_off = off, s.cb_bank = bank;
@@ -1033,7 +1350,8 @@ static void lower_uldc(L *l, const Insn *x, uint32_t op) {
         return mov_cbuf(l, target, &s);
     }
     if (width == 5) {
-        uint32_t t2 = ur(l, dst + 1);
+        uint32_t t2 = ur_dst(l, dst + 1);
+        if (t2 == RZ && target == RZ) return;
         if ((dst & 1) || t2 != target + 1) {
             // A pair that is not adjacent in the mapping: load both words separately.
             emit(l, base(l, 0xef90000000000000ull, target, index) | ((uint64_t)off << 20) | ((uint64_t)bank << 36) | ((uint64_t)4 << 48));
@@ -1048,7 +1366,7 @@ static void lower_uldc(L *l, const Insn *x, uint32_t op) {
 static void lower_s2r(L *l, const Insn *x, uint32_t op) {
     uint32_t sr = bits(x, 72, 8), rd = bits(x, 16, 8);
     if (x->w[1] || (x->w[2] & 0xffff00ffu)) return (void)fail(l, "S2R mode");
-    uint32_t target = op == 0x9c3 ? ur(l, rd) : rd;
+    uint32_t target = op == 0x9c3 ? ur_dst(l, rd) : rd;
     if (sr == 132) return mov_imm(l, target, 0x00010100);           // SR_VARIABLE_RATE: 1x1 shading
     if (!(sr == 0 || (sr >= 17 && sr <= 19) || (sr >= 29 && sr <= 35) || (sr >= 37 && sr <= 39) || (sr >= 56 && sr <= 60)))
         return (void)fail(l, "special register");
@@ -1452,7 +1770,7 @@ static void lower_fswzadd(L *l, const Insn *x) {
 // R2UR (0x1c2): the uniform takes the register's value (the first active lane's on the console; every lane holds
 // the same value where the compiler relies on it, so a move stands in).
 static void lower_r2ur(L *l, const Insn *x) {
-    uint32_t target = ur(l, bits(x, 16, 8));
+    uint32_t target = ur_dst(l, bits(x, 16, 8));
     if (x->w[1] || x->w[2] != 0x000e0000u) return (void)fail(l, "R2UR mode");
     if (target != RZ) mov_reg(l, target, bits(x, 24, 8));
 }
@@ -1468,7 +1786,7 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     int has_c = 1;
     switch (base_op) {
     case 0x086: {                                             // VOTEU: ballot into a uniform register, UPn output
-        uint32_t target = ur(l, bits(x, 16, 8)), pout = bits(x, 81, 3);
+        uint32_t target = ur_dst(l, bits(x, 16, 8)), pout = bits(x, 81, 3);
         if (x->w[1] || bits(x, 72, 2) > 2 || (x->w[2] & ~0x078e0300u) || bits(x, 24, 8)) return (void)fail(l, "VOTEU mode");
         emit(l, 0x50d8000000000000ull | l->pred | target | ((uint64_t)bits(x, 87, 4) << 39) | ((uint64_t)up(l, pout) << 45) |
                     ((uint64_t)bits(x, 72, 2) << 48));
@@ -1476,21 +1794,21 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     }
     case 0x08c: {                                             // UISETP: predicates are uniform ones
         Insn y = *x;
-        y.w[0] = (x->w[0] & 0xffffu) | (ur(l, bits(x, 24, 8)) << 24);
-        if (form == 1) y.w[1] = (x->w[1] & ~0xffu) | ur(l, bits(x, 32, 8));
+        y.w[0] = (x->w[0] & 0xffffu) | (ur_in(l, bits(x, 24, 8), 5) << 24);
+        if (form == 1) y.w[1] = (x->w[1] & ~0xffu) | ur_in(l, bits(x, 32, 8), 6);
         y.w[2] = (x->w[2] & ~0x27fu & ~(0x7fu << 17)) | (up(l, bits(x, 68, 3)) << 4) | (up(l, bits(x, 81, 3)) << 17) |
                  (up(l, bits(x, 84, 3)) << 20) | (up(l, bits(x, 87, 3)) << 23);
         return lower_isetp(l, &y);
     }
     case 0x087: {                                             // USEL: the condition is a uniform predicate
         Insn y = *x;
-        y.w[0] = (x->w[0] & 0xffffu) | (ur(l, bits(x, 16, 8)) << 16) | (ur(l, bits(x, 24, 8)) << 24);
-        if (form == 1) y.w[1] = (x->w[1] & ~0xffu) | ur(l, bits(x, 32, 8));
+        y.w[0] = (x->w[0] & 0xffffu) | (ur_dst(l, bits(x, 16, 8)) << 16) | (ur_in(l, bits(x, 24, 8), 5) << 24);
+        if (form == 1) y.w[1] = (x->w[1] & ~0xffu) | ur_in(l, bits(x, 32, 8), 6);
         y.w[2] = (x->w[2] & ~(0x7u << 23) & ~(1u << 27)) | (up(l, bits(x, 87, 3)) << 23);
         return lower_sel(l, &y, 0);
     }
     case 0x082:                                               // UMOV: register (0xc82, UR at 32-37) or immediate (0x882)
-        if (bits(x, 16, 8) == 63 || (bits(x, 16, 8) < 63 && l->ur_def[bits(x, 16, 8)].kind == 2)) return;   // URZ, or forwarded
+        if (bits(x, 16, 8) == 63 || !ur_has_reg(l, bits(x, 16, 8))) return;   // URZ, or every use forwards
         if (op == 0x882) return mov_imm(l, ur(l, bits(x, 16, 8)), x->w[1]);
         if (op == 0xc82) return mov_reg(l, ur(l, bits(x, 16, 8)), ur_in(l, bits(x, 32, 6), 5));
         return (void)fail(l, "UMOV form");
@@ -1510,7 +1828,15 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
     }
     Insn y = *x;
     int one_source = plain == 0x100 || plain == 0x101 || plain == 0x109;
-    y.w[0] = (x->w[0] & 0xffffu & ~0x1ffu) | plain | (ur(l, bits(x, 16, 8)) << 16) |
+    uint32_t dst = bits(x, 16, 8);
+    if (plain == 0x025) {                                     // a pair: both registers, or neither (dropped)
+        if (!ur_has_reg(l, dst) && !ur_has_reg(l, dst + 1) && bits(x, 81, 6) == 0x3f) return;
+        if (!ur_has_reg(l, dst) || !ur_has_reg(l, dst + 1)) return (void)fail(l, "uniform pair half without a register");
+        if (ur(l, dst + 1) != ur(l, dst) + 1) return (void)fail(l, "uniform pair not adjacent");
+    } else if (!ur_has_reg(l, dst) && bits(x, 81, 6) == 0x3f && dst != 63) {
+        return;                                               // never read, no carry out: nothing to compute
+    }
+    y.w[0] = (x->w[0] & 0xffffu & ~0x1ffu) | plain | (ur_dst(l, dst) << 16) |
              ((one_source ? 0 : ur_in(l, bits(x, 24, 8), 5)) << 24);
     if (form == 1) y.w[1] = (x->w[1] & ~0xffu) | ur_in(l, bits(x, 32, 8), 6);
     if (has_c) y.w[2] = (x->w[2] & ~0xffu) | ur_in(l, bits(x, 64, 8), 7);
@@ -1806,6 +2132,12 @@ static void lower_bra(L *l, const Insn *x) {
         if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
         p = (uint64_t)pc << 16;
     }
+    if ((uint64_t)t / 16 == l->index && p == ((uint64_t)7 << 16)) {
+        // The compiler's sentinel after the last EXIT, an unconditional branch to itself: an end here (the
+        // translator's decoder rejects the self-loop when it follows a split block).
+        emit(l, 0xe30000000007000full);
+        return;
+    }
     reloc(l, (uint32_t)(t / 16));
     emit(l, 0xe24000000000000full | p);
 }
@@ -1977,6 +2309,7 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
     L l = {0};
     l.stage = c.stage;
     l.graphics = c.stage != 5;
+    l.control = control, l.ctl_size = c.size, l.c1 = code + c.c1_off, l.c1_len = c.c1_len;
     uint32_t header = l.graphics ? SM86_HEADER : 0;
     l.in = (const Insn *)(code + header);
     l.n = (c.code_end - header) / 16;
@@ -1984,10 +2317,27 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
     l.first_out = calloc(l.n + 1, sizeof *l.first_out);
     if (!l.first_out) { snprintf(out->error, sizeof out->error, "out of memory"); return 0; }
     scan_registers(&l);
+    int blocks = build_blocks(&l);
+    if (!blocks) free(l.leader), l.leader = NULL;              // a jump table without its record: no local forwarding
     scan_uniform(&l);
+    if (l.scratch_base + NSCRATCH > 255 && blocks && !l.failed) {
+        // No room above the program's registers: scratch comes from the registers dead at each instruction.
+        l.liveness = compute_liveness(&l);
+        if (!l.liveness) free(l.live_out), l.live_out = NULL;
+    }
     for (l.index = 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
+        if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
+        if (l.liveness) scratch_at(&l, l.index);
         lower_one(&l, &l.in[l.index]);
+        int pair;
+        uint8_t kind, bank;
+        uint32_t value;
+        uint32_t w = ur_write(&l.in[l.index], &pair, &kind, &bank, &value);
+        if (w < 63) {
+            l.cur_def[w].kind = kind, l.cur_def[w].bank = bank, l.cur_def[w].value = value;
+            if (pair && w + 1 < 63) l.cur_def[w + 1].kind = kind == 1 ? 1 : 3, l.cur_def[w + 1].bank = bank, l.cur_def[w + 1].value = value + 4;
+        }
     }
     l.first_out[l.n] = l.nout;
     if (!l.failed) emit(&l, 0xe30000000007000full);          // a branch past the end lands on an EXIT
@@ -2048,6 +2398,6 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
         out->error_offset = header + l.error_index * 16;
         sm86_lower_free(out);
     }
-    free(l.out), free(l.first_out), free(l.reloc);
+    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out);
     return !l.failed;
 }

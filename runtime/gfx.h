@@ -101,6 +101,8 @@ uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);   // Output Locations (VS varyings, FS colour targets)
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]);     // CS: the LocalSize execution mode; 1, 1, 1 otherwise
+// OoT: the lowered program's constant bank 1 (its jump tables, moved to the Maxwell code), NULL without one.
+const uint8_t *gfx_shader_c1(const GfxShader *s, uint32_t *len);
 
 // ---- back end (gfx_null.c, vk_*.c). Called by the NVN front end (nvn_api_*.c, nvn_ext.c) on guest threads.
 typedef struct {

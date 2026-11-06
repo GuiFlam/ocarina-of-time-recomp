@@ -582,16 +582,17 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             int st = nvn_stage(bd->stage);
             const uint8_t *ctl, *code;
             uint32_t len = 0, c1 = 0;
-            if (vk_exec_find_stage(ex->prog, st, &ctl, &code, &len)) memcpy(&c1, ctl + 0x700, 4);
-            if (st == 0 && ctl) {   // the control section's vertex attribute table (dword 0x7f8 count, bytes from 0x804)
-                sp(b, "    vs control 0x7f0..0x810:");
-                for (int k = 0x7f0; k < 0x810; k++) sp(b, " %02x", ctl[k]);
+            uint32_t c1_len = 0;
+            if (vk_exec_find_stage(ex->prog, st, &ctl, &code, &len)) memcpy(&c1, ctl + 0x40, 4), memcpy(&c1_len, ctl + 0x3c, 4);
+            if (st == 0 && ctl) {   // the NVN2 control section's fixed part (docs/phase3.md)
+                sp(b, "    vs control 0x00..0xe0:");
+                for (int k = 0; k < 0xe0; k++) sp(b, "%s%02x", k % 32 ? " " : "\n      ", ctl[k]);
                 sp(b, "\n");
             }
-            sp(b, "    %s c1 (compiler constants): %u bytes", stn[st], c1 < len ? len - c1 : 0);
+            sp(b, "    %s c1 (jump tables, as the game holds them): %u bytes", stn[st], c1 < len ? c1_len : 0);
             if (c1 < len) {
                 const float *f = (const float *)(code + c1);
-                for (uint32_t k = 0; k < 4 && (k + 1) * 16 <= len - c1; k++)
+                for (uint32_t k = 0; k < 4 && (k + 1) * 16 <= c1_len; k++)
                     sp(b, "%s[%u] %g %g %g %g", k % 4 ? " " : "\n      ", k, f[4 * k], f[4 * k + 1], f[4 * k + 2], f[4 * k + 3]);
             }
             sp(b, "\n");

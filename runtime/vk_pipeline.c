@@ -3353,12 +3353,12 @@ void vk_pipeline_shutdown(void) {
     ReleaseSRWLockExclusive(&P.lock);
 }
 
-// ---- self-test: census shaders (build/v121/shaders, tools/shader_census.py) through gfx_shader_get into pipelines.
+// ---- self-test: census shaders (build/v131072/shaders, tools/shader_census.py) through gfx_shader_get into pipelines.
 // Graphics pairs are a fragment shader and a vertex shader of the same source file, spread over the census; compute
 // shaders are spread the same way. Every pipeline is built twice (the second call must hit the cache) and the
 // dynamic state of the first graphics pipeline is recorded into a throwaway command buffer.
 
-typedef struct { const char *key, *c1, *src; size_t c1_len, src_len; int stage; uint32_t local[3]; } CensusEntry;
+typedef struct { const char *key, *src; size_t src_len; int stage; uint32_t local[3]; } CensusEntry;   // OoT: programs.json
 
 static const char *st_field(const char *from, const char *to, const char *name, size_t *len) {
     char pat[32];
@@ -3383,7 +3383,7 @@ static int census_cmp(const void *x, const void *y) {
 
 static char *census_read(const char *root, size_t *size) {
     char path[MAX_PATH * 2 + 64];
-    snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\jobs.json", root);
+    snprintf(path, sizeof path, "%s\\build\\v131072\\shaders\\programs.json", root);
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -3396,17 +3396,17 @@ static char *census_read(const char *root, size_t *size) {
     return b;
 }
 
+// programs.json: `"<key>": {` then the fields one per line; stages other than vs, ps and cs are left out.
 static int census_parse(const char *jobs, CensusEntry *out, int max) {
     int n = 0;
-    for (const char *p = jobs; n < max && (p = strstr(p, "\"job\": {")); p += 8) {
-        const char *end = strstr(p, "\"origin\": ");
-        if (!end) break;
-        size_t kl, sl, cl, rl;
-        const char *k = st_field(p, end, "key", &kl), *s = st_field(p, end, "stage", &sl), *c = st_field(p, end, "c1", &cl),
-                   *r = st_field(p, end, "source", &rl);
-        if (!k || !s || !c || !r || kl != 64) continue;
+    for (const char *p = jobs; n < max && (p = strstr(p, "\": {")); p += 4) {
+        const char *end = strstr(p, "\n}");
+        if (!end || p - jobs < 65 || p[-65] != '"') continue;
+        size_t sl, rl;
+        const char *s = st_field(p, end, "stage", &sl), *r = st_field(p, end, "source", &rl);
+        if (!s || !r || sl != 2 || (strncmp(s, "vs", 2) && strncmp(s, "ps", 2) && strncmp(s, "cs", 2))) continue;
         CensusEntry *e = &out[n++];
-        e->key = k, e->c1 = c, e->c1_len = cl / 2, e->src = r, e->src_len = rl;
+        e->key = p - 64, e->src = r, e->src_len = rl;
         e->stage = !strncmp(s, "vs", sl) ? GFX_STAGE_VS : !strncmp(s, "ps", sl) ? GFX_STAGE_FS : GFX_STAGE_CS;
         e->local[0] = e->local[1] = e->local[2] = 1;
         const char *l = strstr(p, "\"local\": [");
@@ -3421,32 +3421,33 @@ static int census_parse(const char *jobs, CensusEntry *out, int max) {
     return n;
 }
 
-static int hexv(char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; }
-
-// The program the game would hand NVN for a census entry, translated with default answers (as gfx_shader_probe.c).
-static const GfxShader *census_shader(const char *root, const CensusEntry *e) {
+static uint8_t *census_file(const char *root, const char *dir, const char *key, const char *ext, size_t *size) {
     char path[MAX_PATH * 2 + 128];
-    static uint8_t c1[8192];
-    uint8_t control[0x880] = {0};
-    if (e->c1_len > sizeof c1) return NULL;
-    for (size_t b = 0; b < e->c1_len; b++) c1[b] = (uint8_t)(hexv(e->c1[b * 2]) << 4 | hexv(e->c1[b * 2 + 1]));
-    snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\code\\%.64s.code", root, e->key);
+    snprintf(path, sizeof path, "%s\\build\\v131072\\shaders\\%s\\%.64s.%s", root, dir, key, ext);
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
-    long body = ftell(f);
+    long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    size_t skip = e->stage == GFX_STAGE_CS ? 0 : 0x30, total = skip + (size_t)body;
-    uint8_t *code = calloc(1, total);
-    int ok = code && fread(code + skip, 1, (size_t)body, f) == (size_t)body;
+    uint8_t *b = calloc(1, (size_t)n + 0x400);   // a control is read through 0x400 bytes
+    int ok = b && fread(b, 1, (size_t)n, f) == (size_t)n;
     fclose(f);
-    if (!ok) return free(code), NULL;
-    uint32_t c1_off = (uint32_t)(total - e->c1_len), length = (uint32_t)total;
-    memcpy(control + 0x700, &c1_off, 4), memcpy(control + 0x704, &length, 4);
+    if (!ok) return free(b), NULL;
+    *size = (size_t)n;
+    return b;
+}
+
+// The program the game hands NVN for a census entry (control section and code block as the archive holds them),
+// translated with default answers (as gfx_shader_probe.c).
+static const GfxShader *census_shader(const char *root, const CensusEntry *e) {
+    size_t ctl_size, code_size;
+    uint8_t *control = census_file(root, "ctl", e->key, "ctl", &ctl_size);
+    uint8_t *code = control ? census_file(root, "code", e->key, "code", &code_size) : NULL;
+    if (!code) return free(control), NULL;
     GfxShaderAnswers a = {0};
-    if (e->stage == GFX_STAGE_CS) for (int k = 0; k < 3; k++) a.local[k] = (uint16_t)e->local[k];
-    const GfxShader *s = gfx_shader_get(e->stage, control, code, total, c1, &a);
-    free(code);
+    if (e->stage == GFX_STAGE_CS) for (int k = 0; k < 3; k++) a.local[k] = (uint16_t)(e->local[k] ? e->local[k] : 1);
+    const GfxShader *s = gfx_shader_get(e->stage, control, code, code_size, NULL, &a);
+    free(code), free(control);
     return s;
 }
 
@@ -3457,7 +3458,7 @@ static int census_root(char *root, size_t n) {
     for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
         *cut = 0;
         char p[MAX_PATH * 2 + 40];
-        snprintf(p, sizeof p, "%s\\build\\v121\\shaders\\jobs.json", exe);
+        snprintf(p, sizeof p, "%s\\build\\v131072\\shaders\\programs.json", exe);
         if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return snprintf(root, n, "%s", exe) < (int)n;
     }
     return 0;
@@ -3517,8 +3518,8 @@ int vk_pipeline_selftest(void) {
     enum { MAXN = 20000, WANT_PAIRS = 64, WANT_CS = 16 };
     char root[MAX_PATH * 2];
     if (!vk_init() || !ensure_init()) { printf("vk_pipeline selftest: FAILED: no Vulkan device\n"); return 1; }
-    if (!census_root(root, sizeof root)) {   // TotK's shader census (tools/shader_census.py), which FE3H does not carry
-        printf("vk_pipeline selftest: skipped: build/v121/shaders/jobs.json (the TotK census) is not present\n");
+    if (!census_root(root, sizeof root)) {   // the shader census (tools/shader_census.py)
+        printf("vk_pipeline selftest: skipped: build/v131072/shaders/programs.json (the shader census) is not present\n");
         return 0;
     }
     size_t size;

@@ -4,6 +4,42 @@ Hand-off written 2026-11-05 at commit `b46d663`, for a fresh session. Read `CLAU
 history is in `docs/plan.md` (Phases 0 to 2 and the NVN2 survey). This file says where the port stands, exactly what
 blocks it, what is already measured, and the order to do the work in.
 
+## Status (2026-11-05, later the same day)
+
+Steps 1 to 3 of the order of work below are done; step 4 is at 86% of the corpus; step 5 is where the work is.
+
+- The translator builds (`build/xlate/oot_xlate.exe`, `python tools/build_xlate.py` from the Windows venv, 20 s).
+  `tools/xlate/Program.cs` now echoes the job's `c1` into the `.res.json` (the host binds the lowered jump tables).
+- `tools/shader_census.py` (NVN2 version; `python3.14`, Linux) reads the archives and writes
+  `build/v131072/shaders/{ctl,code}/<key>`, `programs.json` and `opcodes.txt`: 14,363 programs (10,994 pixel, 3,106
+  vertex, 251 compute, 9 mesh, 3 task) from the four `Shader/*.bfsha.zs`, the `Layout2Shader` bfsha and the two agl
+  `.sharcb` of the ApplicationPackage sarc; the ExeFS modules hold none. `--lower` builds `runtime/sm86_lower.c` with
+  gcc (`tools/sm86_lower_main.c`) and lowers every program, grouping the failures with the failing instruction in
+  `lowered.txt`; `--translate` runs the translator over the lowered ones through WSL interop (`failures.txt`).
+  `tools/sm86_dis.py <key>` lists a program's fields. The corpus is regenerated from the RomFS in 2 min; later runs
+  reuse `programs.json` (`--extract` reads the archives again).
+- The control section's fields are settled (the table below, columns "Reading", and `sm86_control_parse`): size at
+  `+0xd4` (the BNSH archives repeat it at `+0x30` and `+0x98`, the agl packages leave those 0), instruction end at
+  `+0x38`, jump-table constants at `+0x40` with their length at `+0x3c`, code size at `+0x44`, the stage at byte
+  `+0x56` (NVN's enum plus 6 task, 7 mesh), the compute workgroup size at `+0x58`; the tail past `+0xe0` holds a u32
+  count and 16-byte records `{BRX instruction offset, entry count, 0x10000, byte offset of the table in c1}`.
+  Graphics code starts with the 0x80-byte Turing+ header, whose first 0x50 bytes are the Maxwell header the
+  translator reads. The early-fragment-tests flag is not identified (candidates: `+0xa4` bits 0 and 8).
+- `runtime/sm86_lower.c` lowers 13,444 of 14,363 programs (93.6%). Registers: the lowering's uniform registers
+  and scratch live above the program's own; a uniform register loaded by a single direct `ULDC` (or `UMOV`), or by
+  one earlier in the same basic block, is forwarded as that constant and needs no register; when the program leaves
+  no room, a liveness analysis over the basic blocks (`insn_regs`, exact destination widths, reads over-stated only
+  for texture coordinates) finds scratch among the registers dead at each instruction and a uniform register's
+  register among those dead over its span. Uniform predicates take free predicates, or are swapped through a
+  register around each instruction naming them. What is left: 656 vertex shaders (skinning: up to 247 registers
+  live at once, no adjacent pair free where a load needs one), the surface stores (`SUST`, 86 compute programs),
+  `ISBERD`/`ISBEWR` (task and mesh stages), a few rare forms (`lowered.txt`).
+- The host (`runtime/gfx_shader.c`, `vk_exec_draw.c`, `vk_dump.c`, the shader probe and the pipeline self-test)
+  reads the NVN2 control through `sm86_control_parse`, hashes the control section (its own size) and the whole code
+  block for the cache key (`KEY_VERSION` 5, `IN_VERSION` 2, `PRG_VERSION` 2), lowers before translating, and binds
+  the lowered program's c1 (`gfx_shader_c1`, uploaded once per shader) as uniform slot 1 instead of the game's, since
+  the jump tables' targets moved with the code.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485

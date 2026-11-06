@@ -116,6 +116,9 @@ static struct {
     VkBuffer c0_buf[3];
     VkDeviceSize c0_off[3];
     int c0_valid[3];
+    VkBuffer c1_buf[3];                 // the lowered constant bank 1 of the shader c1_of[k] (OoT, ubo_info)
+    VkDeviceSize c1_off[3], c1_size[3];
+    const GfxShader *c1_of[3];
     struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; } c0_in[3];   // what vk_c0_fill read for c0[k]
     VkPipelineLayout ds_layout;          // graphics layout the sets below were last pushed or bound with
     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
@@ -601,14 +604,15 @@ void vk_exec_image_gone(VkImage image) {
 typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; } ShaderEnt;
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
+// OoT: NVN2 control sections (sm86_lower.h): the stage at byte +0x56, the code block's size at +0x44.
+static const GfxShader *C1CUR[6];                           // the shader shader_for last resolved per NVN stage
+
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
         const uint8_t *c = p->sd[i].control;
         if (!c || !p->sd[i].data) continue;
-        uint32_t st;
-        memcpy(&st, c + 0x714, 4);
-        if ((int)st != nvn_stage) continue;
-        memcpy(len, c + 0x704, 4);
+        if (c[0x56] != nvn_stage) continue;
+        memcpy(len, c + 0x44, 4);
         *ctl = c, *code = (const uint8_t *)(uintptr_t)p->sd[i].data;
         return 1;
     }
@@ -630,9 +634,8 @@ int vk_exec_find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, cons
         for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
             const uint8_t *c = p->sd[i].control;
             if (!c || !p->sd[i].data) continue;
-            uint32_t st;
-            memcpy(&st, c + 0x714, 4);
-            if (st < 6 && m->idx[st] < 0) m->idx[st] = (int8_t)i, memcpy(&m->len[st], c + 0x704, 4);
+            uint32_t st = c[0x56];
+            if (st < 6 && m->idx[st] < 0) m->idx[st] = (int8_t)i, memcpy(&m->len[st], c + 0x44, 4);
         }
     }
     int i = m->idx[nvn_stage];
@@ -729,7 +732,7 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
     else
         for (int k = 0; k < 3; k++) {
             uint32_t l;
-            memcpy(&l, ctl + 0x748 + 4 * k, 4);
+            memcpy(&l, ctl + 0x58 + 4 * k, 4);
             a->local[k] = (uint16_t)(l ? l : 1);
         }
     typeof(AC[0]) *c = &AC[st];
@@ -787,7 +790,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                 memmove(&set[1], &set[0], w * sizeof *set);
                 set[0] = hit;
             }
-            return set[0].s;
+            return C1CUR[st] = set[0].s;
         }
     }
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : GFX_STAGE_CS;
@@ -795,7 +798,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
     if (pending && *pending) return NULL;
-    if (s) slot_mask_learn(serial, st, s);
+    if (s) slot_mask_learn(serial, st, s), C1CUR[st] = s;
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
                       (unsigned long long)serial);
     else if (set) {   // in front, the least recently used way drops out
@@ -938,13 +941,21 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
     uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
     VkDescriptorBufferInfo bi;
     if (slot == 0 && c0_on()) return c0_info(ex, st);
-    if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
-        const uint8_t *ctl, *code;
-        uint32_t len, c1;
-        if (vk_exec_find_stage(ex->prog, st, &ctl, &code, &len)) {
-            memcpy(&c1, ctl + 0x700, 4);
-            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, 0, &bi))
-                return bi;
+    if (slot == 1 && ex->prog) {
+        // The compiler's constant bank 1 (the jump tables, in the code block): the lowered program's copy, whose
+        // branch targets were moved with the code (gfx_shader_c1), uploaded once per shader and stage.
+        const GfxShader *s = C1CUR[st];
+        uint32_t n = 0;
+        const uint8_t *c1 = s ? gfx_shader_c1(s, &n) : NULL;
+        if (c1 && n) {
+            int k = st == NVN_STAGE_VS ? 0 : st == NVN_STAGE_FS ? 1 : 2;
+            if (B.c1_of[k] != s || !B.c1_buf[k]) {
+                uint64_t size = (n + 255) & ~255ull;
+                uint8_t *dst = scratch(ex, size, &B.c1_buf[k], &B.c1_off[k]);
+                memcpy(dst, c1, n), memset(dst + n, 0, size - n);
+                B.c1_of[k] = s, B.c1_size[k] = size;
+            }
+            return (VkDescriptorBufferInfo){B.c1_buf[k], B.c1_off[k], B.c1_size[k]};
         }
     } else if (slot >= 3 && slot - 3 < 18) {
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
@@ -2488,10 +2499,8 @@ static SRWLOCK combo_lock = SRWLOCK_INIT;
 static const NVNshaderData *stage_entry(const prog_t *p, int st) {
     for (uint32_t i = 0; p && i < p->nstage && i < 6; i++) {
         const uint8_t *c = p->sd[i].control;
-        uint32_t s;
         if (!c || !p->sd[i].data) continue;
-        memcpy(&s, c + 0x714, 4);
-        if ((int)s == st) return &p->sd[i];
+        if (c[0x56] == st) return &p->sd[i];
     }
     return NULL;
 }
