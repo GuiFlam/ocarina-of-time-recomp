@@ -179,7 +179,7 @@ Open: the frame rate (21 fps in the cinematic: the emulated kernels, and the dec
 start-up crash, now about one run in two (the SDK abort in MultiWait, see the previous section); the 656 skinning
 vertex shaders the lowering refuses; the mesh stages. The game has not yet been taken past the cinematic.
 
-## Status (2026-11-07): the title screen as the player sees it
+## Status (2026-11-06, late night): the title screen as the player sees it
 
 Watched with sound for the first time (the user), three things looked wrong. All three are settled:
 
