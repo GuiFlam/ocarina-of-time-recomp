@@ -2639,8 +2639,8 @@ static uint32_t *ind_map, ind_next;
 typedef struct { uint32_t slot; char hex[17]; } IndRead;
 static void ind_read(void *arg) {
     IndRead *r = arg;
-    static volatile LONG n;
-    if (InterlockedIncrement(&n) <= 200) {
+    static int n;
+    if (__atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 200) {
         const uint32_t *v = ind_map + 4 * r->slot;
         const uint32_t *lim = vk_ctx()->props.limits.maxComputeWorkGroupCount;
         rt_log("vk_exec: OOT_IND_LOG: indirect dispatch of %s: %u x %u x %u groups%s", r->hex, v[0], v[1], v[2],
