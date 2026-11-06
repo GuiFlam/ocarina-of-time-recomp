@@ -61,6 +61,235 @@ void plat_thread_detach(PlatThread *t) {
     t->h = NULL;
 }
 
+// From totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_thread_new_ex,
+// plat_thread_spawn); kernel.c's CreateThread with a reserved stack, moved here.
+PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+    t->h = CreateThread(NULL, stack ? stack : PLAT_STACK_DEFAULT, thread_main, t,
+                        CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t->h) { free(t); return NULL; }
+    if (name) {
+        wchar_t w[64];
+        if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(t->h, w);
+    }
+    ResumeThread(t->h);
+    return t;
+}
+
+int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = plat_thread_new_ex(fn, arg, name, stack);
+    if (t) plat_thread_detach(t);
+    return t != NULL;
+}
+
+uint64_t plat_thread_cpu_ns(uint32_t tid) {
+    HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    FILETIME a, b, k, u;
+    uint64_t ns = 0;
+    if (th && GetThreadTimes(th, &a, &b, &k, &u))
+        ns = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime)) *
+             100;
+    if (th) CloseHandle(th);
+    return ns;
+}
+
+// kernel.c's host_stack for the thread dump (OOT_THREAD_DUMP), moved here: suspended, the thread's context is read and
+// unwound with ntdll's unwinder (no dbghelp, so no loader lock while it is suspended; a leaf frame without unwind data
+// pops its return address).
+int plat_stack_walk(uint32_t tid, uint64_t *frames, int max) {
+    if (!tid || tid == plat_thread_id()) return 0;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) return 0;
+    int n = 0;
+    if (SuspendThread(h) != (DWORD)-1) {
+        CONTEXT ctx;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(h, &ctx)) {
+            for (; n < max && ctx.Rip; ) {
+                frames[n++] = ctx.Rip;
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                if (!fn) {
+                    if (IsBadReadPtr((const void *)(uintptr_t)ctx.Rsp, 8)) break;
+                    ctx.Rip = *(const DWORD64 *)(uintptr_t)ctx.Rsp;
+                    ctx.Rsp += 8;
+                } else {
+                    PVOID handler = NULL;
+                    DWORD64 est = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &handler, &est, NULL);
+                }
+            }
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return n;
+}
+
+
+// ---- thread interruption: SuspendThread, Get/SetThreadContext, ResumeThread (kernel.c's ap_try, moved here; the
+// structure is totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1).
+struct PlatIntr {
+    CONTEXT ctx;   // first: CONTEXT wants 16-byte alignment
+    HANDLE h;
+};
+
+PlatIntr *plat_intr_self(void) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                          FALSE, GetCurrentThreadId());
+    PlatIntr *t = h ? _aligned_malloc(sizeof *t, 16) : NULL;
+    if (!t) {
+        if (h) CloseHandle(h);
+        return NULL;
+    }
+    t->h = h;
+    return t;
+}
+
+void plat_intr_free(PlatIntr *t) {
+    if (!t) return;
+    CloseHandle(t->h);
+    _aligned_free(t);
+}
+
+int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp) {
+    if (SuspendThread(t->h) == (DWORD)-1) return 0;
+    memset(&t->ctx, 0, sizeof t->ctx);
+    t->ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;   // set back whole, so the kernel restores every GPR
+    if (!GetThreadContext(t->h, &t->ctx)) {
+        ResumeThread(t->h);
+        return 0;
+    }
+    *rip = t->ctx.Rip;
+    *rsp = t->ctx.Rsp;
+    return 1;
+}
+
+int plat_intr_resume(PlatIntr *t, uint64_t to) {
+    int ok = 1;
+    if (to) {
+        t->ctx.Rip = to;
+        ok = SetThreadContext(t->h, &t->ctx) != 0;
+    }
+    ResumeThread(t->h);
+    return ok;
+}
+
+// ---- fibers: Windows fibers with FIBER_FLAG_FLOAT_SWITCH (the MXCSR and x87 control word switch with them).
+// From totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_fiber_*); kernel.c's
+// CreateFiberEx with the 64 KiB commit and its ConvertThreadToFiberEx, moved here.
+struct PlatFiber {
+    void *h;
+    void (*fn)(void *arg);
+    void *arg;
+};
+
+static __thread PlatFiber self_fiber;
+
+PlatFiber *plat_fiber_self(void) {
+    self_fiber.h = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
+    return self_fiber.h ? &self_fiber : NULL;
+}
+
+void plat_fiber_unself(void) {
+    ConvertFiberToThread();
+    self_fiber.h = NULL;
+}
+
+static void WINAPI fiber_start(void *p) {
+    PlatFiber *f = p;
+    f->fn(f->arg);
+}
+
+PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
+    PlatFiber *f = malloc(sizeof *f);
+    if (!f) return NULL;
+    f->fn = fn, f->arg = arg;
+    f->h = CreateFiberEx(0x10000, stack, FIBER_FLAG_FLOAT_SWITCH, fiber_start, f);
+    if (!f->h) {
+        free(f);
+        return NULL;
+    }
+    return f;
+}
+
+void plat_fiber_switch(PlatFiber *to) { SwitchToFiber(to->h); }
+
+void plat_fiber_free(PlatFiber *f) {
+    if (!f) return;
+    DeleteFiber(f->h);
+    free(f);
+}
+
+// plat_jmp_save / plat_jmp_go: PlatJmp holds rbx, rbp, rdi, rsi, r12-r15, the caller's rsp and the return address at
+// 0..72, MXCSR at 80, the x87 control word at 84 and xmm6-xmm15 from 96, the Win64 callee-saved state. Both are leaf
+// code that does not move rsp before it leaves, so they need no unwind data. Copied from totk-pc-recomp
+// runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1; they replace kernel.c's non-SEH setjmp and
+// longjmp (__USE_MINGW_SETJMP_NON_SEH), whose buffer the C runtime's longjmp can refuse under Control Flow Guard.
+_Static_assert(sizeof(PlatJmp) == 256 && __builtin_offsetof(PlatJmp, xmm) == 96, "plat_jmp_save layout");
+__asm__(".text\n"
+        ".globl plat_jmp_save\n"
+        ".def plat_jmp_save; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "plat_jmp_save:\n"
+        "    movq %rbx, 0(%rcx)\n"
+        "    movq %rbp, 8(%rcx)\n"
+        "    movq %rdi, 16(%rcx)\n"
+        "    movq %rsi, 24(%rcx)\n"
+        "    movq %r12, 32(%rcx)\n"
+        "    movq %r13, 40(%rcx)\n"
+        "    movq %r14, 48(%rcx)\n"
+        "    movq %r15, 56(%rcx)\n"
+        "    leaq 8(%rsp), %rdx\n"   // the caller's rsp after this call returns
+        "    movq %rdx, 64(%rcx)\n"
+        "    movq (%rsp), %rdx\n"
+        "    movq %rdx, 72(%rcx)\n"
+        "    stmxcsr 80(%rcx)\n"
+        "    fnstcw 84(%rcx)\n"
+        "    movdqu %xmm6, 96(%rcx)\n"
+        "    movdqu %xmm7, 112(%rcx)\n"
+        "    movdqu %xmm8, 128(%rcx)\n"
+        "    movdqu %xmm9, 144(%rcx)\n"
+        "    movdqu %xmm10, 160(%rcx)\n"
+        "    movdqu %xmm11, 176(%rcx)\n"
+        "    movdqu %xmm12, 192(%rcx)\n"
+        "    movdqu %xmm13, 208(%rcx)\n"
+        "    movdqu %xmm14, 224(%rcx)\n"
+        "    movdqu %xmm15, 240(%rcx)\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        ".globl plat_jmp_go\n"
+        ".def plat_jmp_go; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "plat_jmp_go:\n"
+        "    movq 0(%rcx), %rbx\n"
+        "    movq 8(%rcx), %rbp\n"
+        "    movq 16(%rcx), %rdi\n"
+        "    movq 24(%rcx), %rsi\n"
+        "    movq 32(%rcx), %r12\n"
+        "    movq 40(%rcx), %r13\n"
+        "    movq 48(%rcx), %r14\n"
+        "    movq 56(%rcx), %r15\n"
+        "    ldmxcsr 80(%rcx)\n"
+        "    fldcw 84(%rcx)\n"
+        "    movdqu 96(%rcx), %xmm6\n"
+        "    movdqu 112(%rcx), %xmm7\n"
+        "    movdqu 128(%rcx), %xmm8\n"
+        "    movdqu 144(%rcx), %xmm9\n"
+        "    movdqu 160(%rcx), %xmm10\n"
+        "    movdqu 176(%rcx), %xmm11\n"
+        "    movdqu 192(%rcx), %xmm12\n"
+        "    movdqu 208(%rcx), %xmm13\n"
+        "    movdqu 224(%rcx), %xmm14\n"
+        "    movdqu 240(%rcx), %xmm15\n"
+        "    movq 64(%rcx), %rsp\n"
+        "    movl $1, %eax\n"
+        "    jmpq *72(%rcx)\n");
+
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     return (uint64_t)SetThreadAffinityMask(t ? t->h : GetCurrentThread(), (DWORD_PTR)mask);
 }
@@ -136,6 +365,23 @@ uint64_t plat_now_ns(void) {
 
 static __thread HANDLE sleep_timer;
 static __thread int sleep_timer_tried;
+
+// A waitable timer per thread, kept until exit: the high-resolution kind (Windows 10 1803+), else a plain one. kernel.c's
+// SleepThread used the same, one handle per guest thread, closed when the thread ended.
+static __thread HANDLE wait_timer;
+
+void plat_wait_ns(uint64_t ns) {
+    if (!wait_timer) {
+        wait_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!wait_timer) wait_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }
+    LARGE_INTEGER due;
+    uint64_t units = ns / 100 + (ns % 100 != 0);   // 100 ns units, rounded up
+    due.QuadPart = -(LONGLONG)(units > 0 ? units : 1);
+    if (wait_timer && SetWaitableTimer(wait_timer, &due, 0, NULL, NULL, FALSE))
+        WaitForSingleObject(wait_timer, INFINITE);
+    else Sleep((DWORD)((ns + 999999) / 1000000));
+}
 
 void plat_sleep_ns(uint64_t ns) {
     uint64_t end = plat_now_ns() + ns;
@@ -435,6 +681,24 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)addr, out, n, &got) && got == n;
+}
+
+void *plat_aligned_alloc(size_t size, size_t align) { return _aligned_malloc(size, align); }
+void plat_aligned_free(void *p) { _aligned_free(p); }
+
+// From totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1.
+uintptr_t plat_exe_base(void) { return (uintptr_t)GetModuleHandleW(NULL); }
+
+int plat_module_of(uintptr_t addr, char *name, size_t cap, uintptr_t *base) {
+    HMODULE m = NULL;
+    wchar_t w[WPATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)addr, &m) ||
+        !m || !GetModuleFileNameW(m, w, WPATH))
+        return 0;
+    const wchar_t *n = wcsrchr(w, L'\\') ? wcsrchr(w, L'\\') + 1 : w;
+    *base = (uintptr_t)m;
+    return WideCharToMultiByte(CP_UTF8, 0, n, -1, name, (int)cap, NULL, NULL) != 0;
 }
 
 int plat_exe_path(char *out, size_t cap) {

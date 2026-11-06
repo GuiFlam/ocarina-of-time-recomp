@@ -1,4 +1,4 @@
-// From totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), adapted to this project's platform.h, which is smaller than TotK's: the functions it declares only. Copied from TotK, with the reader-writer lock (plat_mutex_lock_shared, and the exclusive lock now shares its word with it), the virtual memory functions with the write watch (userfaultfd write protection and PAGEMAP_SCAN, and the page-state table) and the write-fault hook (here a SIGSEGV handler that only runs the hook; TotK's crash hooks are left out), and the write-watch ABI block. Left out: fibers, thread interruption, the crash hook, IPC, restart and the TotK-only helpers. plat_thread_detach frees its PlatThread (TotK keeps it), and plat_lib_open leaves the name's search to dlopen.
+// From totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), adapted to this project's platform.h, which is smaller than TotK's: the functions it declares only. Copied from TotK, with the reader-writer lock (plat_mutex_lock_shared, and the exclusive lock now shares its word with it), the virtual memory functions with the write watch (userfaultfd write protection and PAGEMAP_SCAN, and the page-state table) and the write-fault hook (here a SIGSEGV handler that only runs the hook; TotK's crash hooks are left out), and the write-watch ABI block. Added later for runtime/kernel.c, from the same commit: thread stacks of a given size, thread interruption, fibers, plat_wait_ns, aligned memory and module lookup. Left out: the crash hook, IPC, restart and the TotK-only helpers. plat_thread_detach frees its PlatThread (TotK keeps it), and plat_lib_open leaves the name's search to dlopen.
 // Linux implementation of platform.h: pthreads, CLOCK_MONOTONIC, futex locks and condition variables, POSIX files,
 // /proc and sysfs for the load counters, posix_spawn for child processes.
 #define _GNU_SOURCE
@@ -101,7 +101,7 @@ static void *thread_main(void *p) {
     return NULL;
 }
 
-PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
+static PlatThread *thread_create(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
     struct ThreadStart *s = calloc(1, sizeof *s);
     PlatThread *t = calloc(1, sizeof *t);
     if (!s || !t) {
@@ -112,12 +112,32 @@ PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
     s->fn = fn;
     s->arg = arg;
     if (name) snprintf(s->name, sizeof s->name, "%s", name);
-    if (pthread_create(&t->t, NULL, thread_main, s)) {
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    // The stack is mapped lazily, as Windows reserves it: only the pages a thread touches cost memory.
+    if (stack) pthread_attr_setstacksize(&a, stack);
+    int e = pthread_create(&t->t, &a, thread_main, s);
+    pthread_attr_destroy(&a);
+    if (e) {
         free(s);
         free(t);
         return NULL;
     }
     return t;
+}
+
+PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) { return thread_create(fn, arg, name, 0); }
+
+// Adapted from totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_thread_new_ex,
+// plat_thread_spawn).
+PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    return thread_create(fn, arg, name, stack ? stack : PLAT_STACK_DEFAULT);
+}
+
+int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = plat_thread_new_ex(fn, arg, name, stack);
+    if (t) plat_thread_detach(t);
+    return t != NULL;
 }
 
 void plat_thread_join(PlatThread *t) {
@@ -204,6 +224,220 @@ uint32_t plat_thread_id(void) {
     return tid;
 }
 
+// The first field of /proc/self/task/<tid>/schedstat is the time the thread has run, in ns. From totk-pc-recomp
+// runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_thread_cpu_ns).
+uint64_t plat_thread_cpu_ns(uint32_t tid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%u/schedstat", tid);
+    FILE *f = fopen(path, "r");
+    unsigned long long ns = 0;
+    if (f) {
+        if (fscanf(f, "%llu", &ns) != 1) ns = 0;
+        fclose(f);
+    }
+    return ns;
+}
+
+// No unwinder here: kernel.c's thread dump falls back to the instruction pointer plat_intr_stop reads.
+int plat_stack_walk(uint32_t tid, uint64_t *frames, int max) {
+    (void)tid, (void)frames, (void)max;
+    return 0;
+}
+
+// ---- thread interruption: a signal handshake in place of Windows' SuspendThread / Get/SetThreadContext. From
+// totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (PlatIntr and plat_intr_*),
+// adapted: the handler stores the interrupted rsp too, and the signal is real-time signal SIGRTMIN + 4.
+// The caller moves the handle from IDLE to REQ and signals the thread. The thread's handler stores where it was and
+// moves REQ to STOPPED, then spins until the caller moves it on to GO (with the redirect in to), changes its own
+// return context, and goes back to IDLE. A caller that sees no STOPPED within INTR_WAIT_NS (the thread is blocked in
+// the kernel and runs no handler) takes REQ back to IDLE; a handler that then finds IDLE returns at once.
+enum { INTR_IDLE, INTR_REQ, INTR_STOPPED, INTR_GO };
+#define INTR_WAIT_NS 200000u
+
+struct PlatIntr {
+    pthread_t pt;
+    volatile int32_t state;
+    uint64_t rip, rsp, to;
+};
+
+static __thread PlatIntr *intr_me;
+static int intr_sig;
+
+static void intr_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si;
+    int saved_errno = errno;
+    PlatIntr *t = intr_me;
+    ucontext_t *u = uc;
+    if (t) {
+        t->rip = (uint64_t)u->uc_mcontext.gregs[REG_RIP];
+        t->rsp = (uint64_t)u->uc_mcontext.gregs[REG_RSP];
+        int32_t req = INTR_REQ;
+        if (__atomic_compare_exchange_n(&t->state, &req, INTR_STOPPED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_GO) spin_pause();
+            if (t->to) u->uc_mcontext.gregs[REG_RIP] = (greg_t)t->to;
+            __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+        }
+    }
+    errno = saved_errno;
+}
+
+PlatIntr *plat_intr_self(void) {
+    static PlatMutex install = PLAT_MUTEX_INIT;
+    if (!__atomic_load_n(&intr_sig, __ATOMIC_ACQUIRE)) {
+        plat_mutex_lock(&install);
+        if (!intr_sig) {
+            int sig = SIGRTMIN + 4;   // glibc keeps the first real-time signals for itself; SIGRTMIN skips them
+            struct sigaction sa = {.sa_sigaction = intr_handler, .sa_flags = SA_SIGINFO | SA_RESTART};
+            sigemptyset(&sa.sa_mask);
+            if (!sigaction(sig, &sa, NULL)) __atomic_store_n(&intr_sig, sig, __ATOMIC_RELEASE);
+        }
+        plat_mutex_unlock(&install);
+    }
+    if (!intr_sig) return NULL;
+    PlatIntr *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->pt = pthread_self();
+    intr_me = t;
+    return t;
+}
+
+// Called by the thread itself as it ends, or by another once the thread no longer runs.
+void plat_intr_free(PlatIntr *t) {
+    if (!t) return;
+    if (intr_me == t) intr_me = NULL;
+    free(t);
+}
+
+int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp) {
+    int32_t idle = INTR_IDLE;
+    if (!__atomic_compare_exchange_n(&t->state, &idle, INTR_REQ, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    if (pthread_kill(t->pt, intr_sig)) {
+        __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+        return 0;
+    }
+    uint64_t end = plat_now_ns() + INTR_WAIT_NS;
+    while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_STOPPED) {
+        if (plat_now_ns() < end) {
+            spin_pause();
+            continue;
+        }
+        int32_t req = INTR_REQ;
+        if (__atomic_compare_exchange_n(&t->state, &req, INTR_IDLE, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    }
+    *rip = t->rip;
+    *rsp = t->rsp;
+    return 1;
+}
+
+int plat_intr_resume(PlatIntr *t, uint64_t to) {
+    t->to = to;
+    __atomic_store_n(&t->state, INTR_GO, __ATOMIC_RELEASE);
+    return 1;
+}
+
+// ---- fibers: a stack switch of our own. From totk-pc-recomp runtime/platform/linux.c @
+// 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_fiber_*), copied. glibc's swapcontext saves and restores the signal
+// mask with a system call on every switch, and the game switches fibers often. fiber_swap saves the callee-saved
+// registers, the MXCSR and the x87 control word on the current stack, stores the stack pointer in *save and loads the
+// other one. A new fiber's stack is laid out as fiber_swap leaves one, returning into fiber_entry, which realigns the
+// stack and calls fn(arg) (r12 and r13).
+struct PlatFiber {
+    void *sp;
+    void *stack;   // mapped stack (NULL for a thread's own context)
+    size_t size;
+};
+
+void plat_fiber_swap(void **save, void *load);
+void plat_fiber_entry(void);
+__asm__(".text\n"
+        ".globl plat_fiber_swap\n"
+        ".type plat_fiber_swap, @function\n"
+        ".p2align 4\n"
+        "plat_fiber_swap:\n"
+        "    .cfi_startproc\n"
+        "    pushq %rbp\n"
+        "    pushq %rbx\n"
+        "    pushq %r12\n"
+        "    pushq %r13\n"
+        "    pushq %r14\n"
+        "    pushq %r15\n"
+        "    subq $16, %rsp\n"
+        "    stmxcsr 8(%rsp)\n"
+        "    fnstcw (%rsp)\n"
+        "    movq %rsp, (%rdi)\n"
+        "    movq %rsi, %rsp\n"
+        "    fldcw (%rsp)\n"
+        "    ldmxcsr 8(%rsp)\n"
+        "    addq $16, %rsp\n"
+        "    popq %r15\n"
+        "    popq %r14\n"
+        "    popq %r13\n"
+        "    popq %r12\n"
+        "    popq %rbx\n"
+        "    popq %rbp\n"
+        "    ret\n"
+        "    .cfi_endproc\n"
+        ".size plat_fiber_swap, .-plat_fiber_swap\n"
+        ".globl plat_fiber_entry\n"
+        ".type plat_fiber_entry, @function\n"
+        ".p2align 4\n"
+        "plat_fiber_entry:\n"
+        // fiber_swap's ret lands here with rsp = top - 8, as at the entry of a called function. The call below must
+        // be made with rsp 16-byte aligned so that fn starts with rsp = 8 mod 16, as the System V ABI demands.
+        "    andq $-16, %rsp\n"
+        "    movq %r13, %rdi\n"
+        "    callq *%r12\n"
+        "    ud2\n"
+        ".size plat_fiber_entry, .-plat_fiber_entry\n");
+
+static __thread PlatFiber *fiber_cur;
+static __thread PlatFiber fiber_own;
+
+PlatFiber *plat_fiber_self(void) {
+    fiber_own = (PlatFiber){0};
+    fiber_cur = &fiber_own;
+    return &fiber_own;
+}
+
+void plat_fiber_unself(void) { fiber_cur = NULL; }
+
+PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
+    PlatFiber *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    // Reserved, not committed; the lowest page stays inaccessible, so an overflow faults instead of corrupting.
+    void *m = mmap(NULL, stack, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
+    if (m == MAP_FAILED) {
+        free(f);
+        return NULL;
+    }
+    mprotect(m, 4096, PROT_NONE);
+    f->stack = m, f->size = stack;
+    uint64_t *top = (uint64_t *)(((uintptr_t)m + stack) & ~(uintptr_t)15);
+    uint64_t *sp = top - 10;   // fpu state (2 words), r15, r14, r13, r12, rbx, rbp, return address, padding
+    sp[0] = 0x037f;            // x87 control word: the default
+    sp[1] = 0x1f80;            // MXCSR: the default
+    sp[2] = sp[3] = 0;         // r15, r14
+    sp[4] = (uint64_t)(uintptr_t)arg;   // r13
+    sp[5] = (uint64_t)(uintptr_t)fn;    // r12
+    sp[6] = sp[7] = 0;         // rbx, rbp
+    sp[8] = (uint64_t)(uintptr_t)plat_fiber_entry;
+    sp[9] = 0;
+    f->sp = sp;
+    return f;
+}
+
+void plat_fiber_switch(PlatFiber *to) {
+    PlatFiber *from = fiber_cur;
+    fiber_cur = to;   // on this thread; the switch back into from sets it on whichever thread that is
+    plat_fiber_swap(&from->sp, to->sp);
+}
+
+void plat_fiber_free(PlatFiber *f) {
+    if (!f) return;
+    if (f->stack) munmap(f->stack, f->size);
+    free(f);
+}
+
 // ---- time
 
 uint64_t plat_now_ns(void) {
@@ -224,6 +458,12 @@ void plat_sleep_ns(uint64_t ns) {
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
     }
     while (plat_now_ns() < end) sched_yield();
+}
+
+// From totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_wait_ns).
+void plat_wait_ns(uint64_t ns) {
+    struct timespec ts = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
 }
 
 // ---- locks: a reader-writer lock in one 32-bit word, zero when free. Adapted from totk-pc-recomp runtime/platform/linux.c
@@ -683,6 +923,28 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
     }
     closedir(d);
     return 1;
+}
+
+// From totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_aligned_alloc,
+// plat_aligned_free, plat_exe_base, plat_module_of).
+void *plat_aligned_alloc(size_t size, size_t align) {
+    void *p = NULL;
+    return posix_memalign(&p, align < sizeof(void *) ? sizeof(void *) : align, size) ? NULL : p;
+}
+
+void plat_aligned_free(void *p) { free(p); }
+
+uintptr_t plat_exe_base(void) {
+    Dl_info d;
+    return dladdr((void *)plat_exe_base, &d) ? (uintptr_t)d.dli_fbase : 0;
+}
+
+int plat_module_of(uintptr_t addr, char *name, size_t cap, uintptr_t *base) {
+    Dl_info d;
+    if (!dladdr((void *)addr, &d) || !d.dli_fname) return 0;
+    const char *n = strrchr(d.dli_fname, '/');
+    *base = (uintptr_t)d.dli_fbase;
+    return snprintf(name, cap, "%s", n ? n + 1 : d.dli_fname) < (int)cap;
 }
 
 int plat_exe_path(char *out, size_t cap) {
