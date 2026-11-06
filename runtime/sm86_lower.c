@@ -2214,6 +2214,12 @@ static void lower_p2r_r2p(L *l, const Insn *x, int r2p) {
 // both outputs: 114 of the 256 tables. (Before 2026-11-06 the outer slot held a while the tables were matched with c
 // outer, so an asymmetric table such as (a & b) | c came out as (c & b) | a.) 0: no PSETP computes it.
 static int plop3_psetp(L *l, uint32_t pd, uint32_t lut, const uint32_t in[3]) {
+    // An input that is PT (7) or !PT (15) is a constant: only the table rows where it has that value count, so a table
+    // of two inputs (a ^ b with c = PT, the usual 0x28) matches the three-input forms that agree on those rows.
+    uint32_t care = 0xff;
+    for (uint32_t v = 0; v < 8; v++)
+        for (int i = 0; i < 3; i++)
+            if ((in[i] & 7) == 7 && ((v >> (2 - i) & 1) != !(in[i] >> 3))) care &= ~(1u << v);
     for (int z = 0; z < 3; z++) {
         int x = z == 0 ? 1 : 0, y = z == 2 ? 1 : 2;
         for (uint32_t n = 0; n < 8; n++)
@@ -2226,7 +2232,7 @@ static int plop3_psetp(L *l, uint32_t pd, uint32_t lut, const uint32_t in[3]) {
                             uint32_t ab = (op == 0 ? u[x] & u[y] : op == 1 ? u[x] | u[y] : u[x] ^ u[y]) ^ inv;
                             t |= (op2 == 0 ? ab & u[z] : op2 == 1 ? ab | u[z] : ab ^ u[z]) << v;
                         }
-                        if (t != lut) continue;
+                        if ((t ^ lut) & care) continue;
                         uint32_t neg[3] = {n >> 2 & 1, n >> 1 & 1, n & 1};
                         uint32_t px = in[x] ^ (neg[x] << 3), py = in[y] ^ (neg[y] << 3), pz = in[z] ^ (neg[z] << 3);
                         uint64_t dst = inv ? (uint64_t)pd | (7ull << 3) : 7ull | ((uint64_t)pd << 3);
