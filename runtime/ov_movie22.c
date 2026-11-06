@@ -7,11 +7,12 @@
 // and the library's object is never touched (its constructor, destructor and Finalize are replaced as well).
 //
 // Video is decoded on the host with dav1d (the game's movies are AV1: the title screen is "video/av01" 1920x1080 at
-// 60 fps, 321 samples per loop, build/logs/run-64.log), on the thread that calls DecodeAsync, into the VideoFrames
-// the game registered; audio is still dropped (a null decoder: the stream is taken, and the registered frame comes
-// back once with its end-of-stream state set when the end-of-stream buffer arrives). The events the game waits on
-// (input ready, output ready, format changed) are real nn::os system events, created and signalled through the SDK's
-// own functions on the calling guest thread.
+// 60 fps, 321 samples per loop, build/logs/run-64.log), on a host thread per decoder (decode_thread), into the
+// VideoFrames the game registered, and handed back on the playback clock (acquire). No movie of this game has an audio
+// track (no run has created an AudioDecoder); one would get a null decoder: the stream is taken, and the registered
+// frame comes back once with its end-of-stream state set when the end-of-stream buffer arrives. The events the game
+// waits on (input ready, output ready, format changed) are interprocess nn::os system events, created through the
+// SDK on the calling guest thread, whose kernel events any host thread can signal.
 //
 // The game's protocol (OoT 1.1.1, main+0x3b5f0c4): C1, Initialize(work memory, size, mime type, output format, codec
 // mode), Configure(MediaProperty, codec data, size), the three event getters, RegisterVideoFrame(frames, count),
@@ -71,6 +72,14 @@ typedef struct {
     int64_t last_pts;
     int eos_pending;                     // audio: the registered frame comes back once as end of stream
     int warned;
+    int64_t pace_pts; uint64_t pace_ns;  // pacing log: the picture time stamp and host time at the last line
+    uint64_t skipped, pace_skipped, decode_ns, pace_decode_ns;
+    int64_t clock_pts; uint64_t clock_ns;  // playback clock: the picture time stamp shown at host time clock_ns
+    HANDLE worker;                       // the host thread that runs dav1d (decode_thread)
+    CONDITION_VARIABLE wake;             // under lock: a sample queued, a ring slot freed, or quit
+    SRWLOCK dav_lock;                    // held around every dav1d call
+    int quit;
+    uint32_t gen;                        // bumped by Stop/Flush/close: pictures decoded before it are discarded
 } Dec;
 
 static Dec decs[MAX_DECODERS];
@@ -101,15 +110,17 @@ static void guest_init(void) {
 
 #define U(x) ((uint64_t)(uintptr_t)(x))
 
-// nn::os::CreateSystemEvent(event, EventClearMode_AutoClear, false), on the calling guest thread.
+// nn::os::CreateSystemEvent(event, EventClearMode_AutoClear, interprocess) on the calling guest thread, through
+// kern_bind_system_event: an interprocess event is a kernel event whose writable handle the kernel keeps, so the
+// decoding thread (a host thread) can signal the output event when a picture is ready.
 static uint8_t *event_new(Cpu *c) {
     uint8_t *e = calloc(1, SYSEVENT_BYTES);
     if (!e) rt_fatal("movie22: out of memory");
-    rt_call(c, G.create_event, 3, U(e), 1ull, 0ull);
+    kern_bind_system_event(c, U(e), 1);
     return e;
 }
 
-static void event_signal(Cpu *c, const uint8_t *e) { if (e) rt_call(c, G.signal_event, 1, U(e)); }
+static void event_signal(Cpu *c, const uint8_t *e) { (void)c; if (e) kern_signal_system_event(U(e)); }
 
 static Dec *find(uint64_t guest) {
     for (int i = 0; i < MAX_DECODERS; i++)
@@ -130,12 +141,23 @@ static void queue_clear(Dec *d) {
     d->qhead = 0;
 }
 
+// lock held; the worker is stopped first (it takes the lock to finish), so the lock is let go while it ends.
 static void dav_close(Dec *d) {
+    if (d->worker) {
+        d->quit = 1, d->gen++;
+        WakeAllConditionVariable(&d->wake);
+        ReleaseSRWLockExclusive(&lock);
+        WaitForSingleObject(d->worker, INFINITE);
+        AcquireSRWLockExclusive(&lock);
+        CloseHandle(d->worker), d->worker = NULL;
+    }
     ready_clear(d);
     queue_clear(d);
     if (d->dav) dav1d_close(&d->dav);
     free(d->config), d->config = NULL, d->config_len = 0;
 }
+
+static DWORD WINAPI decode_thread(void *arg);
 
 static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
     guest_init();
@@ -159,6 +181,10 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
         s.max_frame_delay = 1;           // every sample's picture comes out at once: the game paces by time stamps
         int r = dav1d_open(&d->dav, &s);
         if (r) rt_log("movie22: dav1d_open failed (%d): the cinematic shows no picture", r);
+        InitializeConditionVariable(&d->wake);
+        InitializeSRWLock(&d->dav_lock);
+        if (d->dav && !(d->worker = CreateThread(NULL, 0, decode_thread, d, 0, NULL)))
+            rt_fatal("movie22: the decoding thread did not start");
     }
     return d;
 }
@@ -255,11 +281,15 @@ static void ov_stop(Cpu *c) {
     if (d) {
         AcquireSRWLockExclusive(&lock);
         d->started = 0;
+        d->gen++;                                            // a picture the worker is decoding now is discarded
         ready_clear(d);
         queue_clear(d);
+        d->clock_ns = 0;                                     // the next picture restarts the playback clock
+        ReleaseSRWLockExclusive(&lock);
+        AcquireSRWLockExclusive(&d->dav_lock);
         if (d->dav) dav1d_flush(d->dav);
         d->config_sent = 0;
-        ReleaseSRWLockExclusive(&lock);
+        ReleaseSRWLockExclusive(&d->dav_lock);
     }
     ret_x(c, 0);
 }
@@ -285,8 +315,10 @@ static void ready_drop_oldest(Dec *d) {
     d->rhead = (d->rhead + 1) % MAX_READY, d->rcount--, d->dropped++;
 }
 
-// Pictures dav1d has finished, into the ready ring (the oldest is dropped when the game is not acquiring).
-static void drain(Dec *d) {
+typedef struct { Dav1dPicture pic[8]; int n; } Out;      // pictures of one sample, from dav1d to the ring
+
+// dav_lock held: the pictures dav1d has finished (max_frame_delay 1 gives one per sample; more than 8 are dropped).
+static void drain(Dec *d, Out *o) {
     for (;;) {
         Dav1dPicture pic;
         memset(&pic, 0, sizeof pic);
@@ -295,14 +327,12 @@ static void drain(Dec *d) {
             if (r != DAV1D_ERR(EAGAIN) && d->warned < 3) d->warned = 3, rt_log("movie22: dav1d_get_picture: %d", r);
             return;
         }
-        if (d->rcount == MAX_READY) ready_drop_oldest(d);
-        Ready *n = &d->ready[(d->rhead + d->rcount) % MAX_READY];
-        n->pic = pic, n->eos = 0;
-        d->rcount++;
+        if (o->n == 8) { dav1d_picture_unref(&pic); d->dropped++; continue; }
+        o->pic[o->n++] = pic;
     }
 }
 
-static void send_data(Dec *d, const uint8_t *p, size_t n, int64_t ts) {
+static void send_data(Dec *d, Out *o, const uint8_t *p, size_t n, int64_t ts) {   // dav_lock held
     Dav1dData data;
     uint8_t *buf = dav1d_data_create(&data, n);
     if (!buf) return;
@@ -311,39 +341,74 @@ static void send_data(Dec *d, const uint8_t *p, size_t n, int64_t ts) {
     for (int tries = 0; tries < 64; tries++) {
         int r = dav1d_send_data(d->dav, &data);
         if (r == 0) break;
-        if (r == DAV1D_ERR(EAGAIN)) { drain(d); continue; }
+        if (r == DAV1D_ERR(EAGAIN)) { drain(d, o); continue; }
         if (d->warned < 3) d->warned = 3, rt_log("movie22: dav1d_send_data: %d", r);
         dav1d_data_unref(&data);
         return;
     }
-    drain(d);
+    drain(d, o);
 }
 
-static void push_eos(Dec *d) {
+static Ready *ring_push(Dec *d) {                            // lock held
     if (d->rcount == MAX_READY) ready_drop_oldest(d);
     Ready *n = &d->ready[(d->rhead + d->rcount) % MAX_READY];
     memset(n, 0, sizeof *n);
-    n->eos = 1;
     d->rcount++;
+    return n;
 }
 
-// Queued samples into dav1d while the ring has room (lock held).
-static void pump(Dec *d) {
-    while (d->dav && d->qcount && room(d)) {
-        Sample *q = &d->queue[d->qhead];
+// The decoding thread (2026-11-06): dav1d ran on the guest threads that called DecodeAsync and AcquireVideoFrame,
+// 15 to 30 ms per picture shown once late pictures were skipped (run-197), in the game's frame. This host thread takes
+// queued samples while the ring has room, decodes them outside the ring lock, puts their pictures in the ring and
+// signals the output event (a kernel event, see event_new). A Stop or Flush meanwhile bumps gen: the pictures of a
+// sample taken before it are discarded.
+static DWORD WINAPI decode_thread(void *arg) {
+    Dec *d = arg;
+    AcquireSRWLockExclusive(&lock);
+    while (!d->quit) {
+        if (!d->qcount || !room(d)) { SleepConditionVariableSRW(&d->wake, &lock, INFINITE, 0); continue; }
+        Sample q = d->queue[d->qhead];
         d->qhead = (d->qhead + 1) % d->qcap, d->qcount--;
-        if (q->eos) {
-            drain(d);
-            push_eos(d);
-            dav1d_flush(d->dav);                             // the next samples start the stream over (the title loop)
-            d->config_sent = 0;
-        } else {
-            if (!d->config_sent && d->config) send_data(d, d->config, d->config_len, INT64_MIN), d->config_sent = 1;
-            send_data(d, q->data, q->size, q->ts);
+        uint32_t gen = d->gen;
+        ReleaseSRWLockExclusive(&lock);
+        Out o;
+        o.n = 0;
+        uint64_t t0 = rt_ticks();
+        AcquireSRWLockExclusive(&d->dav_lock);
+        if (gen == *(volatile uint32_t *)&d->gen) {
+            if (q.eos) {
+                drain(d, &o);
+                dav1d_flush(d->dav);                         // the next samples start the stream over (the title loop)
+                d->config_sent = 0;
+            } else {
+                if (!d->config_sent && d->config) send_data(d, &o, d->config, d->config_len, INT64_MIN), d->config_sent = 1;
+                send_data(d, &o, q.data, q.size, q.ts);
+            }
         }
-        free(q->data), q->data = NULL;
+        ReleaseSRWLockExclusive(&d->dav_lock);
+        uint64_t dt = (rt_ticks() - t0) * 625 / 12;
+        free(q.data);
+        AcquireSRWLockExclusive(&lock);
+        d->decode_ns += dt;
+        int fresh = gen == d->gen;
+        for (int i = 0; i < o.n; i++) {
+            if (fresh) ring_push(d)->pic = o.pic[i];
+            else dav1d_picture_unref(&o.pic[i]);
+        }
+        if (fresh && q.eos) ring_push(d)->eos = 1;
+        if (fresh && d->rcount && d->ev_out) {
+            const uint8_t *ev = d->ev_out;
+            ReleaseSRWLockExclusive(&lock);
+            kern_signal_system_event(U(ev));
+            AcquireSRWLockExclusive(&lock);
+        }
     }
+    ReleaseSRWLockExclusive(&lock);
+    return 0;
 }
+
+// Lock held: the decoding thread looks at the queue again (a sample queued or a ring slot freed).
+static void pump(Dec *d) { if (d->worker) WakeConditionVariable(&d->wake); }
 
 static int enqueue(Dec *d, const uint8_t *p, size_t n, int64_t ts, int eos) {   // lock held
     if (d->qcount == d->qcap) {
@@ -451,9 +516,27 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     AcquireSRWLockExclusive(&lock);
     int i = free_frame(d);
     if (!d->rcount || i < 0) { ReleaseSRWLockExclusive(&lock); ret_x(c, MOVIE_R_NO_FRAME); return; }
+    // The game takes one picture per game frame and does not look at the time stamps, so below 60 fps the movie
+    // played slower (a third of its speed at 20 fps, run-196). Pictures whose successor is already due by the
+    // playback clock are skipped (as far as the ring reaches); end-of-stream entries are never skipped.
+    uint64_t now = rt_ticks() * 625 / 12;
+    while (d->clock_ns && d->rcount >= 2) {
+        Ready *h = &d->ready[d->rhead], *nx = &d->ready[(d->rhead + 1) % MAX_READY];
+        if (h->eos || nx->eos || nx->pic.m.timestamp == INT64_MIN || nx->pic.m.timestamp < d->clock_pts) break;
+        if ((int64_t)(now - d->clock_ns) < nx->pic.m.timestamp - d->clock_pts) break;
+        dav1d_picture_unref(&h->pic);
+        d->rhead = (d->rhead + 1) % MAX_READY, d->rcount--, d->skipped++;
+    }
     Ready r = d->ready[d->rhead];
     d->rhead = (d->rhead + 1) % MAX_READY, d->rcount--;
     d->busy |= 1u << i;
+    if (!r.eos && r.pic.m.timestamp != INT64_MIN) {
+        // (Re)start the clock on the first picture, when the time stamps go back (another movie) and after a stall of
+        // more than half a second (a pause, the window out of focus), so the movie resumes instead of jumping ahead.
+        int64_t ts = r.pic.m.timestamp;
+        if (!d->clock_ns || ts < d->clock_pts || (int64_t)(now - d->clock_ns) - (ts - d->clock_pts) > 500000000)
+            d->clock_pts = ts, d->clock_ns = now;
+    }
     pump(d);                                                 // the slot taken makes room for a queued sample
     int have = d->rcount > 0;
     ReleaseSRWLockExclusive(&lock);
@@ -470,6 +553,15 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     *out = frame;
     if (index) *index = i;
     d->acquired++;
+    if (!r.eos && d->acquired % 300 == 0) {                  // playback speed: time stamps against host time
+        now = rt_ticks() * 625 / 12;
+        if (d->pace_ns && d->last_pts > d->pace_pts)
+            rt_log("movie22: pacing: %llu pictures handed back; the last 300 cover %.2f s of video in %.2f s, %llu "
+                   "skipped, %.1f ms of decoding (on the decoding thread) per picture handed back",
+                   (unsigned long long)d->acquired, (d->last_pts - d->pace_pts) / 1e9, (now - d->pace_ns) / 1e9,
+                   (unsigned long long)(d->skipped - d->pace_skipped), (d->decode_ns - d->pace_decode_ns) / 300e6);
+        d->pace_pts = d->last_pts, d->pace_ns = now, d->pace_skipped = d->skipped, d->pace_decode_ns = d->decode_ns;
+    }
     if (d->acquired <= 2 || r.eos || getenv("OOT_MQ_LOG")) {
         char t[96];
         rt_log("movie22: frame %d handed back (%s, pts %lld ns, %llu buffers in, %d ready) to %s", i, r.eos ? "end of stream" : "picture",
