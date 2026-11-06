@@ -165,6 +165,7 @@ PlatEvent *plat_event_new(void) {
 void plat_event_free(PlatEvent *e) { free(e); }
 
 void plat_event_set(PlatEvent *e) {
+    if (!e) return;   // SetEvent(NULL) did nothing before the events became PlatEvent; callers signal early (vk_headroom.c)
     plat_mutex_lock(&e->m);
     e->set = 1;
     plat_mutex_unlock(&e->m);

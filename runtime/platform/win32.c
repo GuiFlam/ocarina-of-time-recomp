@@ -316,7 +316,7 @@ void plat_event_free(PlatEvent *e) {
     free(e);
 }
 
-void plat_event_set(PlatEvent *e) { SetEvent(e->h); }
+void plat_event_set(PlatEvent *e) { if (e) SetEvent(e->h); }   // as SetEvent(NULL) did before the events became PlatEvent
 
 int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
     uint64_t ms = (ns + 999999) / 1000000;
