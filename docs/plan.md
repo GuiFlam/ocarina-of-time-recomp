@@ -145,7 +145,8 @@ messages, 1,485 file opens, the audio renderer at 48 kHz (12,002 renders in 60 s
 
 **Open: shader translation.** Every program fails with "bad control section" (`gfx_shader.c`): the SM86 control block is
 224 to 280 bytes against Maxwell's 0x880, and the code is Ampere. Draws with failed programs are skipped, and the game
-waits for GPU work that never completes. This is Phase 3: an SM86 front end (see "NVN2 survey").
+waits for GPU work that never completes. This is Phase 3: an SM86 front end (see "NVN2 survey" and `docs/phase3.md`, the
+hand-off with the measured control-section fields and the order of work).
 
 Also met: the C++ unwinder's `nn::ro::detail::FindModuleHeader` reads past `subsdk0`'s image into the unmapped gap
 before `sdk` (`0x70050e0000`) when an exception is thrown; `QueryMemory` should report that gap as free so the walk

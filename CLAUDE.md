@@ -40,7 +40,8 @@ PACIBSP prologue, nn::oe and nn::vi additions in `ov_oot.c`, `nv::InitializeGrap
 `build/extracted/v131072/{exefs,romfs,extraction-manifest.json}`. Logs of runs go to `build/logs/`. Phase 2 (`oot.exe
 --seconds 15`) runs the whole start-up without a crash: audio, saves, NPLN offline, 3,661 shader programs, three frames
 presented; it then stalls because no SM86 shader translates (`docs/plan.md`, "Open: shader translation"), which is
-Phase 3. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the crash dump's memory
+Phase 3: `docs/phase3.md` is the hand-off for it (what blocks, the measured NVN2 control-section fields, the lowering
+approach, the order of work). Start there. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the crash dump's memory
 and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`), `build/logs/nvn-proc-got.json`
 (GOT slot -> proc name, from the loader at `main+0x129e290`).
 
@@ -51,7 +52,8 @@ and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`),
   `tools/requirements.txt`.
 - The dump is 25 GB on the Windows desktop; `config.local.toml` points at it in place rather than copying it.
 - `oot.exe` is a Windows program run from WSL through interop: WSL environment variables do NOT reach it unless named
-  in `WSLENV`. Always run it as `WSLENV=OOT_TRACE:OOT_VOLUME:OOT_APP_POOL OOT_TRACE=gfx build/v131072/oot.exe ...`
+  in `WSLENV`. Always run it as `WSLENV=OOT_TRACE:OOT_VOLUME:OOT_APP_POOL:OOT_CRASH_PEEK:OOT_BREAK_AT:OOT_BREAK_BRIEF:OOT_BREAK_WATCH
+  OOT_TRACE=gfx build/v131072/oot.exe ...`
   (add every `OOT_*` variable used); without it the variable is silently ignored. Half a day of traces in this
   session were empty for this reason.
 - Never commit without the content check passing; never bypass the hook.
