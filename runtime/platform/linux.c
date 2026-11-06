@@ -129,6 +129,12 @@ void plat_thread_detach(PlatThread *t) {
     free(t);
 }
 
+// Thread priority is not changed on Linux (see platform.h): an unprivileged thread cannot raise its priority back.
+void plat_thread_priority(PlatThread *t, int level) {
+    (void)t;
+    (void)level;
+}
+
 // Linux has no process-wide affinity: the mask goes to the thread (or the caller when t is NULL).
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     pthread_t th = t ? t->t : pthread_self();
