@@ -219,7 +219,7 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 
 # Host files with an SDL3 twin (same interface, TotK's *_sdl.c adapted): Linux compiles the twin, Windows the original.
-SDL_TWIN = {'swkbd_win.c': 'swkbd_sdl.c'}
+SDL_TWIN = {'swkbd_win.c': 'swkbd_sdl.c', 'input_win.c': 'input_sdl.c'}
 
 
 def runtime_sources(skip=()):
