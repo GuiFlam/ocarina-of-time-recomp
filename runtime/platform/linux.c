@@ -1370,6 +1370,58 @@ int plat_sha256(const void *data, size_t n, uint8_t out[32]) {
     return 1;
 }
 
+// The streamed form: whole 64-byte blocks go through sha_blocks as they fill, the rest waits in buf for the next piece
+// or for plat_sha256_end, which pads it the way plat_sha256 does.
+struct PlatSha256 {
+    uint32_t h[8];
+    uint8_t buf[64];
+    size_t fill;
+    uint64_t total;
+};
+
+PlatSha256 *plat_sha256_begin(void) {
+    static const uint32_t iv[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    PlatSha256 *s = calloc(1, sizeof *s);
+    if (s) memcpy(s->h, iv, sizeof iv);
+    return s;
+}
+
+int plat_sha256_update(PlatSha256 *s, const void *data, size_t n) {
+    const uint8_t *p = data;
+    s->total += n;
+    if (s->fill) {
+        size_t k = 64 - s->fill < n ? 64 - s->fill : n;
+        memcpy(s->buf + s->fill, p, k);
+        s->fill += k, p += k, n -= k;
+        if (s->fill < 64) return 1;
+        sha_blocks(s->h, s->buf, 1);
+        s->fill = 0;
+    }
+    size_t full = n / 64;
+    sha_blocks(s->h, p, full);
+    p += full * 64, n -= full * 64;
+    memcpy(s->buf, p, n);
+    s->fill = n;
+    return 1;
+}
+
+int plat_sha256_end(PlatSha256 *s, uint8_t out[32]) {
+    uint8_t tail[128] = {0};
+    memcpy(tail, s->buf, s->fill);
+    tail[s->fill] = 0x80;
+    size_t len = s->fill < 56 ? 64 : 128;
+    uint64_t bits = s->total * 8;
+    for (int i = 0; i < 8; i++) tail[len - 1 - i] = (uint8_t)(bits >> (8 * i));
+    sha_blocks(s->h, tail, len / 64);
+    for (int i = 0; i < 8; i++) {
+        out[4 * i] = (uint8_t)(s->h[i] >> 24), out[4 * i + 1] = (uint8_t)(s->h[i] >> 16);
+        out[4 * i + 2] = (uint8_t)(s->h[i] >> 8), out[4 * i + 3] = (uint8_t)s->h[i];
+    }
+    free(s);
+    return 1;
+}
+
 // ---- files and the host file system under the save data (fs_host.c; declared in platform.h). Adapted from
 // totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin
 // Dzerakh): a PlatFile is the descriptor + 1, so descriptor 0 is not NULL.

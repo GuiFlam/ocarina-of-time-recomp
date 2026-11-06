@@ -177,6 +177,13 @@ void plat_thread_priority(PlatThread *t, int level);       // t NULL: the callin
 
 // ---- SHA-256 (FIPS 180-4) of n bytes into out; 1 on success. BCrypt on Windows, portable C on Linux.
 int plat_sha256(const void *p, size_t n, uint8_t out[32]);
+// The same hash fed in pieces, for data too big to hold at once (a 17 GB image): plat_sha256_begin, then _update for
+// each piece in order, then _end, which writes the digest and frees the state. begin returns NULL on failure; update
+// and end return 1 on success. end frees the state whatever it returns.
+typedef struct PlatSha256 PlatSha256;
+PlatSha256 *plat_sha256_begin(void);
+int plat_sha256_update(PlatSha256 *h, const void *p, size_t n);
+int plat_sha256_end(PlatSha256 *h, uint8_t out[32]);
 
 // ---- auto-reset events: a set wakes one waiter, and a set with no waiter stays until the next wait consumes it (Windows:
 // CreateEvent without manual reset). A wait returns 1 when it consumed a set, 0 when its time ran out; ns UINT64_MAX

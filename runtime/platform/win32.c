@@ -1128,6 +1128,44 @@ int plat_sha256(const void *p, size_t n, uint8_t out[32]) {
     return ok;
 }
 
+// The streamed form (moved from romfs.c, where the RomFS hashes its 17 GB image in pieces): a BCrypt hash handle with
+// the algorithm handle opened for it; end closes both.
+struct PlatSha256 {
+    BCRYPT_ALG_HANDLE alg;
+    BCRYPT_HASH_HANDLE h;
+};
+
+PlatSha256 *plat_sha256_begin(void) {
+    PlatSha256 *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    if (BCryptOpenAlgorithmProvider(&s->alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) ||
+        BCryptCreateHash(s->alg, &s->h, NULL, 0, NULL, 0, 0)) {
+        if (s->alg) BCryptCloseAlgorithmProvider(s->alg, 0);
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+int plat_sha256_update(PlatSha256 *s, const void *p, size_t n) {
+    const uint8_t *q = p;
+    while (n) {
+        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
+        if (BCryptHashData(s->h, (PUCHAR)q, k, 0)) return 0;
+        q += k;
+        n -= k;
+    }
+    return 1;
+}
+
+int plat_sha256_end(PlatSha256 *s, uint8_t out[32]) {
+    int ok = BCryptFinishHash(s->h, out, 32, 0) == 0;
+    BCryptDestroyHash(s->h);
+    BCryptCloseAlgorithmProvider(s->alg, 0);
+    free(s);
+    return ok;
+}
+
 // ---- files and the host file system under the save data (fs_host.c; declared in platform.h). The Win32 calls that
 // fs_host.c made before the platform layer existed, moved here with the same flags: every file is opened with all
 // three share modes, a save file is flushed with FlushFileBuffers, and a rename into place is MoveFileEx with
