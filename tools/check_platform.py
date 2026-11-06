@@ -23,6 +23,7 @@ ALLOWED = {
     "input_win.c": "input",
     "prof_win.c": "profiler",
     "rdoc_win.c": "RenderDoc loader",
+    "dpi_probe.c": "DPI probe: its whole body is Win32 DPI, behind _WIN32; other systems get a stub that fails",
     "audren.c": "audio",
     "kernel_probe.c": "probe",
     "nvn_probe.c": "probe",
