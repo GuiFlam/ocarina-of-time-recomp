@@ -162,7 +162,7 @@ void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse afte
 uint64_t mem_shadow_reserve(uint64_t size);               // watched storage below the address limit for a virtual pool
                                                            // mapped from CPU-visible pool memory; 0 when none fits
 int mem_shadow_commit(uint64_t addr, uint64_t size);       // commits pages of it (zeroed)
-void mem_shadow_release(uint64_t addr);                    // releases a reservation
+void mem_shadow_release(uint64_t addr, uint64_t size);       // releases a reservation of size bytes
 
 // ---- modules (loader.c)
 typedef struct {
