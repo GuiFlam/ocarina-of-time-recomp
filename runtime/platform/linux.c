@@ -130,6 +130,45 @@ void plat_thread_detach(PlatThread *t) {
     free(t);
 }
 
+// ---- auto-reset events, on a lock and a condition variable: set is sticky until a wait takes it.
+struct PlatEvent {
+    PlatMutex m;
+    PlatCond c;
+    int set;
+};
+
+PlatEvent *plat_event_new(void) {
+    PlatEvent *e = calloc(1, sizeof *e);
+    return e;
+}
+
+void plat_event_free(PlatEvent *e) { free(e); }
+
+void plat_event_set(PlatEvent *e) {
+    plat_mutex_lock(&e->m);
+    e->set = 1;
+    plat_mutex_unlock(&e->m);
+    plat_cond_signal(&e->c);
+}
+
+int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
+    uint64_t end = ns == UINT64_MAX ? UINT64_MAX : plat_now_ns() + ns;
+    plat_mutex_lock(&e->m);
+    while (!e->set) {
+        if (end == UINT64_MAX) {
+            plat_cond_wait(&e->c, &e->m);
+            continue;
+        }
+        uint64_t now = plat_now_ns();
+        if (now >= end) break;
+        plat_cond_wait_ns(&e->c, &e->m, end - now);   // a spurious wake-up just loops
+    }
+    int got = e->set;
+    e->set = 0;
+    plat_mutex_unlock(&e->m);
+    return got;
+}
+
 // Thread priority is not changed on Linux (see platform.h): an unprivileged thread cannot raise its priority back.
 void plat_thread_priority(PlatThread *t, int level) {
     (void)t;

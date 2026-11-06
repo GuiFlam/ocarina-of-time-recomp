@@ -65,6 +65,36 @@ uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     return (uint64_t)SetThreadAffinityMask(t ? t->h : GetCurrentThread(), (DWORD_PTR)mask);
 }
 
+// ---- auto-reset events
+struct PlatEvent {
+    HANDLE h;
+};
+
+PlatEvent *plat_event_new(void) {
+    PlatEvent *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->h = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!e->h) {
+        free(e);
+        return NULL;
+    }
+    return e;
+}
+
+void plat_event_free(PlatEvent *e) {
+    if (!e) return;
+    CloseHandle(e->h);
+    free(e);
+}
+
+void plat_event_set(PlatEvent *e) { SetEvent(e->h); }
+
+int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
+    uint64_t ms = (ns + 999999) / 1000000;
+    DWORD wait = ns == UINT64_MAX || ms >= INFINITE ? INFINITE : (DWORD)ms;
+    return WaitForSingleObject(e->h, wait) == WAIT_OBJECT_0;
+}
+
 void plat_thread_priority(PlatThread *t, int level) {
     static const int map[] = {THREAD_PRIORITY_IDLE, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
     if ((unsigned)level < 3) SetThreadPriority(t ? t->h : GetCurrentThread(), map[level]);

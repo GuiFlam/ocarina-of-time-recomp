@@ -174,3 +174,12 @@ int plat_random(void *out, size_t n);
 // policy but never raise it back, so a lowered worker would stay low for good.
 enum { PLAT_PRIO_IDLE, PLAT_PRIO_BELOW, PLAT_PRIO_NORMAL };
 void plat_thread_priority(PlatThread *t, int level);       // t NULL: the calling thread
+
+// ---- auto-reset events: a set wakes one waiter, and a set with no waiter stays until the next wait consumes it (Windows:
+// CreateEvent without manual reset). A wait returns 1 when it consumed a set, 0 when its time ran out; ns UINT64_MAX
+// waits without a limit (INFINITE on Windows).
+typedef struct PlatEvent PlatEvent;
+PlatEvent *plat_event_new(void);                          // NULL on failure
+void plat_event_free(PlatEvent *e);
+void plat_event_set(PlatEvent *e);
+int plat_event_wait_ns(PlatEvent *e, uint64_t ns);
