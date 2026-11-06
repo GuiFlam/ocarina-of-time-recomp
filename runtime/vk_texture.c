@@ -202,6 +202,18 @@ static void barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessFlags
 #define ALL_RW VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT
 
 // ---------------------------------------------------------------- images
+// The UNORM sibling of an sRGB colour format (a storage view of it), 0 for the others.
+VkFormat vk_unorm_of_srgb(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    case VK_FORMAT_R8G8_SRGB: return VK_FORMAT_R8G8_UNORM;
+    case VK_FORMAT_R8_SRGB: return VK_FORMAT_R8_UNORM;
+    default: return 0;
+    }
+}
+
 static VkFormatFeatureFlags features_of(VkFormat f) {
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(vk_ctx()->phys, f, &p);
@@ -320,6 +332,15 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     // without that flag, and a view without the usage left the stores on a dummy image (get_view).
     if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && samples == 1) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageCreateFlags flags = ds ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;   // format-reinterpreting views
+    // An sRGB image cannot be a storage image, but OoT's upscaler stores its final 2560x1440 picture into the sRGB
+    // output texture (2026-11-06; a dummy took the stores and the cinematic stayed black). Stored into through a
+    // view of the UNORM sibling: EXTENDED_USAGE lets the usage exceed what the image's own format supports.
+    VkFormat storage_format = 0;
+    if (!(usage & VK_IMAGE_USAGE_STORAGE_BIT) && samples == 1) {
+        VkFormat u = vk_unorm_of_srgb(f.vk);
+        if (u && (features_of(u) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+            storage_format = u, usage |= VK_IMAGE_USAGE_STORAGE_BIT, flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
     // Cube compatible only for cube targets: the replay makes cube views of nothing else (vk_exec_draw.c get_view checks
     // the image's own view type). The flag on every square array of 6+ layers changed how AMD's Windows driver lays such
     // an image out, and terrain material arrays sampled through it came out in rainbow blocks that moved with the mip
@@ -389,6 +410,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->format = f.vk;
     p->type = type;
     p->usage = usage;
+    p->storage_format = storage_format;
     p->aspect = aspect_of(&f);
     p->width = w, p->height = h, p->depth = depth, p->levels = levels, p->layers = layers, p->samples = samples;
     p->view_type = type == VK_IMAGE_TYPE_1D ? (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)

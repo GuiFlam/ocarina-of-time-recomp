@@ -4,7 +4,7 @@
 """Build the shader translator: build/xlate/oot_xlate.exe (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies tools/xlate/patches/*.patch there (tools/vendor stays
-byte-identical; 0001-0004 are MNG's, 0005-0009 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK, the MSVC build
+byte-identical; 0001-0004 are MNG's, 0005-0015 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK, the MSVC build
 tools and vswhere.exe (docs/building.md). Run with .venv.
 
 Next to the exe it writes oot_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
@@ -99,8 +99,8 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 11:
-        sys.exit(f"expected 11 patches, found {len(patches)}")
+    if len(patches) != 15:
+        sys.exit(f"expected 15 patches, found {len(patches)}")
     for patch in patches:
         # git apply works outside a repository when given a directory; --check first so a failure names the patch.
         for extra in (["--check"], []):

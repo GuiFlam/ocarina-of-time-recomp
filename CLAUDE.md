@@ -41,14 +41,17 @@ PACIBSP prologue, nn::oe and nn::vi additions in `ov_oot.c`, `nv::InitializeGrap
 --seconds 15`) runs the whole start-up without a crash: audio, saves, NPLN offline, 3,661 shader programs, three frames
 presented; it then stalls because no SM86 shader translates (`docs/plan.md`, "Open: shader translation"), which is
 Phase 3: `docs/phase3.md` is the hand-off for it (what blocks, the measured NVN2 control-section fields, the lowering
-approach, the order of work). Start there, with its dated Status sections: as of 2026-11-06 the SM86 lowering covers
-94.1% of the corpus, the title cinematic decodes on the host (`runtime/ov_movie22.c`, dav1d) and reaches the GPU as a
-correct RGB frame, the tensor-core shaders (HMMA, LDSM, MOVM) of the video path are emulated by the lowering and
-NVN2's pushed compute constants fill bank 0, and the picture is black because the emulated upscaler's output is
-wrong. Test runs: `scratchpad/bin/run.sh` kills every run; one run in three dies after the first frame (an SDK
-abort in MultiWait, see the docs). Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the crash dump's memory
-and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`), `build/logs/nvn-proc-got.json`
-(GOT slot -> proc name, from the loader at `main+0x129e290`).
+approach, the order of work). Start there, with its dated Status sections: as of the night of 2026-11-06 the SM86
+lowering covers 94.1% of the corpus, the title cinematic decodes on the host (`runtime/ov_movie22.c`, dav1d) and
+plays on screen, upscaled to 2560x1440 by the game's neural network through the emulated tensor-core instructions
+(HMMA, LDSM, MOVM), at 21 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
+(`gfx_shader.c`): bump the latter after a lowering change. Test runs: `scratchpad/bin/run.sh` kills every run; the
+first run after a translator or lowering change spends a minute building the kernels' pipelines (the driver's disk
+cache keeps them); about one run in two dies right after the first frame (an SDK abort in MultiWait, see the docs),
+so run until one survives. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the
+crash dump's memory and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`),
+`build/logs/nvn-proc-got.json` (GOT slot -> proc name, from the loader at `main+0x129e290`), `--probe-tensor` and
+`--probe-cs` (a kernel in isolation), `OOT_DUMP=dispatch`, `OOT_SKIP_DISPATCH_FROM`, `OOT_MQ_LOG`, `OOT_THREAD_DUMP`.
 
 ## Environment notes
 

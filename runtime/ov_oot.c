@@ -10,6 +10,7 @@
 // Each entry names the call that needs it and the game version it was seen in.
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
@@ -298,3 +299,71 @@ static void ov_nsd_resolve(Cpu *c) {
 }
 HOST_OVERRIDE("_ZN2nn3nsd24GetEnvironmentIdentifierEPNS0_21EnvironmentIdentifierE", ov_nsd_environment);
 HOST_OVERRIDE("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", ov_nsd_resolve);
+
+// OOT_MQ_LOG=1 (diagnostic, 2026-11-06): the traffic of nn::os::LightMessageQueue, to see what a thread that polls one
+// with TryReceive in a sleep loop (the main thread after the first video frame, main+0xdd2680) waits for and who
+// should post it. Sends log before the call; receives after, with the message when one arrived.
+static int mq_log_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("OOT_MQ_LOG") != NULL;
+    return on;
+}
+static void mq_send(Cpu *c, const char *what) {
+    if (mq_log_on()) {
+        char t[96], lr[96];
+        rt_log("mq: %s(%#llx, %#llx) by %s from %s", what, (unsigned long long)arg_x(c, 0), (unsigned long long)arg_x(c, 1),
+               kern_thread_describe(t, sizeof t), ldr_describe(c->x[30] - 4, lr, sizeof lr));
+    }
+    rt_original(c);
+}
+static void mq_receive(Cpu *c, const char *what, int try) {
+    uint64_t *out = arg_p(c, 0), q = arg_x(c, 1), lr = c->x[30] - 4;
+    rt_original(c);
+    if (mq_log_on() && (!try || (c->x[0] & 1))) {
+        char t[96], l[96];
+        rt_log("mq: %s(%#llx) -> %#llx by %s from %s", what, (unsigned long long)q, out ? (unsigned long long)*out : 0,
+               kern_thread_describe(t, sizeof t), ldr_describe(lr, l, sizeof l));
+    }
+}
+static void obs_mq_send(Cpu *c) { mq_send(c, "Send"); }
+static void obs_mq_trysend(Cpu *c) { mq_send(c, "TrySend"); }
+static void obs_mq_jam(Cpu *c) { mq_send(c, "Jam"); }
+static void obs_mq_tryjam(Cpu *c) { mq_send(c, "TryJam"); }
+static void obs_mq_receive(Cpu *c) { mq_receive(c, "Receive", 0); }
+static void obs_mq_tryreceive(Cpu *c) { mq_receive(c, "TryReceive", 1); }
+HOST_OBSERVER("_ZN2nn2os21SendLightMessageQueueEPNS0_21LightMessageQueueTypeEm", obs_mq_send);
+HOST_OBSERVER("_ZN2nn2os24TrySendLightMessageQueueEPNS0_21LightMessageQueueTypeEm", obs_mq_trysend);
+HOST_OBSERVER("_ZN2nn2os20JamLightMessageQueueEPNS0_21LightMessageQueueTypeEm", obs_mq_jam);
+HOST_OBSERVER("_ZN2nn2os23TryJamLightMessageQueueEPNS0_21LightMessageQueueTypeEm", obs_mq_tryjam);
+HOST_OBSERVER("_ZN2nn2os24ReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE", obs_mq_receive);
+HOST_OBSERVER("_ZN2nn2os27TryReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE", obs_mq_tryreceive);
+
+// OOT_MQ_LOG=1 also traces nn::os::EventType: the main thread waits on one after the cinematic's second frame pair
+// (WaitEvent from main+0x11e7a6c) and nobody signals it.
+static void ev_log(Cpu *c, const char *what, uint64_t obj, uint64_t lr) {
+    char t[96], l[96];
+    rt_log("ev: %s(%#llx) by %s from %s", what, (unsigned long long)obj, kern_thread_describe(t, sizeof t), ldr_describe(lr, l, sizeof l));
+}
+static void obs_ev_signal(Cpu *c) { if (mq_log_on()) ev_log(c, "Signal", arg_x(c, 0), c->x[30] - 4); rt_original(c); }
+static void obs_ev_clear(Cpu *c) { if (mq_log_on()) ev_log(c, "Clear", arg_x(c, 0), c->x[30] - 4); rt_original(c); }
+static void obs_ev_wait(Cpu *c) {
+    uint64_t obj = arg_x(c, 0), lr = c->x[30] - 4;
+    if (mq_log_on()) ev_log(c, "Wait", obj, lr);
+    rt_original(c);
+    if (mq_log_on()) ev_log(c, "Waited", obj, lr);
+}
+static void obs_ev_timedwait(Cpu *c) {
+    uint64_t obj = arg_x(c, 0), lr = c->x[30] - 4;
+    rt_original(c);
+    if (mq_log_on() && (c->x[0] & 1)) ev_log(c, "TimedWait ok", obj, lr);
+}
+static void obs_ev_trywait(Cpu *c) {
+    uint64_t obj = arg_x(c, 0), lr = c->x[30] - 4;
+    rt_original(c);
+    if (mq_log_on() && (c->x[0] & 1)) ev_log(c, "TryWait ok", obj, lr);
+}
+HOST_OBSERVER("_ZN2nn2os11SignalEventEPNS0_9EventTypeE", obs_ev_signal);
+HOST_OBSERVER("_ZN2nn2os10ClearEventEPNS0_9EventTypeE", obs_ev_clear);
+HOST_OBSERVER("_ZN2nn2os9WaitEventEPNS0_9EventTypeE", obs_ev_wait);
+HOST_OBSERVER("_ZN2nn2os14TimedWaitEventEPNS0_9EventTypeENS_8TimeSpanE", obs_ev_timedwait);
+HOST_OBSERVER("_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE", obs_ev_trywait);

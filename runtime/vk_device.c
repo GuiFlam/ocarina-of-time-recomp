@@ -427,8 +427,19 @@ void vk_device_fault_report(VkResult r) {
     VkDeviceFaultVendorInfoEXT *vi = calloc(n.vendorInfoCount + 1, sizeof *vi);
     VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
     uint64_t binary = n.vendorBinarySize;
-    n.vendorBinarySize = 0;   // the vendor binary is not fetched; its size alone is logged
+    void *blob = binary && binary < (64u << 20) ? malloc((size_t)binary) : NULL;   // the vendor's crash dump, kept as a file
+    if (blob) info.pVendorBinaryData = blob;
+    else n.vendorBinarySize = 0;
     if (q == VK_SUCCESS && ai && vi) q = get(c->device, &n, &info);
+    if (blob && (q == VK_SUCCESS || q == VK_INCOMPLETE)) {
+        char path[MAX_PATH * 3];
+        snprintf(path, sizeof path, "%s", rt_log_path() ? rt_log_path() : "fault.log");
+        char *cut = strrchr(path, '\\');
+        snprintf(cut ? cut + 1 : path, sizeof path - (size_t)(cut ? cut + 1 - path : 0), "fault-vendor.bin");
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(blob, 1, (size_t)n.vendorBinarySize, f); fclose(f); rt_log("vk: device fault vendor binary written to %s", path); }
+    }
+    free(blob);
     if (q != VK_SUCCESS && q != VK_INCOMPLETE) {
         rt_log("vk: device lost; vkGetDeviceFaultInfoEXT failed (%d)", (int)q);
     } else {

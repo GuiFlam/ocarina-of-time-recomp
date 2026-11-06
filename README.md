@@ -11,7 +11,7 @@ core survives a new console generation.
 
 ## Status
 
-As of 2026-11-05 (details and dates in [docs/plan.md](docs/plan.md), the shader work in
+As of 2026-11-06 (details and dates in [docs/plan.md](docs/plan.md), the shader work in
 [docs/phase3.md](docs/phase3.md)):
 
 - The dump extracts (`tools/extract_nup.py`, the Switch 2's `.nup` container and zbic-compressed NSOs), the three
@@ -24,12 +24,12 @@ As of 2026-11-05 (details and dates in [docs/plan.md](docs/plan.md), the shader 
   archives, `runtime/sm86_lower.c` lowers them to Maxwell in front of the unchanged translator (93.6% of the corpus
   lowers, and every lowered program translates), and the host binds the lowered jump tables itself. With that the
   boot logo renders at 60 fps through translated shaders.
-- Where it stops: the title screen, which in this version is a looping cinematic. SDK 22's movie library decodes
-  through console services this host does not serve; `runtime/ov_movie22.c` replaces it and decodes the AV1 stream
-  with dav1d, the frame reaches the GPU and converts to RGB correctly, and the game's neural upscaler, which runs on
-  the Switch 2's tensor cores (HMMA, LDSM, MOVM, emulated in the lowering with shuffles and half-precision FMAs),
-  still produces a black picture from it. That is the next step; after it, the 656 skinning vertex shaders the
-  lowering still refuses (register pressure) and the mesh stages.
+- The title screen, which in this version is a looping cinematic, plays. SDK 22's movie library decodes through
+  console services this host does not serve; `runtime/ov_movie22.c` replaces it and decodes the AV1 stream with
+  dav1d, and the game's neural upscaler, which runs on the Switch 2's tensor cores (HMMA, LDSM, MOVM, emulated in
+  the lowering with shuffles and half-precision FMAs), upscales it to 2560x1440 at 21 fps. Next: the frame rate,
+  the start-up crash that hits about one run in two, the 656 skinning vertex shaders the lowering still refuses
+  (register pressure), the mesh stages, and whatever lies past the cinematic.
 
 Builds run with Windows Python and MSYS2 Clang (`tools/build_game.py`), the shader translator with .NET
 (`tools/build_xlate.py`); see the plan for the set-up.

@@ -534,17 +534,19 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
+    VkFormat vf = storage && img->storage_format ? img->storage_format : img->format;   // sRGB stored through UNORM
+    ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
-                                .format = img->format,
+                                .format = vf,
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                      .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
+                                      .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
+    if (img->block_views || img->storage_format) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
+                                                                     // (vk_texture.c); an sRGB image's STORAGE usage is its UNORM view's
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
     ViewNode *n = malloc(sizeof *n);
@@ -735,6 +737,10 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
             memcpy(&l, ctl + 0x58 + 4 * k, 4);
             a->local[k] = (uint16_t)(l ? l : 1);
         }
+    // The shared memory the kernel may use: the NVN2 control section's field for it is not identified yet (none of
+    // its words matches the kernels' STS/LDS/LDSM use), and 0 loses every shared store, so every compute program
+    // gets Maxwell's and Vulkan's common limit; it costs occupancy, not correctness (2026-11-06, docs/phase3.md).
+    if (st == NVN_STAGE_CS) a->shared_bytes = 0xc000;
     typeof(AC[0]) *c = &AC[st];
     // The generation and tokens are read before the lookups (one that creates an entry changes them) and unlocked: a
     // registration racing with them is ordered after this draw, and a slot stored under older ones is only looked up
@@ -933,6 +939,11 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     }
     for (uint32_t t = 0; t < nt && t < 128 && o + 8 <= VK_C0_BYTES; t++, o += 8) memcpy(bank + o, &ex->tex[NVN_STAGE_CS][t], 8);
     for (uint32_t i = 0; i < ni && i < 32 && o + 8 <= VK_C0_BYTES; i++, o += 8) memcpy(bank + o, &ex->img[NVN_STAGE_CS][i], 8);
+    // Maxwell's tables as well, past the NVN2 layout: the translator's GlobalToStorage fallback searches the storage
+    // table at 0x310 for the base of a global pointer it could not trace to a constant (the kernels' stores through
+    // the address at bank 0 + 0x10), and the uniform table at 0x210 for the blocks read as storage.
+    c0_table(bank + 0x310, ex->ssbo[NVN_STAGE_CS]);
+    c0_table(bank + 0x210, ex->ubo[NVN_STAGE_CS]);
 }
 
 // The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image; -1 outside.
@@ -1897,6 +1908,12 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     if (r->cbuf_slot >= 3 || (r->cbuf_slot == 0 && slot < 0)) h = cbuf_handle(ex, st, r, k);
                     else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+                    {   // OOT_CS_DUMMY_TEX=1 (diagnostic, 2026-11-06): compute shaders read the dummy texture instead of
+                        // the bound ones, to tell a texture read from the rest when a kernel loses the device
+                        static int dummy_cs = -1;
+                        if (dummy_cs < 0) dummy_cs = getenv("OOT_CS_DUMMY_TEX") != NULL;
+                        if (dummy_cs && st == NVN_STAGE_CS && !img) h = 0;
+                    }
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                     // an image the shader stores into: marked written after the lock is released (below)
@@ -2459,6 +2476,12 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+    {   // OOT_SKIP_DISPATCH_FROM=<n> (diagnostic): the n-th and later compute dispatches since boot are not recorded, to
+        // bisect a device loss down to one of the cinematic's upscaler kernels (2026-11-06)
+        static long long skip_from = -2, count;
+        if (skip_from == -2) { const char *e = getenv("OOT_SKIP_DISPATCH_FROM"); skip_from = e ? atoll(e) : -1; }
+        if (skip_from >= 0 && count++ >= skip_from) return;
+    }
     cb_res(ex);
     dummies_init();
     int present;

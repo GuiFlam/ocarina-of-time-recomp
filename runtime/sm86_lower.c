@@ -22,7 +22,8 @@
 // Layout of the output (what Ryujinx's Decoder expects): graphics programs start with the 0x50-byte Maxwell program
 // header, which is the first 0x50 bytes of the 0x80-byte Ampere one (the common words and the input/output maps are
 // laid out alike); instructions follow in groups of three behind a scheduling word (an address that is a multiple
-// of 32 is a scheduling word; they are zero, Ryujinx ignores them). Compute programs start with the first group.
+// of 32 from the first group is a scheduling word; they are zero, Ryujinx ignores them). Compute programs start with
+// the first group; graphics programs' first group follows the header (addr_of).
 // Branch targets are addresses of instructions; a relative branch adds its 24-bit offset to its own address + 8.
 #include "sm86_lower.h"
 
@@ -121,9 +122,12 @@ static int fail(L *l, const char *msg) {
     return 0;
 }
 
-// Address of output instruction k (Maxwell's view: after the header, with a scheduling word at every 32 bytes).
+// Address of output instruction k (Maxwell's view: the scheduling words at every 32 bytes from the first
+// instruction group, which follows the 0x50-byte header of a graphics program directly: Ryujinx Decoder.FillBlock
+// counts from Translator's address + HeaderSize. 2026-11-06: counted from the block start instead, every third
+// instruction of every vertex and fragment shader sat where the decoder skips a scheduling word.)
 static uint32_t addr_of(const L *l, uint32_t k) {
-    return l->graphics ? 0x50 + 8 * k + 8 * ((k + 1) / 3) : 8 + 8 * k + 8 * (k / 3);
+    return (l->graphics ? 0x50 : 0) + 8 + 8 * k + 8 * (k / 3);
 }
 
 static void emit(L *l, uint64_t word) {
@@ -830,7 +834,7 @@ static uint64_t b_slot(L *l, Src s, uint64_t op_r, uint64_t op_c, uint64_t op_i,
 
 static uint64_t base(L *l, uint64_t op, uint32_t rd, uint32_t ra) { return op | l->pred | rd | ((uint64_t)ra << 8); }
 // Maxwell HFMA2 R (Ryujinx InstHfma2R): Rd = a(swizzle) * b + c on half pairs; a swizzle 2 = H0_H0, 3 = H1_H1.
-#define HFMA2_R(rd, ra, aswz, rb, rc) (0x5c80000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20) | \
+#define HFMA2_R(rd, ra, aswz, rb, rc) (0x5d00000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20) | \
                                        ((uint64_t)(rc) << 39) | ((uint64_t)(aswz) << 47))
 static void h2_relu(L *l, uint32_t rd);
 
@@ -1557,9 +1561,10 @@ static void lower_sust(L *l, const Insn *x) {
 // The game's neural upscaler (NDSR) runs on them. The fragment layouts are PTX's (mma.m16n8k16, ldmatrix,
 // movmatrix): lane = 4 * g + t (g = lane >> 2, t = lane & 3); an 8x8 half matrix fragment gives lane the pair
 // (row g, columns 2t and 2t + 1) in one register. Lane constants come from S2R SR_LANEID each time (scratch is per
-// instruction). SHFL.IDX with a register lane and clamp 31 reads another lane's register.
+// instruction). SHFL.IDX with a register lane and clamp 31 reads another lane's register; its validity predicate
+// goes to PT (48-50), not P0, which the program may hold live across the emulated instruction.
 #define SHFL_IDX_R(rd, ra, lane) (0xef10000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(lane) << 20) | \
-                                  ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34))
+                                  ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48))
 #define IADD_IMM(rd, ra, imm) (0x3810000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)((imm) & 0xfffff) << 20))
 #define SHL_IMM(rd, ra, sh) (0x3848000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(sh) << 20))
 #define SHR_IMM(rd, ra, sh) (0x3828000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(sh) << 20))
@@ -1568,6 +1573,11 @@ static void lower_sust(L *l, const Insn *x) {
 #define LDS(rd, ra, off, size) (0xef48000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)((off) & 0xffffff) << 20) | ((uint64_t)(size) << 48))
 #define S2R_LANEID(rd) (0xf0c8000000000000ull | (rd))
 // HFMA2_R (defined with lower_hfma2): Rd = a(swizzle) * b + c on half pairs; a swizzle 2 = H0_H0, 3 = H1_H1.
+
+static int stub_on(const char *what) {   // OOT_SM86_STUB=hmma|ldsm|all (diagnostic): the emulation replaced by zeros, to time the rest
+    const char *e = getenv("OOT_SM86_STUB");
+    return e && (!strcmp(e, what) || !strcmp(e, "all"));
+}
 
 static int overlaps(uint32_t a, uint32_t na, uint32_t b, uint32_t nb) { return a != RZ && b != RZ && a < b + nb && b < a + na; }
 
@@ -1578,6 +1588,7 @@ static int overlaps(uint32_t a, uint32_t na, uint32_t b, uint32_t nb) { return a
 static void lower_ldsm(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), offset = bits(x, 40, 24), count = 1u << bits(x, 72, 2), trans = bits(x, 78, 1);
     if (bits(x, 74, 4) || bits(x, 79, 12) || count > 4 || rd == RZ || rd + count > 255) return (void)fail(l, "LDSM mode");
+    if (stub_on("ldsm")) { for (uint32_t m = 0; m < count; m++) mov_imm(l, rd + m, 0); return; }
     if (bits(x, 91, 1)) {
         uint32_t u = to_reg(l, ur_src(l, bits(x, 32, 6)), 6, 0, 0);
         emit(l, base(l, 0x5c10000000000000ull, S(l, 6), ra) | ((uint64_t)u << 20));
@@ -1623,6 +1634,7 @@ static void lower_hmma(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8), rc = bits(x, 64, 8);
     if (bits(x, 72, 8) != 8 || bits(x, 80, 12) || rd == RZ || ra == RZ || rb == RZ || rd > 253 || ra > 251 || rb > 253 || (rc != RZ && rc > 253))
         return (void)fail(l, "HMMA mode");
+    if (stub_on("hmma")) { mov_imm(l, rd, 0), mov_imm(l, rd + 1, 0); return; }
     if (overlaps(rd, 2, ra, 4)) {                                 // the output reuses A's registers: A to scratch first
         for (uint32_t i = 0; i < 4; i++) mov_reg(l, S(l, 8 + (int)i), ra + i);
         ra = S(l, 8);
@@ -1915,7 +1927,7 @@ static void lower_hfma2(L *l, const Insn *x, uint32_t op) {
         return (void)fail(l, "HFMA2 form");
     }
     if (bits(x, 62, 1) && form != 4) return (void)fail(l, "HFMA2 absolute operand");
-    emit(l, base(l, 0x5c80000000000000ull, rd, a) | ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)c_neg << 30) |
+    emit(l, base(l, 0x5d00000000000000ull, rd, a) | ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)c_neg << 30) |
                 ((uint64_t)(a_neg ^ b_neg) << 31) | ((uint64_t)sat << 32) | ((uint64_t)c_swz << 35) | ((uint64_t)c << 39) |
                 ((uint64_t)a_swz << 47));
     if (relu) h2_relu(l, rd);
@@ -2528,6 +2540,21 @@ static void lower_one(L *l, const Insn *x) {
     uint32_t swap = l->up_swap ? up_fields(x) : 0;
     if (swap) {
         // Save P(mask), load the uniform predicates into them, run the instruction, merge them back, restore.
+        // PLOP3 is the one instruction here with ordinary predicate outputs (and inputs): an output in a swapped
+        // slot is the instruction's result, kept out of the merge and the restore (2026-11-06: the upscaler's
+        // first layer ends its tile loop on PLOP3 P0 = UP0; restoring P0 made the loop run until its counters
+        // wrapped, 2.2 s per dispatch and a GPU timeout in play); an input in one would read the uniform value.
+        uint32_t wr = 0, rd = 0, op = x->w[0] & 0xfff;
+        if (op == 0x81c) {
+            uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), a = bits(x, 87, 3), b = bits(x, 77, 3);
+            if (pd != 7) wr |= 1u << pd;
+            if (pd2 != 7) wr |= 1u << pd2;
+            if (a != 7) rd |= 1u << a;
+            if (b != 7) rd |= 1u << b;
+            if (!bits(x, 67, 1) && bits(x, 68, 3) != 7) rd |= 1u << bits(x, 68, 3);
+            if (rd & swap) return (void)fail(l, "PLOP3 reads the predicate a uniform one is swapped into");
+        }
+        uint32_t keep = swap & ~wr;
         if (!l->up_reg) {
             l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
             if (l->up_reg == NOREG) return (void)fail(l, "no general register free for the uniform predicates");
@@ -2536,8 +2563,10 @@ static void lower_one(L *l, const Insn *x) {
         emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)swap << 20));
         emit(l, 0x38f0000000070000ull | ((uint64_t)l->up_reg << 8) | ((uint64_t)swap << 20));
         lower_one_inner(l, x);
-        emit(l, 0x38e8000000070000ull | l->up_reg | ((uint64_t)l->up_reg << 8) | ((uint64_t)swap << 20));
-        emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)swap << 20));
+        if (keep) {
+            emit(l, 0x38e8000000070000ull | l->up_reg | ((uint64_t)l->up_reg << 8) | ((uint64_t)keep << 20));
+            emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)keep << 20));
+        }
         return;
     }
     lower_one_inner(l, x);

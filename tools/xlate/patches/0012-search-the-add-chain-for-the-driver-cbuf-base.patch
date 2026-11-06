@@ -1,0 +1,97 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -190,6 +190,7 @@
+             public int SbCbOffset { get; }
+             public Operand Offset { get; }
+             public int ConstOffset { get; }
++            public bool SubtractBase { get; }
+ 
+             public SearchResult(int sbCbSlot, int sbCbOffset)
+             {
+@@ -197,12 +198,13 @@
+                 SbCbOffset = sbCbOffset;
+             }
+ 
+-            public SearchResult(int sbCbSlot, int sbCbOffset, Operand offset, int constOffset = 0)
++            public SearchResult(int sbCbSlot, int sbCbOffset, Operand offset, int constOffset = 0, bool subtractBase = false)
+             {
+                 SbCbSlot = sbCbSlot;
+                 SbCbOffset = sbCbOffset;
+                 Offset = offset;
+                 ConstOffset = constOffset;
++                SubtractBase = subtractBase;
+             }
+         }
+ 
+@@ -319,14 +321,14 @@
+ 
+                 bool storageUnaligned = gpuAccessor.QueryHasUnalignedStorageBuffer();
+ 
+-                if (storageUnaligned)
++                if (storageUnaligned || result.SubtractBase)
+                 {
+                     Operand baseAddress = Cbuf(result.SbCbSlot, result.SbCbOffset);
+ 
+                     Operand baseAddressMasked = Local();
+                     Operand hostOffset = Local();
+ 
+-                    int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
++                    int alignment = storageUnaligned ? gpuAccessor.QueryHostStorageBufferOffsetAlignment() : 1;
+ 
+                     Operation maskOp = new(Instruction.BitwiseAnd, baseAddressMasked, baseAddress, Const(-alignment));
+                     Operation subOp = new(Instruction.Subtract, hostOffset, globalAddress, baseAddressMasked);
+@@ -984,6 +986,54 @@
+ 
+         private static SearchResult FindUniqueBaseAddressCb(GtsContext gtsContext, BasicBlock block, Operand globalAddress, bool needsOffset)
+         {
++            SearchResult result = FindUniqueBaseAddressCbDirect(gtsContext, block, globalAddress, needsOffset);
++
++            if (!result.Found)
++            {
++                // Code compiled for SM86 and lowered to Maxwell builds a global address in steps: the base from the
++                // driver reserved constant buffer plus a uniform offset into one register, plus the thread's offset
++                // into another. Search the chain of adds for a word of that buffer; the storage offset is then the
++                // address minus the base, computed at run time (SubtractBase).
++                result = FindBaseAddressInAddChain(block, globalAddress, globalAddress, 8);
++            }
++
++            return result;
++        }
++
++        private static SearchResult FindBaseAddressInAddChain(BasicBlock block, Operand globalAddress, Operand operand, int depth)
++        {
++            operand = Utils.FindLastOperation(operand, block);
++
++            if (operand.Type == OperandType.ConstantBuffer)
++            {
++                if (operand.GetCbufSlot() == DriverReservedCb && (operand.GetCbufOffset() & 1) == 0)
++                {
++                    return new SearchResult(operand.GetCbufSlot(), operand.GetCbufOffset(), globalAddress, 0, subtractBase: true);
++                }
++
++                return SearchResult.NotFound;
++            }
++
++            if (depth == 0 || operand.AsgOp is not Operation addOp || addOp.Inst != Instruction.Add)
++            {
++                return SearchResult.NotFound;
++            }
++
++            for (int index = 0; index < addOp.SourcesCount; index++)
++            {
++                SearchResult result = FindBaseAddressInAddChain(block, globalAddress, addOp.GetSource(index), depth - 1);
++
++                if (result.Found)
++                {
++                    return result;
++                }
++            }
++
++            return SearchResult.NotFound;
++        }
++
++        private static SearchResult FindUniqueBaseAddressCbDirect(GtsContext gtsContext, BasicBlock block, Operand globalAddress, bool needsOffset)
++        {
+             globalAddress = Utils.FindLastOperation(globalAddress, block);
+ 
+             if (globalAddress.Type == OperandType.ConstantBuffer)

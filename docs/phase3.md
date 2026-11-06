@@ -119,9 +119,65 @@ produces a near-constant image and then zeros, so the screen stays black. Found 
   signalled at start-up, to find), and the abort path crashing instead of reporting. `OOT_ASYNC_PREEMPT=0` does not
   prevent it.
 
-Next: find where the upscaler's values go wrong (`OOT_DUMP_BUF` snapshots of its feature-map buffers after each
-pass, the shapes of the HMMA operands against the PTX layouts, the LDSM addresses), then the frame rate (the decode
-on the game's thread and the emulated kernels).
+Next (as of that section): find where the upscaler's values go wrong. Resolved in the section below.
+
+## Status (2026-11-06, night): the cinematic plays
+
+The title cinematic renders: the AV1 frame decoded by dav1d, upscaled to 2560x1440 by the game's neural network
+through the emulated tensor-core instructions, composited with its subtitles (`build/logs/run-184.png`, 27,548
+distinct colours). At 21 fps while the cinematic plays, 60 fps before it. Six distinct defects stood between the
+black picture and this, found one after the other with the tools listed at the end:
+
+- The translator's dead-node removal (`Optimizer.RemoveNode`) followed into any producer whose use count reached
+  zero, even one still live through another destination. SHFL defines a value and a validity predicate; dropping the
+  dead predicate copy stripped the use lists of the shuffle's lane index, and the next pass deleted the index
+  computation: every emulated LDSM and HMMA shuffled from an undefined lane. Patch 0013 follows only into producers
+  that are dead through every destination.
+- PRMT, the byte permute, was an unimplemented logging stub in Ryujinx in every form (R, I, C, Rc). Half the lowered
+  programs use it (packing halves), and the emulation builds every half pair with it. Patch 0014 implements it; a
+  constant selector (the usual case) is resolved at translation time, the half-word packs 0x5410 and 0x7632 to two
+  instructions.
+- With those two fixed the kernels' SPIR-V grew to 16-22 MB (over a million instructions; the NVIDIA driver took 20
+  to 30 s to build each pipeline): every emulated shuffle was a helper-function call with four pointer arguments.
+  Patch 0015 emits SHFL.IDX with the plain mask (clamp 31, no segment) on a 32-lane subgroup as the subgroup shuffle
+  itself, the lane index masked to the subgroup. The pipelines still take 0.5 to 30 s to build the first time (the
+  driver's disk cache keeps them); the emulation's instruction count is the next performance item.
+- The uniform-predicate swap (`sm86_lower.c` lower_one): when a program uses all seven predicates, a uniform
+  predicate is swapped into the predicate of the same number around each instruction naming it, and the game's
+  predicate restored after. The first neural-network layer ends its tile loop on `PLOP3 P0 = UP0`: the restore put
+  the old P0 back over the result, the loop ran until its counters wrapped (2.2 s per dispatch, measured with the
+  kernel probe) and the GPU hit Windows' 2 s timeout, reported as a device loss with the instruction pointers of
+  every killed warp. The swap now leaves the instruction's own predicate outputs alone.
+- The upscaler's final pass stores its 2560x1440 picture into the game's sRGB output texture, which Vulkan cannot
+  make a storage image; the host bound a dummy. `vk_texture.c` now creates such images with EXTENDED_USAGE and the
+  STORAGE usage, and `vk_exec_draw.c` get_view stores through a view of the UNORM sibling (`vk_unorm_of_srgb`).
+- The lowering put the scheduling words of graphics programs at absolute multiples of 32 bytes from the block
+  start, but Ryujinx counts them from the end of the 0x50-byte header: every third instruction of every vertex and
+  fragment shader sat where the decoder skips a scheduling word, and the scheduling word was decoded as an
+  instruction. The compositing quad's texture fetch was one of them. `addr_of` now counts from the header's end.
+  (The pipeline check `module_binding_missing` in `vk_pipeline.c` also had to learn that a declared but unreferenced
+  binding is not a layout error: the translator declares a constant buffer whose binding it reserved even when the
+  load was removed.)
+
+Also on the way: the game's movie worker feeds samples whenever it has them without consulting the input event;
+decoding each as it came ran the whole stream through dav1d in seconds, the ready ring dropped pictures and the game
+waited forever for the frame of a sample it had sent. `ov_movie22.c` now queues the samples and decodes them as the
+ring has room. The SHFL emitted by the emulation sends its validity predicate to PT (it clobbered P0). The device
+fault handler keeps the vendor's crash blob (`fault-vendor.bin` next to the log), compute pipeline builds over 100
+ms are logged with their SPIR-V size.
+
+Tools that paid off, all kept: `oot.exe --probe-tensor` (a hand-assembled SM86 kernel: LDSM x4, LDSM x2 transposed,
+HMMA.16816.F16 against a CPU reference, through the lowering, the translator and a real dispatch);
+`oot.exe --probe-cs <dir>` (one of the game's compute kernels dispatched in isolation with stand-in resources and
+timing: ctl, code, bindings.txt; the kernel's weights from an `OOT_DUMP_BUF` snapshot); `OOT_DUMP=dispatch` (the
+frame dump armed on the first compute dispatch); `OOT_SKIP_DISPATCH_FROM=<n>` (bisecting a device loss down to a
+dispatch); `OOT_CS_DUMMY_TEX=1`; `OOT_MQ_LOG=1` (nn::os LightMessageQueue and EventType traffic with threads and
+call sites, which found the movie worker's stall); `OOT_SM86_STUB=hmma|ldsm|all` (the emulation replaced by zeros,
+for timing); `OOT_THREAD_DUMP=s<seconds>` with host backtraces (the render thread inside `nvgpucomp64.dll`).
+
+Open: the frame rate (21 fps in the cinematic: the emulated kernels, and the decode on the game's thread); the
+start-up crash, now about one run in two (the SDK abort in MultiWait, see the previous section); the 656 skinning
+vertex shaders the lowering refuses; the mesh stages. The game has not yet been taken past the cinematic.
 
 ## Where the port stands
 

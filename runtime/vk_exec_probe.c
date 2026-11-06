@@ -19,6 +19,7 @@
 #include "nvn_tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "sm86_lower.h"
 
 #define SUBMITS 100
 #define TAIL 10
@@ -924,4 +925,326 @@ int probe_vkexec(void) {
     else
         printf("probe-vkexec: mirror part skipped (memory mode import)\n");
     return 0;
+}
+
+// ---- tensor part (oot.exe --probe-tensor): sm86_lower.c's emulation of the SM86 tensor-core instructions (LDSM,
+// HMMA) run on the host GPU against a CPU reference. A hand-assembled kernel of one 32-lane workgroup: every lane
+// loads its 16 bytes of A (16x16 f16, row-major) and 8 bytes of B (16x8 f16, row-major) from storage buffer slot 0,
+// stores them to shared memory (A row r at r*32, B row k at 512 + k*16), LDSM.x4 loads the A fragment from the row
+// addresses the CPU tabulated at +768 (lane L: (L&15)*32 + (L&16)), LDSM.x2.trans the B fragment from +896
+// (512 + (L&15)*16), HMMA.16816.F16 multiplies them into zero accumulators, and the fragments go back to the
+// buffer: D at +1024 (8 bytes per lane), A at +1280 (16 per lane), B at +1792 (8 per lane). The SM86 encodings
+// are the ones sm86_lower.c decodes (NAK's); word 3 holds scheduling bits the lowering ignores.
+
+typedef struct { uint32_t w[4]; } TnInsn;
+
+static void tn_emit(TnInsn **p, uint32_t w0, uint32_t w1, uint32_t w2) {
+    (*p)->w[0] = w0 | 0x7000u, (*p)->w[1] = w1, (*p)->w[2] = w2, (*p)->w[3] = 0x000fe200u;   // predicate PT
+    (*p)++;
+}
+
+static uint16_t tn_f2h(float f) {   // the test's values are small integers: exact
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    uint32_t sign = (u >> 16) & 0x8000;
+    int exp = (int)((u >> 23) & 0xff) - 127 + 15;
+    if (f == 0 || exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
+    uint32_t mant = u & 0x7fffff, h = sign | ((uint32_t)exp << 10) | (mant >> 13), rem = mant & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) h++;
+    return (uint16_t)h;
+}
+
+static float tn_h2f(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1f, mant = h & 0x3ff, u;
+    if (exp == 0) u = sign | (mant ? (uint32_t)(((uint32_t)(mant) << 13) | 0x33800000u) : 0);   // subnormals: not exact, unused
+    else if (exp == 31) u = sign | 0x7f800000u | (mant << 13);
+    else u = sign | ((exp + 112) << 23) | (mant << 13);
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+#define TN_BUF 4096
+
+static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x400000, .size = 0x100000,
+                   .game_mem = guest + 0x400000};
+    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool for the tensor part");
+    uint8_t *buf = pool.mem;
+    memset(buf, 0, TN_BUF);
+    // A[i][k] in -3..3, B[k][j] in -2..2: every partial sum is an integer below 2048, exact in f16 whatever the order.
+    float A[16][16], B[16][8], D[16][8];
+    for (int i = 0; i < 16; i++)
+        for (int k = 0; k < 16; k++) A[i][k] = (float)((i * 3 + k * 5) % 7 - 3);
+    for (int k = 0; k < 16; k++)
+        for (int j = 0; j < 8; j++) B[k][j] = (float)((k * 2 + j * 3) % 5 - 2);
+    for (int i = 0; i < 16; i++)
+        for (int j = 0; j < 8; j++) {
+            float s = 0;
+            for (int k = 0; k < 16; k++) s += A[i][k] * B[k][j];
+            D[i][j] = s;
+        }
+    uint16_t *ha = (uint16_t *)buf, *hb = (uint16_t *)(buf + 512);
+    for (int i = 0; i < 16; i++)
+        for (int k = 0; k < 16; k++) ha[i * 16 + k] = tn_f2h(A[i][k]);
+    for (int k = 0; k < 16; k++)
+        for (int j = 0; j < 8; j++) hb[k * 8 + j] = tn_f2h(B[k][j]);
+    uint32_t *addr_a = (uint32_t *)(buf + 768), *addr_b = (uint32_t *)(buf + 896);
+    for (uint32_t L = 0; L < 32; L++) addr_a[L] = (L & 15) * 32 + (L & 16), addr_b[L] = 512 + (L & 15) * 16;
+
+    // The kernel. Registers: R0 lane, R1 = 16L, R2 = 8L, R3 = 4L, R4-7 A row piece, R8-9 B row piece, R10/R11 the
+    // LDSM row addresses, R12-15 the A fragment, R16-17 the B fragment, R20-21 D. UR4:5 = the storage buffer's address
+    // (bank 0 + 0x10, the NVN2 layout with no pushed constants).
+    static _Alignas(256) TnInsn code[64];
+    memset(code, 0, sizeof code);
+    TnInsn *p = code;
+    tn_emit(&p, 0x0919 | 0 << 16, 0, 0);                                       // S2R R0, SR_LANEID
+    tn_emit(&p, 0x0824 | 1 << 16 | 0 << 24, 16, 0x078e00ffu);                  // IMAD R1, R0, 16, RZ
+    tn_emit(&p, 0x0824 | 2 << 16 | 0 << 24, 8, 0x078e00ffu);                   // IMAD R2, R0, 8, RZ
+    tn_emit(&p, 0x0824 | 3 << 16 | 0 << 24, 4, 0x078e00ffu);                   // IMAD R3, R0, 4, RZ
+    tn_emit(&p, 0x0ab9 | 4 << 16 | 0xff << 24, 0x10 << 6, 5 << 9);             // ULDC.64 UR4, c[0][0x10]
+    tn_emit(&p, 0x0981 | 4 << 16 | 1 << 24, 4, 0x081e8100u | 6 << 9);          // LDG.E.128 R4, [R1.U32 + UR4]
+    tn_emit(&p, 0x0981 | 8 << 16 | 2 << 24, 4 | 512 << 8, 0x081e8100u | 5 << 9);    // LDG.E.64 R8, [R2 + UR4 + 512]
+    tn_emit(&p, 0x0981 | 10 << 16 | 3 << 24, 4 | 768 << 8, 0x081e8100u | 4 << 9);   // LDG.E R10, [R3 + UR4 + 768]
+    tn_emit(&p, 0x0981 | 11 << 16 | 3 << 24, 4 | 896 << 8, 0x081e8100u | 4 << 9);   // LDG.E R11, [R3 + UR4 + 896]
+    tn_emit(&p, 0x0388 | 1 << 24, 4, 6 << 9);                                  // STS.128 [R1], R4
+    tn_emit(&p, 0x0388 | 2 << 24, 8 | 512 << 8, 5 << 9);                       // STS.64 [R2 + 512], R8
+    tn_emit(&p, 0x0b1d, 0, 0);                                                 // BAR.SYNC 0
+    tn_emit(&p, 0x083b | 12 << 16 | 10 << 24, 0, 2 << 8);                      // LDSM.16.M88.4 R12, [R10]
+    tn_emit(&p, 0x083b | 16 << 16 | 11 << 24, 0, 1 << 8 | 1 << 14);            // LDSM.16.MT88.2 R16, [R11]
+    tn_emit(&p, 0x023c | 20 << 16 | 12 << 24, 16, 0xff | 8 << 8);              // HMMA.16816.F16 R20, R12, R16, RZ
+    tn_emit(&p, 0x0986 | 2 << 24, 20 | 1024 << 8, 0x0810a100u | 4 | 5 << 9);   // STG.E.64 [R2 + UR4 + 1024], R20
+    tn_emit(&p, 0x0986 | 1 << 24, 12 | 1280 << 8, 0x0810a100u | 4 | 6 << 9);   // STG.E.128 [R1 + UR4 + 1280], R12
+    tn_emit(&p, 0x0986 | 2 << 24, 16 | 1792 << 8, 0x0810a100u | 4 | 5 << 9);   // STG.E.64 [R2 + UR4 + 1792], R16
+    // Diagnostics: the loaded A piece, the plain shared-memory round trips, the LDSM row addresses.
+    tn_emit(&p, 0x0984 | 24 << 16 | 1 << 24, 0, 6 << 9);                       // LDS.128 R24, [R1]
+    tn_emit(&p, 0x0984 | 28 << 16 | 2 << 24, 512 << 8, 5 << 9);                // LDS.64 R28, [R2 + 512]
+    tn_emit(&p, 0x0986 | 1 << 24, 4 | 2048 << 8, 0x0810a100u | 4 | 6 << 9);    // STG.E.128 [R1 + UR4 + 2048], R4
+    tn_emit(&p, 0x0986 | 1 << 24, 24 | 2560 << 8, 0x0810a100u | 4 | 6 << 9);   // STG.E.128 [R1 + UR4 + 2560], R24
+    tn_emit(&p, 0x0986 | 2 << 24, 28 | 3072 << 8, 0x0810a100u | 4 | 5 << 9);   // STG.E.64 [R2 + UR4 + 3072], R28
+    tn_emit(&p, 0x0986 | 2 << 24, 10 | 3328 << 8, 0x0810a100u | 4 | 5 << 9);   // STG.E.64 [R2 + UR4 + 3328], R10
+    tn_emit(&p, 0x094d, 0, 0x03800000u);                                       // EXIT
+    uint32_t code_end = (uint32_t)((p - code) * 16), code_size = 512;
+    static uint8_t ctl[0x100];
+    memset(ctl, 0, sizeof ctl);
+    const uint32_t magic = SM86_CONTROL_MAGIC, ctl_size = SM86_CONTROL_MIN, local[3] = {32, 1, 1};
+    memcpy(ctl, &magic, 4), memcpy(ctl + 0x30, &ctl_size, 4), memcpy(ctl + 0xd4, &ctl_size, 4);
+    memcpy(ctl + 0x38, &code_end, 4), memcpy(ctl + 0x40, &code_size, 4), memcpy(ctl + 0x44, &code_size, 4);
+    ctl[0x56] = 5, ctl[0xb2] = 1;                                              // compute; one storage buffer slot
+    memcpy(ctl + 0x58, local, 12);
+    static prog_t prog;
+    memset(&prog, 0, sizeof prog);
+    prog.magic = NVN_PROG_MAGIC, prog.serial = 0x7100, prog.nstage = 1;
+    prog.sd[0].data = (uint64_t)(uintptr_t)code, prog.sd[0].control = ctl;
+
+    static _Alignas(8) uint8_t stream[1024];
+    uint8_t *q = stream;
+    q = put(q, OP_BEGIN, NULL, 0);
+    const p_bind_program bp = {&prog, 1 << 5};
+    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
+    const p_bind_buf sb = {5, 0, (uint64_t)(uintptr_t)buf, TN_BUF};
+    q = put(q, OP_BIND_SSBO, &sb, sizeof sb);
+    const p_dispatch dp = {1, 1, 1, 0};
+    q = put(q, OP_DISPATCH, &dp, sizeof dp);
+    const p_barrier bar = {0, 0};
+    q = put(q, OP_BARRIER, &bar, sizeof bar);
+    q = put(q, OP_END, NULL, 0);
+    uint64_t handle = (uint64_t)(uintptr_t)stream;
+    uint64_t f = b->submit(&handle, 1);
+    CHECK(b->fence_wait(f, 20000000000ull), "fence_wait of the tensor dispatch timed out");
+
+    // Lane L (g = L >> 2, t = L & 3): A fragment R12 = (A[g][2t], A[g][2t+1]), R13 = A[g+8][2t..], R14 = A[g][2t+8..],
+    // R15 = A[g+8][2t+8..]; B fragment R16 = (B[2t][g], B[2t+1][g]), R17 = (B[2t+8][g], B[2t+9][g]); D R20 =
+    // (D[g][2t], D[g][2t+1]), R21 = (D[g+8][2t], D[g+8][2t+1]).
+    int bad = 0, bad_a = 0, bad_b = 0, bad_d = 0, shown = 0, bad_ldg = 0, bad_lds = 0, bad_addr = 0;
+    for (uint32_t L = 0; L < 32; L++) {
+        const uint32_t *ldg = (const uint32_t *)(buf + 2048 + L * 16), *lds = (const uint32_t *)(buf + 2560 + L * 16);
+        const uint32_t *ldsb = (const uint32_t *)(buf + 3072 + L * 8), *ad = (const uint32_t *)(buf + 3328 + L * 8);
+        const uint32_t *fa = (const uint32_t *)(buf + 1280 + L * 16), *fb = (const uint32_t *)(buf + 1792 + L * 8);
+        const uint32_t *fd = (const uint32_t *)(buf + 1024 + L * 8);
+        bad_ldg += memcmp(ldg, buf + L * 16, 16) != 0;
+        bad_lds += memcmp(lds, buf + L * 16, 16) != 0 || memcmp(ldsb, buf + 512 + L * 8, 8) != 0;
+        bad_addr += ad[0] != addr_a[L] || ad[1] != addr_b[L];
+        printf("probe-tensor: lane %2u ldg %08x %08x %08x %08x lds %08x %08x %08x %08x / %08x %08x addr %u %u | A %08x %08x %08x %08x | B %08x %08x | D %08x %08x\n",
+               L, ldg[0], ldg[1], ldg[2], ldg[3], lds[0], lds[1], lds[2], lds[3], ldsb[0], ldsb[1], ad[0], ad[1],
+               fa[0], fa[1], fa[2], fa[3], fb[0], fb[1], fd[0], fd[1]);
+    }
+    printf("probe-tensor: lanes with a wrong LDG piece %d, wrong shared round trip %d, wrong LDSM addresses %d\n", bad_ldg, bad_lds, bad_addr);
+    for (uint32_t L = 0; L < 32; L++) {
+        uint32_t g = L >> 2, t = L & 3;
+        const uint16_t *fa = (const uint16_t *)(buf + 1280 + L * 16), *fb = (const uint16_t *)(buf + 1792 + L * 8);
+        const uint16_t *fd = (const uint16_t *)(buf + 1024 + L * 8);
+        float wa[8] = {A[g][2 * t], A[g][2 * t + 1], A[g + 8][2 * t], A[g + 8][2 * t + 1],
+                       A[g][2 * t + 8], A[g][2 * t + 9], A[g + 8][2 * t + 8], A[g + 8][2 * t + 9]};
+        float wb[4] = {B[2 * t][g], B[2 * t + 1][g], B[2 * t + 8][g], B[2 * t + 9][g]};
+        float wd[4] = {D[g][2 * t], D[g][2 * t + 1], D[g + 8][2 * t], D[g + 8][2 * t + 1]};
+        for (int i = 0; i < 8; i++)
+            if (tn_h2f(fa[i]) != wa[i]) {
+                bad_a++;
+                if (shown++ < 12) printf("probe-tensor: lane %u A half %d is %g (%04x), expected %g\n", L, i, tn_h2f(fa[i]), fa[i], wa[i]);
+            }
+        for (int i = 0; i < 4; i++)
+            if (tn_h2f(fb[i]) != wb[i]) {
+                bad_b++;
+                if (shown++ < 12) printf("probe-tensor: lane %u B half %d is %g (%04x), expected %g\n", L, i, tn_h2f(fb[i]), fb[i], wb[i]);
+            }
+        for (int i = 0; i < 4; i++)
+            if (tn_h2f(fd[i]) != wd[i]) {
+                bad_d++;
+                if (shown++ < 12) printf("probe-tensor: lane %u D half %d is %g (%04x), expected %g\n", L, i, tn_h2f(fd[i]), fd[i], wd[i]);
+            }
+    }
+    printf("probe-tensor: A fragment %d of 256 halves wrong, B fragment %d of 128, D %d of 128\n", bad_a, bad_b, bad_d);
+    bad = bad_a + bad_b + bad_d;
+    b->pool_fini(&pool);
+    *n_bad = bad;
+    return 0;
+}
+
+int probe_tensor(void) {
+    main_tid = GetCurrentThreadId();
+    const GfxBackend *b = &gfx_vulkan_backend;
+    uint64_t heap = 0;
+    CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
+    uint8_t *guest = (uint8_t *)(uintptr_t)heap;
+    int n_bad = -1;
+    int bad = probe_tensor_run(b, guest, &n_bad);
+    b->finish();
+    vk_pipeline_shutdown();
+    vk_exec_draw_shutdown();
+    vk_exec_xfer_shutdown();
+    vk_backend_shutdown();
+    long errors = vk_validation_errors_total();
+    if (bad || n_bad || errors) {
+        printf("probe-tensor: FAILED (%d fragment halves wrong, %ld validation errors)\n", n_bad, errors);
+        return 1;
+    }
+    printf("probe-tensor: passed (LDSM.x4, LDSM.x2.trans and HMMA.16816.F16 fragments of a 16x16 by 16x8 product exact, "
+           "0 validation errors)\n");
+    return 0;
+}
+
+// ---- kernel part (oot.exe --probe-cs <dir>): one NVN2 compute kernel of the game dispatched in isolation with
+// stand-in resources, to bisect a device loss or a wrong result outside the game (2026-11-06: the cinematic's first
+// neural-network layer faulted the GPU). <dir> holds the control section (ctl), the code block (code) and bindings.txt:
+//   ssbo <slot> <size> [<file>]      storage buffer slot: zeros, or the file's bytes (the game's, from OOT_DUMP_BUF)
+//   tex <slot> <w> <h>               a texture slot: an RGBA8 2D texture of zeros (unbound slots get the dummy)
+//   dispatch <x> <y> <z>
+//   trunc <n>                        lower only the first n instructions (OOT_SM86_TRUNC) to bisect inside the kernel
+// After the fence the storage buffers are written back as <dir>/out_ssbo<slot>.bin.
+
+static uint8_t *cs_read(const char *path, long *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    *size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *b = calloc(1, (size_t)*size + 16);
+    if (b && fread(b, 1, (size_t)*size, f) != (size_t)*size) free(b), b = NULL;
+    fclose(f);
+    return b;
+}
+
+int probe_cs(const char *dir) {
+    main_tid = GetCurrentThreadId();
+    const GfxBackend *b = &gfx_vulkan_backend;
+    char path[MAX_PATH * 2];
+    long ctl_size = 0, code_size = 0;
+    snprintf(path, sizeof path, "%s/ctl", dir);
+    uint8_t *ctl = cs_read(path, &ctl_size);
+    snprintf(path, sizeof path, "%s/code", dir);
+    uint8_t *code = cs_read(path, &code_size);
+    CHECK(ctl && code, "cannot read %s/ctl and %s/code", dir, dir);
+    snprintf(path, sizeof path, "%s/bindings.txt", dir);
+    FILE *bf = fopen(path, "r");
+    CHECK(bf, "cannot read %s", path);
+    uint64_t heap = 0;
+    CHECK(mem_set_heap_size(64ull << 20, &heap) == 0 && heap, "SetHeapSize 64 MiB");
+    uint8_t *guest = (uint8_t *)(uintptr_t)heap;
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0x400000, .size = 0x3c00000,
+                   .game_mem = guest + 0x400000};
+    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool for the kernel part");
+    static _Alignas(256) uint8_t code_buf[1 << 20];
+    CHECK(code_size <= (long)sizeof code_buf, "code block too large");
+    memcpy(code_buf, code, (size_t)code_size);
+    static prog_t prog;
+    memset(&prog, 0, sizeof prog);
+    prog.magic = NVN_PROG_MAGIC, prog.serial = 0x7200, prog.nstage = 1;
+    prog.sd[0].data = (uint64_t)(uintptr_t)code_buf, prog.sd[0].control = ctl;
+
+    static _Alignas(8) uint8_t stream[4096];
+    uint8_t *q = stream;
+    q = put(q, OP_BEGIN, NULL, 0);
+    const p_bind_program bp = {&prog, 1 << 5};
+    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
+    uint64_t off = 0x10000;
+    struct { int slot; uint64_t off, size; } ssbo[16];
+    int nssbo = 0;
+    p_dispatch dp = {1, 1, 1, 0};
+    char line[600];
+    while (fgets(line, sizeof line, bf)) {
+        int slot, x, y, z;
+        unsigned long long size;
+        char file[400];
+        if (sscanf(line, "ssbo %d %llx %399s", &slot, &size, file) >= 2) {
+            if (sscanf(line, "ssbo %d %llx %399s", &slot, &size, file) == 2) file[0] = 0;
+            CHECK(nssbo < 16 && off + size <= pool.size, "too many or too large storage buffers");
+            uint8_t *mem = pool.mem + off;
+            memset(mem, 0, (size_t)size);
+            if (file[0]) {
+                long n = 0;
+                snprintf(path, sizeof path, "%s/%s", dir, file);
+                uint8_t *d = cs_read(path, &n);
+                CHECK(d, "cannot read %s", path);
+                memcpy(mem, d, (size_t)(n < (long)size ? n : (long)size));
+                free(d);
+                printf("probe-cs: ssbo slot %d: %ld bytes from %s\n", slot, n, file);
+            }
+            const p_bind_buf sb = {5, slot, (uint64_t)(uintptr_t)mem, size};
+            q = put(q, OP_BIND_SSBO, &sb, sizeof sb);
+            ssbo[nssbo].slot = slot, ssbo[nssbo].off = off, ssbo[nssbo].size = size, nssbo++;
+            off = (off + size + 0xffff) & ~0xffffull;
+        } else if (sscanf(line, "dispatch %d %d %d", &x, &y, &z) == 3) {
+            dp.x = x, dp.y = y, dp.z = z;
+        } else if (sscanf(line, "trunc %d", &x) == 1) {
+            char v[32];
+            snprintf(v, sizeof v, "%d", x);
+            _putenv_s("OOT_SM86_TRUNC", v);
+            printf("probe-cs: lowering truncated after %d instructions\n", x);
+        }
+    }
+    fclose(bf);
+    q = put(q, OP_DISPATCH, &dp, sizeof dp);
+    const p_barrier bar = {0, 0};
+    q = put(q, OP_BARRIER, &bar, sizeof bar);
+    q = put(q, OP_END, NULL, 0);
+    printf("probe-cs: dispatch %dx%dx%d of a %ld-byte kernel with %d storage buffers\n", dp.x, dp.y, dp.z, code_size, nssbo);
+    fflush(stdout);
+    uint64_t handle = (uint64_t)(uintptr_t)stream;
+    LARGE_INTEGER qf, q0, q1;
+    QueryPerformanceFrequency(&qf);
+    uint64_t f = b->submit(&handle, 1);
+    QueryPerformanceCounter(&q0);
+    int done = b->fence_wait(f, 60000000000ull);
+    QueryPerformanceCounter(&q1);
+    printf("probe-cs: fence %s after %.1f ms (the pipeline build is before the submit)\n", done ? "reached" : "TIMED OUT",
+           (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart);
+    for (int i = 0; i < nssbo && done; i++) {
+        snprintf(path, sizeof path, "%s/out_ssbo%d.bin", dir, ssbo[i].slot);
+        FILE *o = fopen(path, "wb");
+        if (o) { fwrite(pool.mem + ssbo[i].off, 1, (size_t)ssbo[i].size, o); fclose(o); }
+        uint64_t nz = 0;
+        for (uint64_t k = 0; k < ssbo[i].size; k++) nz += pool.mem[ssbo[i].off + k] != 0;
+        printf("probe-cs: ssbo slot %d: %llu of %llu bytes non-zero after the dispatch -> %s\n", ssbo[i].slot,
+               (unsigned long long)nz, (unsigned long long)ssbo[i].size, path);
+    }
+    b->finish();
+    vk_pipeline_shutdown();
+    vk_exec_draw_shutdown();
+    vk_exec_xfer_shutdown();
+    vk_backend_shutdown();
+    long errors = vk_validation_errors_total();
+    printf("probe-cs: %s (%ld validation errors)\n", done ? "done" : "FAILED", errors);
+    return done ? 0 : 1;
 }

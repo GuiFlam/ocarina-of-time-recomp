@@ -1,0 +1,138 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmit.cs
+@@ -1,5 +1,8 @@
+ using Ryujinx.Graphics.Shader.Decoders;
++using Ryujinx.Graphics.Shader.IntermediateRepresentation;
+ using Ryujinx.Graphics.Shader.Translation;
++using static Ryujinx.Graphics.Shader.Instructions.InstEmitHelper;
++using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
+ 
+ namespace Ryujinx.Graphics.Shader.Instructions
+ {
+@@ -215,32 +218,118 @@
+             context.TranslatorContext.GpuAccessor.Log("Shader instruction Pret is not implemented.");
+         }
+ 
++        // OoT (2026-11-06): PRMT, the byte permute, was a logging stub in every form; half the lowered SM86 programs
++        // use it (packing halves), and sm86_lower.c's LDSM, HMMA and MOVM emulation builds half pairs with it.
++        // Rd = the bytes of {Rc:Ra} (Ra bytes 0-3, Rc bytes 4-7) picked by the four selector nibbles of the b operand;
++        // a nibble's bit 3 replicates the picked byte's sign. The other modes derive the selector from the low bits
++        // of b as the PTX prmt tables do (f4e, b4e, rc8, ecl, ecr, rc16).
+         public static void PrmtR(EmitterContext context)
+         {
+-            context.GetOp<InstPrmtR>();
++            InstPrmtR op = context.GetOp<InstPrmtR>();
+ 
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction PrmtR is not implemented.");
++            EmitPrmt(context, GetSrcReg(context, op.SrcA), GetSrcReg(context, op.SrcB), GetSrcReg(context, op.SrcC), op.Dest, op.PMode);
+         }
+ 
+         public static void PrmtI(EmitterContext context)
+         {
+-            context.GetOp<InstPrmtI>();
++            InstPrmtI op = context.GetOp<InstPrmtI>();
+ 
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction PrmtI is not implemented.");
++            EmitPrmt(context, GetSrcReg(context, op.SrcA), GetSrcImm(context, Imm20ToSInt(op.Imm20)), GetSrcReg(context, op.SrcC), op.Dest, op.PMode);
+         }
+ 
+         public static void PrmtC(EmitterContext context)
+         {
+-            context.GetOp<InstPrmtC>();
++            InstPrmtC op = context.GetOp<InstPrmtC>();
+ 
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction PrmtC is not implemented.");
++            EmitPrmt(context, GetSrcReg(context, op.SrcA), GetSrcCbuf(context, op.CbufSlot, op.CbufOffset), GetSrcReg(context, op.SrcC), op.Dest, op.PMode);
+         }
+ 
+         public static void PrmtRc(EmitterContext context)
+         {
+-            context.GetOp<InstPrmtRc>();
++            InstPrmtRc op = context.GetOp<InstPrmtRc>();
+ 
+-            context.TranslatorContext.GpuAccessor.Log("Shader instruction PrmtRc is not implemented.");
++            EmitPrmt(context, GetSrcReg(context, op.SrcA), GetSrcReg(context, op.SrcC), GetSrcCbuf(context, op.CbufSlot, op.CbufOffset), op.Dest, op.PMode);
++        }
++
++        private static Operand PrmtTable(EmitterContext context, Operand index, int mask, params int[] table)
++        {
++            Operand key = context.BitwiseAnd(index, Const(mask));
++            Operand result = Const(table[0]);
++
++            for (int i = 1; i < table.Length; i++)
++            {
++                result = context.ConditionalSelect(context.ICompareEqual(key, Const(i)), Const(table[i]), result);
++            }
++
++            return result;
++        }
++
++        private static void EmitPrmt(EmitterContext context, Operand srcA, Operand srcB, Operand srcC, int rd, PMode mode)
++        {
++            Operand selector = mode switch
++            {
++                PMode.F4e => PrmtTable(context, srcB, 3, 0x3210, 0x4321, 0x5432, 0x6543),
++                PMode.B4e => PrmtTable(context, srcB, 3, 0x5670, 0x6745, 0x7456, 0x4567),
++                PMode.Rc8 => PrmtTable(context, srcB, 3, 0x0000, 0x1111, 0x2222, 0x3333),
++                PMode.Ecl => PrmtTable(context, srcB, 3, 0x3210, 0x3211, 0x3222, 0x3333),
++                PMode.Ecr => PrmtTable(context, srcB, 3, 0x0000, 0x1110, 0x2210, 0x3210),
++                PMode.Rc16 => PrmtTable(context, srcB, 1, 0x1010, 0x3232),
++                _ => srcB,
++            };
++
++            Operand result = null;
++
++            if (selector.Type == OperandType.Constant)
++            {
++                // A constant selector (the usual case: the half-word packs 0x5410 and 0x7632, the copies): the bytes
++                // are picked at translation time; two-byte picks from one source with no sign become one extract.
++                int sel = selector.Value;
++
++                switch (sel)
++                {
++                    case 0x3210: context.Copy(GetDest(rd), srcA); return;
++                    case 0x7654: context.Copy(GetDest(rd), srcC); return;
++                    case 0x5410: result = context.BitwiseOr(context.BitwiseAnd(srcA, Const(0xffff)), context.ShiftLeft(srcC, Const(16))); context.Copy(GetDest(rd), result); return;
++                    case 0x7632: result = context.BitwiseOr(context.ShiftRightU32(srcA, Const(16)), context.BitwiseAnd(srcC, Const(unchecked((int)0xffff0000)))); context.Copy(GetDest(rd), result); return;
++                    case 0x1010: result = context.BitwiseOr(context.BitwiseAnd(srcA, Const(0xffff)), context.ShiftLeft(srcA, Const(16))); context.Copy(GetDest(rd), result); return;
++                    case 0x3232: result = context.BitwiseOr(context.ShiftRightU32(srcA, Const(16)), context.BitwiseAnd(srcA, Const(unchecked((int)0xffff0000)))); context.Copy(GetDest(rd), result); return;
++                }
++
++                for (int i = 0; i < 4; i++)
++                {
++                    int nibble = (sel >> (4 * i)) & 0xf;
++                    Operand src = (nibble & 4) != 0 ? srcC : srcA;
++                    Operand picked = context.BitfieldExtractU32(src, Const((nibble & 3) * 8), Const(8));
++
++                    if ((nibble & 8) != 0)
++                    {
++                        picked = context.BitwiseAnd(context.BitfieldExtractS32(src, Const((nibble & 3) * 8 + 7), Const(1)), Const(0xff));
++                    }
++
++                    Operand placed = i == 0 ? picked : context.ShiftLeft(picked, Const(8 * i));
++
++                    result = i == 0 ? placed : context.BitwiseOr(result, placed);
++                }
++
++                context.Copy(GetDest(rd), result);
++                return;
++            }
++
++            for (int i = 0; i < 4; i++)
++            {
++                Operand nibble = context.BitwiseAnd(context.ShiftRightU32(selector, Const(4 * i)), Const(0xf));
++                Operand bitOffset = context.ShiftLeft(context.BitwiseAnd(nibble, Const(3)), Const(3));
++                Operand fromA = context.BitfieldExtractU32(srcA, bitOffset, Const(8));
++                Operand fromC = context.BitfieldExtractU32(srcC, bitOffset, Const(8));
++                Operand picked = context.ConditionalSelect(context.ICompareNotEqual(context.BitwiseAnd(nibble, Const(4)), Const(0)), fromC, fromA);
++                Operand replicated = context.BitwiseAnd(context.INegate(context.ShiftRightU32(picked, Const(7))), Const(0xff));
++                Operand value = context.ConditionalSelect(context.ICompareNotEqual(context.BitwiseAnd(nibble, Const(8)), Const(0)), replicated, picked);
++                Operand placed = i == 0 ? value : context.ShiftLeft(value, Const(8 * i));
++
++                result = i == 0 ? placed : context.BitwiseOr(result, placed);
++            }
++
++            context.Copy(GetDest(rd), result);
+         }
+ 
+         public static void R2b(EmitterContext context)

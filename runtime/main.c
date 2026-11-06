@@ -731,7 +731,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-tensor | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -783,7 +783,7 @@ int main(int argc, char **argv) {
         rt_logf("OOT_GPU must be null or vulkan, not '%s'\n", cfg.gpu);
         return 2;
     }
-    const char *mode = NULL;
+    const char *mode = NULL, *cs_dir = "probe-cs";
     for (int i = 1; i < argc; i++) {
         const char **path = !strcmp(argv[i], "--exefs") ? &cfg.exefs : !strcmp(argv[i], "--romfs") ? &cfg.romfs
                           : !strcmp(argv[i], "--profile") ? &cfg.profile : NULL;
@@ -799,6 +799,10 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
             cfg.shot = argv[i];
+        } else if (!mode && !strcmp(argv[i], "--probe-cs")) {   // --probe-cs <dir>: vk_exec_probe.c probe_cs
+            mode = argv[i];
+            if (++i == argc) return usage(argv[0]);
+            cs_dir = argv[i];
         } else if (!mode && !strncmp(argv[i], "--", 2)) {
             mode = argv[i];
         } else {
@@ -828,6 +832,8 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-shader")) return probe_shader();
     if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
+    if (!strcmp(mode, "--probe-tensor")) return probe_tensor();
+    if (!strcmp(mode, "--probe-cs")) return probe_cs(cs_dir);
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();

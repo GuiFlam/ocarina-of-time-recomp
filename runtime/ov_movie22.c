@@ -49,6 +49,7 @@
 #define MOVIE_R_NO_FRAME (342u | (2u << 9))   // module 342 (movie): nothing to acquire
 
 typedef struct { Dav1dPicture pic; int eos; } Ready;
+typedef struct { uint8_t *data; size_t size; int64_t ts; int eos; } Sample;   // a compressed sample waiting for the ring
 
 typedef struct {
     uint64_t guest;                      // the game's movie::VideoDecoder / AudioDecoder object (0: free)
@@ -65,6 +66,8 @@ typedef struct {
     int config_sent;
     Ready ready[MAX_READY];
     int rhead, rcount;
+    Sample *queue;                       // samples taken by DecodeAsync and not yet given to dav1d, in order
+    int qhead, qcount, qcap;
     int64_t last_pts;
     int eos_pending;                     // audio: the registered frame comes back once as end of stream
     int warned;
@@ -122,8 +125,14 @@ static void ready_clear(Dec *d) {
     }
 }
 
+static void queue_clear(Dec *d) {
+    while (d->qcount) free(d->queue[d->qhead].data), d->qhead = (d->qhead + 1) % d->qcap, d->qcount--;
+    d->qhead = 0;
+}
+
 static void dav_close(Dec *d) {
     ready_clear(d);
+    queue_clear(d);
     if (d->dav) dav1d_close(&d->dav);
     free(d->config), d->config = NULL, d->config_len = 0;
 }
@@ -223,12 +232,20 @@ static void ov_event_in(Cpu *c) { event_get(c, 0); }
 static void ov_event_out(Cpu *c) { event_get(c, 1); }
 static void ov_event_fmt(Cpu *c) { event_get(c, 2); }
 
+// Pacing (2026-11-06): the game's movie worker feeds samples whenever it has them and does not look at the input
+// event first; decoding each sample as it came ran the whole stream through dav1d in a few seconds, the ready ring
+// overflowed, the oldest pictures were dropped and the game waited forever for the frame of a sample it had sent
+// (the main thread in WaitEvent, the worker spinning); refusing a sample broke its pipeline the same way. So every
+// sample is taken, as a copy on a queue, and given to dav1d only while the ring has room for its picture: at
+// DecodeAsync, and again whenever an acquire frees a ring slot. Nothing is refused or dropped.
+static int room(const Dec *d) { return d->rcount < MAX_READY - 2; }
+
 static void ov_start(Cpu *c) {
     Dec *d = find(arg_x(c, 0));
     if (d) {
         d->started = 1;
         event_signal(c, d->ev_fmt);                          // the output format is known from the start
-        event_signal(c, d->ev_in);                           // input is always welcome
+        event_signal(c, d->ev_in);                           // input is always welcome (queued)
     }
     ret_x(c, 0);
 }
@@ -239,6 +256,7 @@ static void ov_stop(Cpu *c) {
         AcquireSRWLockExclusive(&lock);
         d->started = 0;
         ready_clear(d);
+        queue_clear(d);
         if (d->dav) dav1d_flush(d->dav);
         d->config_sent = 0;
         ReleaseSRWLockExclusive(&lock);
@@ -309,6 +327,41 @@ static void push_eos(Dec *d) {
     d->rcount++;
 }
 
+// Queued samples into dav1d while the ring has room (lock held).
+static void pump(Dec *d) {
+    while (d->dav && d->qcount && room(d)) {
+        Sample *q = &d->queue[d->qhead];
+        d->qhead = (d->qhead + 1) % d->qcap, d->qcount--;
+        if (q->eos) {
+            drain(d);
+            push_eos(d);
+            dav1d_flush(d->dav);                             // the next samples start the stream over (the title loop)
+            d->config_sent = 0;
+        } else {
+            if (!d->config_sent && d->config) send_data(d, d->config, d->config_len, INT64_MIN), d->config_sent = 1;
+            send_data(d, q->data, q->size, q->ts);
+        }
+        free(q->data), q->data = NULL;
+    }
+}
+
+static int enqueue(Dec *d, const uint8_t *p, size_t n, int64_t ts, int eos) {   // lock held
+    if (d->qcount == d->qcap) {
+        int cap = d->qcap ? d->qcap * 2 : 64;
+        Sample *q = malloc((size_t)cap * sizeof *q);
+        if (!q) return 0;
+        for (int i = 0; i < d->qcount; i++) q[i] = d->queue[(d->qhead + i) % d->qcap];
+        free(d->queue), d->queue = q, d->qcap = cap, d->qhead = 0;
+    }
+    Sample *q = &d->queue[(d->qhead + d->qcount) % d->qcap];
+    q->data = n ? malloc(n) : NULL;
+    if (n && !q->data) return 0;
+    if (n) memcpy(q->data, p, n);
+    q->size = n, q->ts = ts, q->eos = eos;
+    d->qcount++;
+    return 1;
+}
+
 static void ov_decode(Cpu *c) {                              // DecodeAsync(const nn::movie::Buffer *)
     Dec *d = find(arg_x(c, 0));
     uint64_t buffer = arg_x(c, 1);
@@ -330,16 +383,11 @@ static void ov_decode(Cpu *c) {                              // DecodeAsync(cons
     }
     if (d->video) {
         AcquireSRWLockExclusive(&lock);
-        if (d->dav) {
-            if (!d->config_sent && d->config) send_data(d, d->config, d->config_len, INT64_MIN), d->config_sent = 1;
-            if (data && size) send_data(d, (const uint8_t *)(uintptr_t)data, (size_t)size, ts);
-            if (eos) {
-                drain(d);
-                push_eos(d);
-                dav1d_flush(d->dav);                         // the next samples start the stream over (the title loop)
-                d->config_sent = 0;
-            }
+        if ((data && size) || eos) {
+            if (!enqueue(d, (const uint8_t *)(uintptr_t)data, (size_t)(data ? size : 0), ts, eos) && d->warned < 3)
+                d->warned = 3, rt_log("movie22: out of memory queueing a %llu-byte sample", (unsigned long long)size);
         }
+        pump(d);
         int have = d->rcount > 0;
         ReleaseSRWLockExclusive(&lock);
         event_signal(c, d->ev_in);
@@ -406,7 +454,10 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     Ready r = d->ready[d->rhead];
     d->rhead = (d->rhead + 1) % MAX_READY, d->rcount--;
     d->busy |= 1u << i;
+    pump(d);                                                 // the slot taken makes room for a queued sample
+    int have = d->rcount > 0;
     ReleaseSRWLockExclusive(&lock);
+    if (have) event_signal(c, d->ev_out);                    // more pictures wait (the event clears on each wait)
     uint64_t frame = d->frames[i];
     if (r.eos) {
         rt_call(c, G.set_ts, 2, frame, (uint64_t)d->last_pts);
@@ -419,9 +470,11 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     *out = frame;
     if (index) *index = i;
     d->acquired++;
-    if (d->acquired <= 2 || r.eos)
-        rt_log("movie22: frame %d handed back (%s, pts %lld ns, %llu buffers in, %d ready)", i, r.eos ? "end of stream" : "picture",
-               (long long)d->last_pts, (unsigned long long)d->decoded, d->rcount);
+    if (d->acquired <= 2 || r.eos || getenv("OOT_MQ_LOG")) {
+        char t[96];
+        rt_log("movie22: frame %d handed back (%s, pts %lld ns, %llu buffers in, %d ready) to %s", i, r.eos ? "end of stream" : "picture",
+               (long long)d->last_pts, (unsigned long long)d->decoded, d->rcount, kern_thread_describe(t, sizeof t));
+    }
     ret_x(c, 0);
 }
 static void ov_acquire(Cpu *c) { acquire(c, 0); }
@@ -435,6 +488,10 @@ static void ov_release(Cpu *c) {                             // Release{Video,Au
         for (int i = 0; i < d->nframes; i++) if (d->frames[i] == frame) d->busy &= ~(1u << i);
         int have = d->video && d->rcount > 0;
         ReleaseSRWLockExclusive(&lock);
+        if (getenv("OOT_MQ_LOG")) {
+            char t[96];
+            rt_log("movie22: frame %#llx released by %s (%d ready, busy %#x)", (unsigned long long)frame, kern_thread_describe(t, sizeof t), d->rcount, d->busy);
+        }
         if (have) event_signal(c, d->ev_out);
     }
     ret_x(c, 0);

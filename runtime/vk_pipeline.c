@@ -1135,20 +1135,38 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
 
 // The first binding a module's resource variables use that the binding list b[0..n) lacks (module bindings >= 1 moved
 // by off), or -1. A reflection that misses a resource would otherwise hand the driver an invalid layout.
+// Only variables an instruction references count: Vulkan needs a layout binding for what the module uses
+// statically, and the translator declares a constant buffer whose binding it reserved even when the load that
+// needed it was later removed (OoT 2026-11-06: fragment shaders of the cinematic's compositing declared bank 1,
+// the jump-table bank, unused and unreflected, and their draws were skipped for the "missing" binding).
 static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayoutBinding *b, uint32_t n, uint32_t off) {
     uint64_t words = 0;
     const uint32_t *w = gfx_shader_spirv(s, &words);
-    for (uint64_t i = 5; w && i < words;) {
+    if (!w || words < 6) return -1;
+    uint32_t bound = w[3];
+    uint8_t *ref = calloc(bound + 1, 1);   // bit 0: a Binding decoration; bit 1: referenced by an instruction
+    if (!ref) return -1;
+    for (uint64_t i = 5; i < words;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > words) break;
-        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING) {
+        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING && w[i + 1] < bound) ref[w[i + 1]] |= 1;
+        else if (op != SPV_OP_DECORATE && op != 5 && op != 6 && op != 72 && op != 59 && op != 15 && op != 4 && op != 7)
+            for (uint32_t k = 1; k < len; k++) if (w[i + k] < bound) ref[w[i + k]] |= 2;   // every operand that is an id
+        i += len;
+    }
+    int missing = -1;
+    for (uint64_t i = 5; i < words && missing < 0;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > words) break;
+        if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING && w[i + 1] < bound && ref[w[i + 1]] == 3) {
             uint32_t want = w[i + 3] + (w[i + 3] >= 1 ? off : 0), j = 0;
             while (j < n && b[j].binding != want) j++;
-            if (j == n) return (int)w[i + 3];
+            if (j == n) missing = (int)w[i + 3];
         }
         i += len;
     }
-    return -1;
+    free(ref);
+    return missing;
 }
 
 // Checks both stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
@@ -1160,7 +1178,11 @@ static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off,
         m = l->set1 ? module_binding_missing(s->fs, l->b + l->n0, l->n - l->n0, 0) : module_binding_missing(s->fs, l->b, l->n, fs_off);
         stage = "fragment";
     }
-    if (m >= 0) snprintf(why, cap, "the %s shader uses binding %d, which its reflection and layout lack", stage, m);
+    if (m >= 0) {
+        const uint8_t *k = gfx_shader_key(stage[0] == 'v' ? s->vs : s->fs);
+        snprintf(why, cap, "the %s shader (key %02x%02x%02x%02x%02x%02x%02x%02x) uses binding %d, which its reflection and layout lack",
+                 stage, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], m);
+    }
     return m < 0;
 }
 
@@ -2748,7 +2770,12 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
+    double t0 = now_ms();
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    double ms = now_ms() - t0;
+    if (ms > 100)   // the upscaler's kernels: tens of thousands of emulated tensor-core instructions each (docs/phase3.md)
+        rt_log("vk_pipeline: a compute pipeline of %llu SPIR-V words took %.0f ms to build%s", (unsigned long long)words, ms,
+               pipe ? "" : " and failed");
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }

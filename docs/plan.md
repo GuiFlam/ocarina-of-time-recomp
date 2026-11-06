@@ -178,9 +178,11 @@ the first frame with an access violation on a host thread at an address in no mo
 line); `main.c`'s crash handler now dumps that thread's registers and stack for the next occurrence. The next day the
 cinematic decodes on the host (dav1d, NV12 frames back to the game), and the picture is still black: the game's
 video path, like its rendering at 2560x1440, runs a neural upscaler on the tensor cores (HMMA, LDSM, MOVM in 19
-compute programs that the shader archives do not hold), which no Maxwell translator has. That lowering is the next
-step (`docs/phase3.md`, Status 2026-11-06), together with the crash after the first frame that the crash dump now
-traces to the asynchronous preemption's bookkeeping.
+compute programs that the shader archives do not hold), which no Maxwell translator has. The lowering emulates them
+(shuffles and half-precision FMAs), and by the night of 2026-11-06 the cinematic plays, upscaled through that
+emulation (`docs/phase3.md`, Status 2026-11-06 night: two translator defects, two lowering defects, the sRGB storage
+image and the movie worker's pacing stood in the way). Open: the frame rate in the cinematic (21 fps), the start-up
+crash that the crash dump traces to an SDK abort in MultiWait, and what lies past the cinematic.
 
 
 ## Shared core
