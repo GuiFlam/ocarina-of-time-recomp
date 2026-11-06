@@ -14,7 +14,9 @@ What it takes care of, each a mistake made by hand at least once:
     non-zero before its time, or without its --shot, is run again, up to --retry times.
   - The window keeps focus as far as the game knows (OOT_ASSUME_FOCUS=1): out of focus the game pauses itself, as on
     the console under the HOME menu. --no-focus-pin to test that.
-  - --press-a presses A at frame 600, which brings up the title menu over the cinematic.
+  - --press-a presses A at frame 600, which brings up the title menu over the cinematic. --record FILE writes what
+    the player does (pad and keyboard) as an input script, --replay FILE plays one back; --skip-movies ends every
+    movie after the title loop at once (OOT_MOVIE_SKIP=2), so a replay reaches the game without the opening.
   - --fresh-cache NAME translates into an empty build/logs/sc-NAME, for runs whose lowering differs in ways the
     cache keys do not show (OOT_TENSOR_ONLY, OOT_TENSOR_HMMA_MASK).
   - --expect REGEX checks the log for each pattern afterwards (did the switch apply?) and fails the run if one is
@@ -34,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ROOT / "build" / "v131072" / "oot.exe"
 LOGS = ROOT / "build" / "logs"
-PATH_VARS = {"OOT_SHADER_CACHE", "OOT_INPUT_SCRIPT", "OOT_DUMP_DIR", "OOT_XLATE", "OOT_PROFILE_DIR", "OOT_SHOTS_DIR",
+PATH_VARS = {"OOT_SHADER_CACHE", "OOT_INPUT_SCRIPT", "OOT_INPUT_RECORD", "OOT_DUMP_DIR", "OOT_XLATE", "OOT_PROFILE_DIR", "OOT_SHOTS_DIR",
              "OOT_FLIGHT_DIR", "OOT_RDOC_DIR"}
 PROCS = ("oot.exe", "oot_xlate.exe")
 
@@ -84,7 +86,8 @@ def summary(log: Path) -> list[str]:
 def run_game(seconds: int = 60, shot: str | None = None, env: dict | None = None, press_a: bool = False,
              fresh_cache: str | None = None, dump: int | None = None, trace: str | None = None, volume: int = 0,
              focus_pin: bool = True, retry: int = 3, expect: list[str] | None = None, extra: list[str] | None = None,
-             kill_existing: bool = False, quiet: bool = False) -> dict:
+             kill_existing: bool = False, quiet: bool = False, record: str | None = None, replay: str | None = None,
+             skip_movies: bool = False) -> dict:
     """Runs the game once (retrying the start-up crash); returns {ok, log, shot, exit, summary, missing}."""
     if not EXE.exists():
         sys.exit(f"run: {EXE} is not built (tools/build_game.py)")
@@ -105,6 +108,14 @@ def run_game(seconds: int = 60, shot: str | None = None, env: dict | None = None
         LOGS.mkdir(parents=True, exist_ok=True)
         script.write_text("600 A 10\n")
         child["OOT_INPUT_SCRIPT"] = str(script.relative_to(ROOT))
+    if record:
+        child["OOT_INPUT_RECORD"] = record
+    if replay:
+        if not (ROOT / replay).exists() and not Path(replay).exists():
+            sys.exit(f"run: no input script {replay}")
+        child["OOT_INPUT_SCRIPT"] = replay
+    if skip_movies:
+        child["OOT_MOVIE_SKIP"] = "2"
     for kv in env or {}:
         child[kv] = str(env[kv])
     result = {"ok": False}
@@ -175,6 +186,9 @@ def main() -> int:
     ap.add_argument("--retry", type=int, default=3)
     ap.add_argument("--expect", action="append", default=[], metavar="REGEX")
     ap.add_argument("--kill-existing", action="store_true")
+    ap.add_argument("--record", metavar="FILE", help="write the player's input as a script (relative to the repo)")
+    ap.add_argument("--replay", metavar="FILE", help="play an input script back (from --record or by hand)")
+    ap.add_argument("--skip-movies", action="store_true", help="end every movie after the title loop at once")
     ap.add_argument("extra", nargs="*", help="arguments for oot.exe after --")
     a = ap.parse_args()
     env = {}
@@ -184,7 +198,8 @@ def main() -> int:
             sys.exit(f"run: --env {kv}: only OOT_* variables reach the game")
         env[k] = v
     r = run_game(a.seconds, a.shot, env, a.press_a, a.fresh_cache, a.dump, a.trace, a.volume, not a.no_focus_pin,
-                 a.retry, a.expect, a.extra, a.kill_existing)
+                 a.retry, a.expect, a.extra, a.kill_existing, record=a.record, replay=a.replay,
+                 skip_movies=a.skip_movies)
     print(f"run: {'ok' if r['ok'] else 'FAILED'}: {Path(r['log']).relative_to(ROOT)}, exit {r['exit']}, "
           f"{r.get('seconds_run')} s" + (f", shot {r['shot']}" if r.get("shot") else ""))
     for line in r["summary"]:

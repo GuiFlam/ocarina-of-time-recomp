@@ -240,7 +240,12 @@ build/logs/run-243.log). The title, menu and opening cutscene run at a steady 60
   `nvnCommandBufferDrawMeshTasks`, which is a stub that draws nothing, and only 51 distinct shaders were seen in the
   whole session. The world is most likely drawn with mesh shaders: the mesh stages (listed as open since the
   start of Phase 3) are now the blocker. Next: a frame dump of a gameplay frame (`tools/run.py --dump`) to confirm
-  what is drawn and how much goes through mesh tasks.
+  what is drawn and how much goes through mesh tasks. Reproduced unattended (run-244): A pressed every two seconds
+  from the title and `OOT_MOVIE_SKIP=2` (`tools/run.py --skip-movies`) reach the mesh draws in about 25 s, and the
+  screenshot is pure black.
+- **Faint rectangle outlines in the cinematic** (the user, on a frame filled with blue sky): the upscaler's tiles
+  show at their edges. Not yet measured whether the emulated HMMA shows them too (tensor cores round once, the
+  emulation per step) or whether a tile border is handled wrongly.
 
 ## Where the port stands
 

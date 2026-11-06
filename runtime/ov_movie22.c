@@ -75,6 +75,7 @@ typedef struct {
     int64_t pace_pts; uint64_t pace_ns;  // pacing log: the picture time stamp and host time at the last line
     uint64_t skipped, pace_skipped, decode_ns, pace_decode_ns;
     int64_t clock_pts; uint64_t clock_ns;  // playback clock: the picture time stamp shown at host time clock_ns
+    int skip, skip_sent;                 // OOT_MOVIE_SKIP: this movie ends at once (open_dec, acquire)
     HANDLE worker;                       // the host thread that runs dav1d (decode_thread)
     CONDITION_VARIABLE wake;             // under lock: a sample queued, a ring slot freed, or quit
     SRWLOCK dav_lock;                    // held around every dav1d call
@@ -170,6 +171,15 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
         memset(d, 0, sizeof *d);
         d->guest = guest, d->video = video;
         d->ev_in = in, d->ev_out = out, d->ev_fmt = fmt;     // events of an earlier life stay valid
+        if (video) {
+            // OOT_MOVIE_SKIP=<n> (testing): the n-th video decoder opened and every later one end at once, so a run
+            // gets past the opening cinematic to the game (the title loop is the first, the opening the second).
+            static int opened;
+            const char *e = getenv("OOT_MOVIE_SKIP");
+            int from = e ? atoi(e) : 0;
+            d->skip = from > 0 && ++opened >= from;
+            if (d->skip) rt_log("movie22: video decoder %d skipped (OOT_MOVIE_SKIP=%d): its first frame is the end of stream", opened, from);
+        }
     }
     ReleaseSRWLockExclusive(&lock);
     if (!d) { rt_log("movie22: more than %d decoders alive", MAX_DECODERS); return NULL; }
@@ -446,7 +456,10 @@ static void ov_decode(Cpu *c) {                              // DecodeAsync(cons
         if (size >= 8 && p && said <= 12)
             rt_log("movie22:   starts %02x %02x %02x %02x %02x %02x %02x %02x", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
-    if (d->video) {
+    if (d->video && d->skip) {                               // OOT_MOVIE_SKIP: nothing decoded, the end is ready
+        event_signal(c, d->ev_in);
+        event_signal(c, d->ev_out);
+    } else if (d->video) {
         AcquireSRWLockExclusive(&lock);
         if ((data && size) || eos) {
             if (!enqueue(d, (const uint8_t *)(uintptr_t)data, (size_t)(data ? size : 0), ts, eos) && d->warned < 3)
@@ -503,6 +516,18 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     uint64_t *out = arg_p(c, 1);
     int *index = with_index ? arg_p(c, 2) : NULL;
     if (!d || !out || !d->nframes) { ret_x(c, MOVIE_R_NO_FRAME); return; }
+    if (d->video && d->skip) {                               // OOT_MOVIE_SKIP: one end-of-stream frame, then nothing
+        if (d->skip_sent || (d->busy & 1)) { ret_x(c, MOVIE_R_NO_FRAME); return; }
+        uint64_t frame = d->frames[0];
+        d->busy |= 1, d->skip_sent = 1, d->acquired++;
+        rt_call(c, G.set_ts, 2, frame, 0ull);
+        rt_call(c, G.video_eos, 2, frame, 1ull);
+        *out = frame;
+        if (index) *index = 0;
+        rt_log("movie22: skipped movie handed back its end of stream");
+        ret_x(c, 0);
+        return;
+    }
     if (!d->video) {
         if (!d->eos_pending || d->busy) { ret_x(c, MOVIE_R_NO_FRAME); return; }
         uint64_t frame = d->frames[0];
