@@ -1,4 +1,4 @@
-// From totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), adapted to this project's platform.h, which is smaller than TotK's: the functions it declares only. Left out: fibers, thread interruption, the fault and crash hooks, the write watch, the virtual memory reservations, IPC, restart and the TotK-only helpers. plat_thread_detach frees its PlatThread (TotK keeps it), and plat_lib_open leaves the name's search to dlopen.
+// From totk-pc-recomp runtime/platform/linux.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), adapted to this project's platform.h, which is smaller than TotK's: the functions it declares only. Copied from TotK, with the reader-writer lock (plat_mutex_lock_shared, and the exclusive lock now shares its word with it), the virtual memory functions with the write watch (userfaultfd write protection and PAGEMAP_SCAN, and the page-state table) and the write-fault hook (here a SIGSEGV handler that only runs the hook; TotK's crash hooks are left out), and the write-watch ABI block. Left out: fibers, thread interruption, the crash hook, IPC, restart and the TotK-only helpers. plat_thread_detach frees its PlatThread (TotK keeps it), and plat_lib_open leaves the name's search to dlopen.
 // Linux implementation of platform.h: pthreads, CLOCK_MONOTONIC, futex locks and condition variables, POSIX files,
 // /proc and sysfs for the load counters, posix_spawn for child processes.
 #define _GNU_SOURCE
@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/futex.h>
+#include <linux/userfaultfd.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -24,7 +26,46 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
+
+// The write-watch ABI of Linux 6.7 (uapi linux/fs.h and linux/userfaultfd.h), for headers older than it. The kernel refuses
+// what it lacks at run time.
+#ifndef PAGEMAP_SCAN
+struct page_region {
+    __u64 start;
+    __u64 end;
+    __u64 categories;
+};
+struct pm_scan_arg {
+    __u64 size;
+    __u64 flags;
+    __u64 start;
+    __u64 end;
+    __u64 walk_end;
+    __u64 vec;
+    __u64 vec_len;
+    __u64 max_pages;
+    __u64 category_inverted;
+    __u64 category_mask;
+    __u64 category_anyof_mask;
+    __u64 return_mask;
+};
+#define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
+#define PAGE_IS_WRITTEN (1 << 1)
+#define PAGE_IS_PRESENT (1 << 3)
+#define PAGE_IS_SWAPPED (1 << 4)
+#define PAGE_IS_PFNZERO (1 << 5)
+#define PM_SCAN_WP_MATCHING (1 << 0)
+#define PM_SCAN_CHECK_WPASYNC (1 << 1)
+#endif
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_UNPOPULATED (1 << 13)
+#define UFFD_FEATURE_WP_ASYNC (1 << 15)
+#endif
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
+#endif
 
 #include "platform.h"
 
@@ -137,12 +178,16 @@ void plat_sleep_ns(uint64_t ns) {
     while (plat_now_ns() < end) sched_yield();
 }
 
-// ---- locks: a non-recursive futex lock in one 32-bit word, zero when free.
-// bit 31: held; bit 30: some thread sleeps on the word. A thread that cannot take the lock after a short spin sets the
-// sleeper bit and waits on the futex; every unlock that finds the bit clears it and wakes all sleepers, which retry.
+// ---- locks: a reader-writer lock in one 32-bit word, zero when free. Adapted from totk-pc-recomp runtime/platform/linux.c
+// (see the header).
+// bit 31: a writer holds it; bit 30: some thread sleeps on the word; bits 0-29: readers holding it.
+// A thread that cannot take the lock sets the sleeper bit and waits on the futex; every release that finds the bit
+// clears it and wakes all sleepers, which retry (and set it again if they still cannot get in). Readers do not enter
+// while the sleeper bit is set, so a waiting writer is not starved by a stream of readers.
 
-#define LK_HELD 0x80000000u
-#define LK_SLEEPERS 0x40000000u
+#define LK_W 0x80000000u
+#define LK_S 0x40000000u
+#define LK_R 0x3fffffffu
 #define LK_SPINS 64
 
 static long futex(volatile uint32_t *w, int op, uint32_t val, const struct timespec *ts) {
@@ -153,13 +198,12 @@ static inline volatile uint32_t *lk(PlatMutex *m) { return (volatile uint32_t *)
 
 // Sets the sleeper bit on s and sleeps while the word still equals the result.
 static void lk_sleep(volatile uint32_t *w, uint32_t s) {
-    if (!(s & LK_SLEEPERS) && !__atomic_compare_exchange_n(w, &s, s | LK_SLEEPERS, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-        return;
-    futex(w, FUTEX_WAIT, s | LK_SLEEPERS, NULL);
+    if (!(s & LK_S) && !__atomic_compare_exchange_n(w, &s, s | LK_S, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    futex(w, FUTEX_WAIT, s | LK_S, NULL);
 }
 
 static void lk_wake(volatile uint32_t *w) {
-    __atomic_fetch_and(w, ~LK_SLEEPERS, __ATOMIC_RELAXED);
+    __atomic_fetch_and(w, ~LK_S, __ATOMIC_RELAXED);
     futex(w, FUTEX_WAKE, INT_MAX, NULL);
 }
 
@@ -168,8 +212,8 @@ void plat_mutex_init(PlatMutex *m) { m->p = 0; }
 int plat_mutex_trylock(PlatMutex *m) {
     volatile uint32_t *w = lk(m);
     uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
-    while (!(s & LK_HELD))
-        if (__atomic_compare_exchange_n(w, &s, s | LK_HELD, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
+    while (!(s & (LK_W | LK_R)))
+        if (__atomic_compare_exchange_n(w, &s, s | LK_W, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
     return 0;
 }
 
@@ -177,8 +221,8 @@ void plat_mutex_lock(PlatMutex *m) {
     volatile uint32_t *w = lk(m);
     for (int spin = 0;; spin++) {
         uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
-        if (!(s & LK_HELD)) {
-            if (__atomic_compare_exchange_n(w, &s, s | LK_HELD, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+        if (!(s & (LK_W | LK_R))) {
+            if (__atomic_compare_exchange_n(w, &s, s | LK_W, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
             continue;
         }
         if (spin < LK_SPINS) spin_pause();
@@ -188,8 +232,27 @@ void plat_mutex_lock(PlatMutex *m) {
 
 void plat_mutex_unlock(PlatMutex *m) {
     volatile uint32_t *w = lk(m);
-    uint32_t s = __atomic_fetch_and(w, ~LK_HELD, __ATOMIC_RELEASE);
-    if (s & LK_SLEEPERS) lk_wake(w);
+    uint32_t s = __atomic_fetch_and(w, ~LK_W, __ATOMIC_RELEASE);
+    if (s & LK_S) lk_wake(w);
+}
+
+void plat_mutex_lock_shared(PlatMutex *m) {
+    volatile uint32_t *w = lk(m);
+    for (int spin = 0;; spin++) {
+        uint32_t s = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (!(s & (LK_W | LK_S))) {
+            if (__atomic_compare_exchange_n(w, &s, s + 1, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+            continue;
+        }
+        if (spin < LK_SPINS) spin_pause();
+        else lk_sleep(w, s);
+    }
+}
+
+void plat_mutex_unlock_shared(PlatMutex *m) {
+    volatile uint32_t *w = lk(m);
+    uint32_t s = __atomic_sub_fetch(w, 1, __ATOMIC_RELEASE);
+    if (!(s & LK_R) && (s & LK_S)) lk_wake(w);
 }
 
 // ---- condition variables: a sequence number in the first 32 bits. A waiter reads it before releasing the lock and
@@ -226,17 +289,192 @@ void plat_cond_broadcast(PlatCond *c) {
     futex(cv(c), FUTEX_WAKE, INT_MAX, NULL);
 }
 
-// ---- memory
+// ---- virtual memory. Reservations are PROT_NONE MAP_NORESERVE mappings; commit is mprotect read-write, decommit
+// MADV_DONTNEED and PROT_NONE. Linux keeps no committed/reserved distinction, so a byte per guest page records the state
+// (pstate, mapped lazily: only the pages touched cost memory). Adapted from totk-pc-recomp runtime/platform/linux.c.
+//
+// Write watch: a userfaultfd in asynchronous write-protect mode (Linux 6.7) over the watched reservations. The kernel
+// clears a page's protection on the first write without a round trip to us, and PAGEMAP_SCAN lists the pages whose
+// protection was cleared and protects them again. Without it (an older kernel), plat_mem_written reports the ranges as
+// untracked and the back end uploads them in full.
 
-// The range must already be mapped (the guest's reservations); Linux has no commit step beyond the protection.
-int plat_mem_commit(uint64_t addr, size_t n) {
-    return mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE) == 0;
+#define PG 4096ull
+#define PS_LIMIT (1ull << 39)
+enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
+static uint8_t *pstate;
+static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
+static PlatMutex vm_lock = PLAT_MUTEX_INIT;
+
+static void ps_set(uint64_t addr, uint64_t n, uint8_t v) {
+    if (addr < PS_LIMIT) memset(pstate + addr / PG, v, (size_t)((n + PG - 1) / PG));
 }
 
-// process_vm_readv on our own process copies the bytes and fails, rather than faulting, on unmapped memory.
+static void ww_open(void) {
+    int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    struct uffdio_api api = {.api = UFFD_API,
+                             .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
+    if (fd < 0 || ioctl(fd, UFFDIO_API, &api)) {
+        fprintf(stderr, "platform: no asynchronous userfaultfd write protection (%s): written memory is not tracked\n",
+                strerror(errno));
+        if (fd >= 0) close(fd);
+        return;
+    }
+    pm_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (pm_fd < 0) {
+        close(fd);
+        return;
+    }
+    ww_fd = fd;
+}
+
+int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
+    plat_mutex_lock(&vm_lock);
+    if (!pstate) {
+        void *p = mmap(NULL, PS_LIMIT / PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        pstate = p == MAP_FAILED ? NULL : p;
+    }
+    if (watch && ww_fd < 0 && pm_fd < 0) ww_open();
+    void *p = pstate && addr + n <= PS_LIMIT
+                  ? mmap((void *)(uintptr_t)addr, n, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0)
+                  : MAP_FAILED;
+    int ok = p == (void *)(uintptr_t)addr;
+    if (p != MAP_FAILED && !ok) munmap(p, n);   // a kernel without MAP_FIXED_NOREPLACE put it elsewhere
+    if (ok) {
+        ps_set(addr, n, PS_RESERVED);
+        // Transparent huge pages would populate (and count as written) 2 MiB at the first write of one page; writes are
+        // tracked per 4 KiB page, as on Windows.
+        if (watch) madvise(p, n, MADV_NOHUGEPAGE);
+        struct uffdio_register reg = {.range = {addr, n}, .mode = UFFDIO_REGISTER_MODE_WP};
+        if (watch && ww_fd >= 0 && ioctl(ww_fd, UFFDIO_REGISTER, &reg))
+            fprintf(stderr, "platform: write watch over %#llx+%#llx failed (%s)\n", (unsigned long long)addr,
+                    (unsigned long long)n, strerror(errno));
+    }
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
+
+void *plat_mem_alloc(size_t n) {
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+int plat_mem_commit(uint64_t addr, size_t n) {
+    if (mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
+    ps_set(addr, n, PS_RW);
+    return 1;
+}
+
+int plat_mem_decommit(uint64_t addr, uint64_t n) {
+    if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED) || mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
+    ps_set(addr, n, PS_RESERVED);
+    return 1;
+}
+
+int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
+    int p = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
+    if (mprotect((void *)(uintptr_t)addr, n, p)) return 0;
+    ps_set(addr, n, (uint8_t)(PS_NONE + prot));
+    return 1;
+}
+
+void plat_mem_release(uint64_t addr, uint64_t n) {
+    munmap((void *)(uintptr_t)addr, n);
+    ps_set(addr, n, PS_FREE);
+}
+
+int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
+    if (!pstate || addr >= PS_LIMIT) {
+        *end = limit;
+        return PLAT_MEM_FREE;
+    }
+    uint64_t lim = limit < PS_LIMIT ? limit : PS_LIMIT, i = addr / PG;
+    uint8_t v = pstate[i];
+    while ((i + 1) * PG < lim && pstate[i + 1] == v) i++;
+    *end = (i + 1) * PG < lim ? (i + 1) * PG : lim;
+    return v == PS_FREE ? PLAT_MEM_FREE : v == PS_RESERVED ? PLAT_MEM_RESERVED : (int)v - PS_NONE;
+}
+
+uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
+    if (!max || !n) return 0;
+    if (ww_fd < 0) return UINT64_MAX;
+    struct page_region r[256];
+    uint64_t got = 0;
+    for (uint64_t at = addr, end = addr + n; at < end && got < max;) {
+        // Written means: write-protection cleared, on a populated page (present or swapped out) that is not the shared
+        // zero page. A page never touched since its commit has no protection marker either and counts as written to
+        // the kernel; a read maps the zero page there. Neither is a write, as on Windows.
+        struct pm_scan_arg arg = {.size = sizeof arg,
+                                  .flags = reset ? PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC : 0,
+                                  .start = at, .end = end, .vec = (uint64_t)(uintptr_t)r, .vec_len = 256,
+                                  .max_pages = max - got,
+                                  .category_inverted = PAGE_IS_PFNZERO,
+                                  .category_mask = PAGE_IS_WRITTEN | PAGE_IS_PFNZERO,
+                                  .category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED,
+                                  .return_mask = PAGE_IS_WRITTEN};
+        long k = ioctl(pm_fd, PAGEMAP_SCAN, &arg);
+        if (k < 0) return UINT64_MAX;
+        for (long i = 0; i < k; i++)
+            for (uint64_t p = r[i].start; p < r[i].end && got < max; p += PG) pages[got++] = p;
+        if (arg.walk_end <= at) break;
+        at = arg.walk_end;
+    }
+    return got;
+}
+
+// A write fault (SIGSEGV with the write bit of the page-fault error code) goes to the hook first: memory.c makes a frozen
+// region writable there. Any other fault, and a write the hook refuses, gets the default action.
+static int (*fault_hook)(uint64_t addr);
+
+static void fault_handler(int sig, siginfo_t *si, void *uc) {
+    ucontext_t *u = uc;
+    long err = u->uc_mcontext.gregs[REG_ERR];
+    if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
+    signal(sig, SIG_DFL);   // returns into the faulting instruction, which faults again with the default action
+}
+
+void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
+    fault_hook = fn;
+    struct sigaction sa = {.sa_sigaction = fault_handler, .sa_flags = SA_SIGINFO | SA_NODEFER};
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+}
+
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
     struct iovec local = {out, n}, remote = {(void *)(uintptr_t)addr, n};
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+
+// ---- time, errors, environment, re-running
+
+uint64_t plat_tick_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+uint32_t plat_last_error(void) { return (uint32_t)errno; }
+
+int plat_setenv(const char *name, const char *value) {
+    return value ? setenv(name, value, 1) == 0 : unsetenv(name) == 0;
+}
+
+// Replaces this process with the same program and arguments (the environment goes on as it is now).
+int plat_reexec(uint32_t *err) {
+    static char args[16384];
+    char *argv[256];
+    int argc = 0;
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    size_t n = f ? fread(args, 1, sizeof args - 1, f) : 0;
+    if (f) fclose(f);
+    args[n] = 0;
+    for (size_t i = 0; i < n && argc < 255; i += strlen(args + i) + 1) argv[argc++] = args + i;
+    argv[argc] = NULL;
+    fflush(stdout);
+    fflush(stderr);
+    execv("/proc/self/exe", argv);
+    if (err) *err = (uint32_t)errno;
+    return 0;
 }
 
 // ---- files

@@ -39,7 +39,8 @@ static inline uint64_t plat_scaled(PlatScale s, uint64_t t) {
 void plat_sleep_ns(uint64_t ns);          // returns no earlier than ns later; overshoot well under 1 ms
 
 // ---- locks (not recursive) and condition variables; zero-initialised storage is a valid unlocked lock and an empty
-// condition variable (PLAT_MUTEX_INIT / PLAT_COND_INIT spell it).
+// condition variable (PLAT_MUTEX_INIT / PLAT_COND_INIT spell it). A PlatMutex is a reader-writer lock: taken
+// exclusively (plat_mutex_lock) or shared (plat_mutex_lock_shared), like Windows' SRW lock it is on Windows.
 typedef struct { void *p; } PlatMutex;
 typedef struct { void *p; } PlatCond;
 #define PLAT_MUTEX_INIT {0}
@@ -48,14 +49,47 @@ void plat_mutex_init(PlatMutex *m);
 void plat_mutex_lock(PlatMutex *m);
 int plat_mutex_trylock(PlatMutex *m);     // 1 when acquired
 void plat_mutex_unlock(PlatMutex *m);
+void plat_mutex_lock_shared(PlatMutex *m);
+void plat_mutex_unlock_shared(PlatMutex *m);
 void plat_cond_init(PlatCond *c);
 void plat_cond_wait(PlatCond *c, PlatMutex *m);
 int plat_cond_wait_ns(PlatCond *c, PlatMutex *m, uint64_t ns);   // 0 on timeout (spurious wakeups return 1 too)
 void plat_cond_signal(PlatCond *c);
 void plat_cond_broadcast(PlatCond *c);
 
-// ---- memory
+// Milliseconds since an arbitrary start, monotonic (GetTickCount64 on Windows).
+uint64_t plat_tick_ms(void);
+
+// ---- errors, environment, re-running the program
+uint32_t plat_last_error(void);                           // the OS error code of the last failed call (GetLastError, errno)
+int plat_setenv(const char *name, const char *value);     // value NULL removes the variable; 1 on success
+// Starts this program again with the same arguments and environment. On success it does not return (Windows: it waits
+// for the new process and exits with its exit code; Linux: it replaces this process). On failure returns 0 and *err
+// gets the OS error code.
+int plat_reexec(uint32_t *err);
+
+// ---- memory: guest ranges reserved at fixed addresses, committed, decommitted and protected at 4 KiB granularity
+enum { PLAT_PROT_NONE, PLAT_PROT_READ, PLAT_PROT_RW };
+// plat_mem_state: PLAT_PROT_* for a committed page, else one of these.
+enum { PLAT_MEM_FREE = -2, PLAT_MEM_RESERVED = -1, PLAT_MEM_OTHER = -3 };   // OTHER: committed with another protection
+// Reserves [addr, addr + n) inaccessible, exactly there: 1 on success, 0 when any of it is taken. watch: writes to its
+// pages are tracked for plat_mem_written.
+int plat_mem_reserve(uint64_t addr, uint64_t n, int watch);
+// n bytes of read-write zero memory anywhere, backed as pages are written; NULL on failure. Kept until exit.
+void *plat_mem_alloc(size_t n);
 int plat_mem_commit(uint64_t addr, size_t n);             // read-write pages inside a reserved range; 1 on success
+int plat_mem_decommit(uint64_t addr, uint64_t n);         // contents dropped: the pages read zero when committed again; 1 on success
+int plat_mem_protect(uint64_t addr, uint64_t n, int prot); // committed pages only: PLAT_PROT_*; 1 on success
+void plat_mem_release(uint64_t addr, uint64_t n);         // gives back a range from plat_mem_reserve; n is its size
+// The page at addr: PLAT_PROT_* when committed, else PLAT_MEM_RESERVED or PLAT_MEM_FREE (not reserved by us). *end gets
+// the end of the run of pages in the same state, at most limit.
+int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end);
+// The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
+// order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
+uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
+// A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and the
+// write should run again, 0 to let the fault go on. One hook per process.
+void plat_mem_fault_hook(int (*fn)(uint64_t addr));
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 
 // ---- files. Paths are UTF-8 with either separator; each implementation converts to what the OS wants.

@@ -123,6 +123,8 @@ void plat_mutex_init(PlatMutex *m) { InitializeSRWLock((PSRWLOCK)m); }
 void plat_mutex_lock(PlatMutex *m) { AcquireSRWLockExclusive((PSRWLOCK)m); }
 int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
+void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared((PSRWLOCK)m); }
+void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared((PSRWLOCK)m); }
 
 void plat_cond_init(PlatCond *c) { InitializeConditionVariable((PCONDITION_VARIABLE)c); }
 void plat_cond_wait(PlatCond *c, PlatMutex *m) { SleepConditionVariableSRW((PCONDITION_VARIABLE)c, (PSRWLOCK)m, INFINITE, 0); }
@@ -295,8 +297,101 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
     return 1;
 }
 
+uint64_t plat_tick_ms(void) { return GetTickCount64(); }
+
+uint32_t plat_last_error(void) { return (uint32_t)GetLastError(); }
+
+int plat_setenv(const char *name, const char *value) { return SetEnvironmentVariableA(name, value) != 0; }
+
+// Creates the same command line in a new process, waits for it and exits with its code (the code of the parent
+// memory.c's reexec_or_fail used before this layer existed).
+int plat_reexec(uint32_t *err) {
+    STARTUPINFOW si = {.cb = sizeof si};
+    PROCESS_INFORMATION pi;
+    wchar_t *cmd = _wcsdup(GetCommandLineW());   // CreateProcessW may write its command line
+    if (!cmd || !CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        if (err) *err = (uint32_t)GetLastError();
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 70;
+    GetExitCodeProcess(pi.hProcess, &code);
+    ExitProcess(code);
+}
+
+int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
+    void *p = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_RESERVE | (watch ? MEM_WRITE_WATCH : 0), PAGE_NOACCESS);
+    if (p && p != (void *)(uintptr_t)addr) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        p = NULL;
+    }
+    return p != NULL;
+}
+
+void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
+
 int plat_mem_commit(uint64_t addr, size_t n) {
     return VirtualAlloc((void *)(uintptr_t)addr, n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+}
+
+int plat_mem_decommit(uint64_t addr, uint64_t n) {
+    return VirtualFree((void *)(uintptr_t)addr, n, MEM_DECOMMIT) != 0;
+}
+
+static DWORD win_prot(int prot) {
+    return prot == PLAT_PROT_RW ? PAGE_READWRITE : prot == PLAT_PROT_READ ? PAGE_READONLY : PAGE_NOACCESS;
+}
+
+int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
+    DWORD old;
+    return VirtualProtect((void *)(uintptr_t)addr, n, win_prot(prot), &old) != 0;
+}
+
+void plat_mem_release(uint64_t addr, uint64_t n) {
+    (void)n;   // VirtualFree with MEM_RELEASE takes the base address and frees the whole reservation
+    VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE);
+}
+
+int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void *)(uintptr_t)addr, &mbi, sizeof mbi)) {
+        *end = limit;
+        return PLAT_MEM_FREE;
+    }
+    uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    *end = b < limit ? b : limit;
+    if (mbi.State == MEM_FREE) return PLAT_MEM_FREE;
+    if (mbi.State == MEM_RESERVE) return PLAT_MEM_RESERVED;
+    if (mbi.Protect == PAGE_NOACCESS) return PLAT_PROT_NONE;
+    if (mbi.Protect == PAGE_READONLY) return PLAT_PROT_READ;
+    if (mbi.Protect == PAGE_READWRITE) return PLAT_PROT_RW;
+    return PLAT_MEM_OTHER;
+}
+
+uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
+    ULONG_PTR cnt = (ULONG_PTR)max;
+    DWORD gran;
+    _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
+    if (GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, (void *)(uintptr_t)addr, (SIZE_T)n, (PVOID *)pages, &cnt, &gran))
+        return UINT64_MAX;
+    return cnt;
+}
+
+static int (*fault_hook)(uint64_t addr);
+
+// A write access violation at a page goes to the hook first; the hook made the page writable when it returns 1.
+static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook && fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                           : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
+    fault_hook = fn;
+    AddVectoredExceptionHandler(1, fault_handler);   // before the crash handler
 }
 
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
