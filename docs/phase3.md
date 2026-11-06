@@ -266,8 +266,11 @@ Open, in order:
 - The mesh stages: the level draws with `DrawMeshTasksIndirect` too (stubs).
 - The movie start stutters for about 8 s (every other frame ~160 ms while the GPU needs 5-13 ms: CPU side), and the
   cutscene's audio stream runs 10-20 s off the picture (the user); the opening's voice lines are silent.
-- `OOT_MOVIE_SKIP` hands its end back before the game has sent its own end and the game ignores it; it needs to wait
-  for the flag-8 buffer (until then a run sits through the 154 s opening).
+- (Done) `OOT_MOVIE_SKIP`: the cutscene follows the time stamps of the pictures it shows, not the movie's end alone
+  nor its audio stream (the user: the cut to the game came before the lagging audio ended). The skip now hands back,
+  once the game has sent its end buffer, one black picture stamped with the last sample's time, then the end; the
+  quick route (`tools/run.py --replay build/logs/a-spam.txt --skip-movies`) reaches the level in about 75 s.
+  The game has no button to skip the opening (the user).
 
 ## Where the port stands
 

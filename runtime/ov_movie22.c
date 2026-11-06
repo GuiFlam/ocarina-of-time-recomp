@@ -78,7 +78,8 @@ typedef struct {
     int64_t pace_pts; uint64_t pace_ns;  // pacing log: the picture time stamp and host time at the last line
     uint64_t skipped, pace_skipped, decode_ns, pace_decode_ns;
     int64_t clock_pts; uint64_t clock_ns;  // playback clock: the picture time stamp shown at host time clock_ns
-    int skip, skip_sent, skip_end;       // OOT_MOVIE_SKIP: no pictures; the end once the game sent its end buffer
+    int skip, skip_sent, skip_end;       // OOT_MOVIE_SKIP: the last picture and the end once the game sent its end
+                                         // buffer (skip_sent: 1 the picture handed back, 2 the end too)
     int64_t skip_pts;                    // the last sample's time stamp, for that end frame
     HANDLE worker;                       // the host thread that runs dav1d (decode_thread)
     CONDITION_VARIABLE wake;             // under lock: a sample queued, a ring slot freed, or quit
@@ -526,15 +527,38 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     uint64_t *out = arg_p(c, 1);
     int *index = with_index ? arg_p(c, 2) : NULL;
     if (!d || !out || !d->nframes) { ret_x(c, MOVIE_R_NO_FRAME); return; }
-    if (d->video && d->skip) {   // OOT_MOVIE_SKIP: the end-of-stream frame once the game sent its end (flag 8) buffer
-        // (2026-11-06: an end handed back before that is ignored by the game, which then waits for one forever)
-        if (!d->skip_end || d->skip_sent || (d->busy & 1)) { ret_x(c, MOVIE_R_NO_FRAME); return; }
-        uint64_t frame = d->frames[0];
-        d->busy |= 1, d->skip_sent = 1, d->acquired++;
+    if (d->video && d->skip) {
+        // OOT_MOVIE_SKIP: once the game has sent its end (flag 8) buffer, one black picture with the last sample's time
+        // stamp, then the end of stream. The cutscene follows the time stamps of the pictures it shows: an end alone
+        // (at once, or after the game's end buffer, with time stamp 0 or the last one) left it waiting (2026-11-06).
+        if (!d->skip_end || d->skip_sent >= 2) { ret_x(c, MOVIE_R_NO_FRAME); return; }
+        int i = free_frame(d);
+        if (i < 0) { ret_x(c, MOVIE_R_NO_FRAME); return; }
+        uint64_t frame = d->frames[i];
+        d->busy |= 1u << i, d->acquired++;
+        if (d->skip_sent == 0) {
+            uint8_t *buf = (uint8_t *)(uintptr_t)LD64(frame + 0x8);
+            uint64_t cap = LD64(frame + 0x48);
+            size_t ysz = (size_t)cap * 2 / 3;
+            if (buf && cap) memset(buf, 16, ysz), memset(buf + ysz, 128, (size_t)cap - ysz);   // black, NV12
+            rt_call(c, G.set_plane, 4, frame, U(buf), (uint64_t)ysz, 0ull);
+            rt_call(c, G.set_plane, 4, frame, U(buf + ysz), (uint64_t)(cap - ysz), 1ull);
+            rt_call(c, G.set_plane, 4, frame, 0ull, 0ull, 2ull);
+            rt_call(c, G.set_ts, 2, frame, (uint64_t)d->skip_pts);
+            rt_call(c, G.video_eos, 2, frame, 0ull);
+            d->skip_sent = 1, d->last_pts = d->skip_pts;
+            *out = frame;
+            if (index) *index = i;
+            rt_log("movie22: skipped movie handed back its last picture (pts %lld ns)", (long long)d->skip_pts);
+            event_signal(c, d->ev_out);
+            ret_x(c, 0);
+            return;
+        }
+        d->skip_sent = 2;
         rt_call(c, G.set_ts, 2, frame, (uint64_t)d->skip_pts);
         rt_call(c, G.video_eos, 2, frame, 1ull);
         *out = frame;
-        if (index) *index = 0;
+        if (index) *index = i;
         rt_log("movie22: skipped movie handed back its end of stream");
         ret_x(c, 0);
         return;

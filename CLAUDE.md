@@ -68,7 +68,7 @@ the first frame (an SDK abort in MultiWait, see the docs).
     cinematic. A at frame 600 (`--press-a`) brings up the menu.
   - Into the game without sitting through the opening: `python3 tools/run.py --seconds 150 --replay
     build/logs/a-spam.txt --skip-movies` (the script: A every 120 frames from frame 600, written by a one-line
-    Python loop) reaches gameplay in about 25 s. `--record FILE` writes a played session as a script for `--replay`.
+    Python loop) reaches the level in about 75 s; the game itself cannot skip the opening. `--record FILE` writes a played session as a script for `--replay`.
   - Out of focus the game pauses itself, music included, as on the console under the HOME menu; `tools/run.py` pins
     the focus (`OOT_ASSUME_FOCUS=1`).
   - The movies have no sound track: the music is the game's own audio.
