@@ -95,10 +95,22 @@ typedef struct { const char *name; GuestFn fn; } RtHostEntry;
 #define RT_CAT2(a, b) a##b
 #define RT_CAT(a, b) RT_CAT2(a, b)
 // File-scope declarations; fn must be declared before. The loader binds them by symbol name.
+
+// The linker tables of HOST_OVERRIDE / HOST_OBSERVER entries. PE/COFF sorts ".ovr$a" < ".ovr$m" < ".ovr$z" by the text after
+// the '$', so hostfn.c brackets the entries with the a and z sections. ELF has no such rule: a section named like a C
+// identifier ("ovr") gets __start_ovr / __stop_ovr from GNU ld, and hostfn.c reads those.
+#ifdef _WIN32
+#define RT_OVR_SECTION ".ovr$m"
+#define RT_OBS_SECTION ".obs$m"
+#else
+#define RT_OVR_SECTION "ovr"
+#define RT_OBS_SECTION "obs"
+#endif
+
 #define HOST_OVERRIDE(sym, fn) /* replaces sym in every GOT/GLOB_DAT/ABS64 of every module */                  \
-    __attribute__((used, section(".ovr$m"))) static const RtHostEntry RT_CAT(rt_ovr_, __COUNTER__) = {sym, fn}
+    __attribute__((used, section(RT_OVR_SECTION))) static const RtHostEntry RT_CAT(rt_ovr_, __COUNTER__) = {sym, fn}
 #define HOST_OBSERVER(sym, fn) /* JUMP_SLOT only; fn calls rt_original(c) */                                    \
-    __attribute__((used, section(".obs$m"))) static const RtHostEntry RT_CAT(rt_obs_, __COUNTER__) = {sym, fn}
+    __attribute__((used, section(RT_OBS_SECTION))) static const RtHostEntry RT_CAT(rt_obs_, __COUNTER__) = {sym, fn}
 uint64_t hostfn_register(const char *name, GuestFn fn);    // synthetic address; before hostfn_seal only. The same
                                                            // (name, fn) pair returns the same address
 GuestFn hostfn_override(const char *name);                 // NULL if none
