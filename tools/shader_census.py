@@ -52,6 +52,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'tools'))
 XLATE = ROOT / 'build' / 'xlate' / 'oot_xlate.exe'
 LOWER_SOURCES = [ROOT / 'runtime' / 'sm86_lower.c', ROOT / 'tools' / 'sm86_lower_main.c']
 ZSTD = b'\x28\xb5\x2f\xfd'
@@ -316,7 +317,7 @@ def lower(programs, out):
     missing = set(programs) - failures.keys()
     if ok != len(missing):
         sys.exit(f'the lowering helper answered for {ok + len(failures)} of {len(programs)} programs:\n{r.stderr[-2000:]}')
-    write_groups(out / 'lowered.txt', [('lowering failures', failures)], programs)
+    write_groups(out / 'lowered.txt', [('lowering failures', failures)], programs, out)
     return ok, failures
 
 
@@ -324,7 +325,8 @@ def normalize(message):
     return re.sub(r'\b\d+\b|0x[0-9a-fA-F]+|\+[0-9a-fA-F]+', 'N', message)[:300]
 
 
-def write_groups(path, tables, programs):
+def write_groups(path, tables, programs, out=None):
+    """Failures grouped by message; a lowering failure's example lines also show the instruction (sm86_dis)."""
     lines = []
     for title, table in tables:
         groups = defaultdict(list)
@@ -334,7 +336,14 @@ def write_groups(path, tables, programs):
         for _, members in sorted(groups.items(), key=lambda g: -len(g[1])):
             stages = Counter(programs[k]['stage'] for k, _ in members if k in programs)
             lines.append(f'{len(members)}\t{members[0][1][:300]}\t{dict(stages)}')
-            lines.extend(f'\texample {key}' for key, _ in sorted(members)[:2])
+            for key, message in sorted(members)[:2]:
+                lines.append(f'\texample {key}')
+                m = re.search(r'\(at \+([0-9a-f]+)\)$', message)
+                if m and out and key in programs:
+                    import sm86_dis
+                    code = (out / 'code' / f'{key}.code').read_bytes()
+                    at = int(m.group(1), 16)
+                    lines.extend('\t\t' + t for t in sm86_dis.listing(code, at, min(at + 16, len(code))))
     if any(t for _, t in tables):
         path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     else:
@@ -403,16 +412,21 @@ def main():
     ap.add_argument('--version', required=True, help='v131072 (build/extracted/<version>)')
     ap.add_argument('--lower', action='store_true', help='lower every program to Maxwell and report the failures')
     ap.add_argument('--translate', action='store_true', help='also translate every lowered program (implies --lower)')
+    ap.add_argument('--extract', action='store_true', help='read the archives again even when programs.json exists')
     args = ap.parse_args()
     t0 = time.monotonic()
     extracted = ROOT / 'build' / 'extracted' / args.version
     out = ROOT / 'build' / args.version / 'shaders'
     out.mkdir(parents=True, exist_ok=True)
-    shaders, visited = inventory(extracted / 'romfs')
-    programs = write_corpus(shaders, out)
-    stages = Counter(p['stage'] for p in programs.values())
-    print(f'{len(programs)} unique programs from {len(visited)} files: {dict(stages)}; '
-          f'extracted in {time.monotonic() - t0:.1f} s', flush=True)
+    if (out / 'programs.json').is_file() and not args.extract:
+        programs = json.loads((out / 'programs.json').read_text(encoding='utf-8'))
+        print(f'{len(programs)} programs from programs.json (--extract reads the archives again)', flush=True)
+    else:
+        shaders, visited = inventory(extracted / 'romfs')
+        programs = write_corpus(shaders, out)
+        stages = Counter(p['stage'] for p in programs.values())
+        print(f'{len(programs)} unique programs from {len(visited)} files: {dict(stages)}; '
+              f'extracted in {time.monotonic() - t0:.1f} s', flush=True)
     if not args.lower and not args.translate:
         return 0
     ok, failures = lower(programs, out)
