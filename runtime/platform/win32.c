@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <pdh.h>
+#include <bcrypt.h>
 #include <pdhmsg.h>
 #include <psapi.h>
 #include <shellapi.h>
@@ -796,4 +797,8 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     DWORD got = 0;
     if (!ReadFile(c->out, buf, (DWORD)cap, &got, NULL)) return -1;
     return (long)got;
+}
+
+int plat_random(void *out, size_t n) {
+    return BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
 }
