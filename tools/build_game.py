@@ -80,6 +80,16 @@ def find_tool(name):
     return Path(shutil.which(name) or name)
 
 
+def pkg_config_libs(*names):
+    """The link flags pkg-config gives for the named packages (Linux). Without pkg-config, the flags of SDL3 and libvpx
+    by name."""
+    try:
+        out = subprocess.run(['pkg-config', '--libs', *names], capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return ['-lSDL3', '-lvpx']
+    return out.split()
+
+
 # Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
@@ -117,7 +127,7 @@ else:
     SDL3_DLLS = []
     RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
     LINK_FLAGS = ['-Xlinker', '"--Map=$builddir/oot.map"']
-    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lm', '-lpthread', '-ldl']
+    LINK_LIBS = ['-lvulkan', '-lopus', '-lm', '-lpthread', '-ldl'] + pkg_config_libs('sdl3', 'vpx')
     VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h from the VulkanMemoryAllocator-devel package
     LLVM_LINK_LIBS = LINK_LIBS
     AR = find_tool('llvm-ar') if shutil.which('llvm-ar') else find_tool('ar')
@@ -208,13 +218,18 @@ def c_string(s):
 RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build without touching the shared tree
 
 
+# Host files with an SDL3 twin (same interface, TotK's *_sdl.c adapted): Linux compiles the twin, Windows the original.
+SDL_TWIN = {'swkbd_win.c': 'swkbd_sdl.c'}
+
+
 def runtime_sources(skip=()):
     """Every runtime/*.c, *.cpp, platform/*.c, *.rc, the in-game menu (ui/*.cpp) and Dear ImGui except the names in skip,
-    so a task adds a file without editing this script."""
+    so a task adds a file without editing this script. Of each SDL_TWIN pair only the one of the host is kept."""
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
             'third_party/imgui/backends/*.cpp')
+    left_out = set(SDL_TWIN) if sys.platform != 'win32' else set(SDL_TWIN.values())
     return sorted(p for pat in pats for p in RUNTIME.glob(pat)
-                  if p.name not in skip and (sys.platform == 'win32' or p.suffix != '.rc'))
+                  if p.name not in skip and p.name not in left_out and (sys.platform == 'win32' or p.suffix != '.rc'))
 
 
 def runtime_object(out, src):
