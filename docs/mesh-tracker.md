@@ -81,6 +81,41 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
 | E3 | Performance: GPU time of the mesh passes (`OOT_TRACE=perf`), pipeline build time, the prewarm and the disk cache for mesh pipelines. | E1 | todo | Frame rate on the level reported next to a passing screenshot, mesh pipelines in the prewarm. |
 | E4 | Clean up: diagnostics that stay are documented in `CLAUDE.md`; `docs/mesh.md` Status updated; the switches added on the way are in `runtime/cfg.c`'s list. | E1 | todo | `python tools/check_content.py --staged` passes and the docs match the code. |
 
+## Design for phase C (2026-11-07, before any code)
+
+Measured: `Spv.Generator/spirv.cs` (vendored) has only the NV mesh enums (TaskNV 5267, MeshNV 5268); the EXT ones
+from the Vulkan SDK's `Include/spirv-headers/spirv.h`: ExecutionModel TaskEXT 5364, MeshEXT 5365; ExecutionMode
+OutputVertices 26, OutputPrimitivesEXT 5270, OutputTrianglesEXT 5298; StorageClass TaskPayloadWorkgroupEXT 5402;
+Decoration PerPrimitiveEXT 5271; BuiltIn PrimitiveTriangleIndicesEXT 5296, CullPrimitiveEXT 5299; Capability
+MeshShadingEXT 5283; OpEmitMeshTasksEXT 5294, OpSetMeshOutputsEXT 5295 (no result, no result type). Ryujinx refers
+to stages in 29 files of `Ryujinx.Graphics.Shader` (139 uses; `ShaderStage.Count` sizes per-stage arrays) and already
+declares per-vertex output arrays for tessellation control (`Declarations.cs`, `gl_out[]` sized by
+`ThreadsPerInputPrimitive`), the nearest model for mesh outputs indexed by vertex.
+
+The plan, smallest first:
+
+1. **Translate task and mesh stages as compute programs** in the front end: workgroup and thread ids, local memory,
+   shared memory and barriers then work as they do. The lowering emits them without the graphics header (as compute,
+   `l.graphics` 0), and the job passes what the header carried: the stage (`ts` / `ms`), the output map (the
+   components of the code header's VTG map from byte 0x34), the maximum vertices and primitives (control +0x60), the
+   payload size (control +0x58, top byte), the workgroup size (32).
+2. **Decode the two pseudo instructions** (top byte 0x6c, 0x6d; `runtime/sm86_lower.h`) in `InstTable.cs` and emit IR:
+   ATTR and MAP writes to a shared-memory stage buffer (ATTR at 0, MAP after the ATTR size: maxV rounded up to 32 x
+   lines x 4 bytes; MAP.32 at 3 = the count word, MAP.U8 = byte stores); a TASK write at 4 = the count word, from 0x10
+   = the payload (shared too, copied at the end); an ATTR read at 0 or a TASK read at 0 = the workgroup id's x; a TASK
+   read from 0x10 = the task payload variable.
+3. **The epilogue in IR** (where 0x6d is decoded): a workgroup barrier; mesh: count = the count word,
+   SetMeshOutputs(maxV, count), then for v = tid + 32 j (j unrolled to maxV / 32) each component line k into its
+   output (position for lines 0-3 when the map has it, else the user output's location and component) at index v,
+   and for p = tid + 32 j below count the three index bytes into the primitive indices at p; task: copy the payload
+   words into the payload variable, EmitMeshTasks(count, 1, 1). Ryujinx's own structurizer handles the loops and ifs.
+4. **SPIR-V**: the execution model, modes (OutputVertices, OutputPrimitivesEXT, OutputTrianglesEXT, LocalSize), the
+   capability and extension, the per-vertex output arrays sized maxV, `gl_PrimitiveTriangleIndicesEXT[maxP]`, the
+   payload variable, the two new instructions. Spv.Generator gets the enums and two instruction builders.
+
+Checks along the way: `tools/kernel.py xlate` and `spirv-val --target-env vulkan1.3` on the captured programs (with
+B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment shader.
+
 ## Open questions
 
 - Is the stage buffer layout of this game the same as the one in Lichii's notes? (A3 answers it.)
