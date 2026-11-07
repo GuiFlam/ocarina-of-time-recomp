@@ -1257,7 +1257,11 @@ static void lower_imad(L *l, const Insn *x, uint32_t op) {
 }
 
 // IMAD.WIDE (0x025): Rd:Rd+1 = a * b + c:c+1, 64-bit; .U32 or signed (73). Low word by IMAD, high by IMAD.HI,
-// then the 64-bit add of c.
+// then the 64-bit add of c. b takes IMAD's register, constant or 20-bit immediate form (the same .HI bit 54 and
+// signedness bits 48 and 53 in each). The halves go straight into Rd:Rd+1 when no operand read after a half is written
+// is that half (Rd is read-only to the IMAD.HI that follows, Rd+1 only to the adds of c); otherwise through two
+// scratch registers. Vertex shaders of the level that use registers into the R220s ran out of scratch on runs of
+// IMAD.WIDE Rd, Rd+1, 0x10, R228 (2026-11-06).
 static void lower_imad_wide(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), c = bits(x, 64, 8);
     int is_signed = bits(x, 73, 1);
@@ -1265,15 +1269,32 @@ static void lower_imad_wide(L *l, const Insn *x) {
     if (bits(x, 72, 1) || bits(x, 74, 7) || bits(x, 81, 3) != 7 || (bits(x, 84, 3) != 0 && bits(x, 84, 3) != 7) ||
         bits(x, 87, 4) != 15 || rd >= 254 || (c != RZ && c >= 254))
         return (void)fail(l, "IMAD.WIDE mode");
-    uint32_t rb = to_reg(l, b, 1, 0, 0);
-    uint32_t lo = S(l, 2), hi = S(l, 3);
+    int is32;
+    uint64_t bw = b.neg || b.abs_ ? 0x5a00000000000000ull | (uint64_t)to_reg(l, b, 1, 0, 0) << 20   // modifiers applied
+                                  : b_slot(l, b, 0x5a00000000000000ull, 0x4a00000000000000ull, 0x3400000000000000ull, 0, 0, 1, &is32);
+    if (l->failed) return;
+    uint32_t rb = (bw >> 56) == 0x5a ? (uint32_t)(bw >> 20 & 0xff) : RZ;   // the register b is read from, if any
+    int direct = rd != a.reg && rd != rb && (c == RZ || (rd != c + 1 && rd + 1 != c && rd + 1 != c + 1));
     uint64_t sign = is_signed ? ((uint64_t)1 << 48) | ((uint64_t)1 << 53) : 0;
-    emit(l, base(l, 0x5a00000000000000ull, lo, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)RZ << 39));
-    emit(l, base(l, 0x5a00000000000000ull, hi, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
+    if (!direct && c != RZ && rd != a.reg && rd != rb && rd != c + 1) {
+        // One scratch register t (Rd = c is the usual case: IMAD.WIDE R228, R115, 0x10, R228): t = lo(a b),
+        // Rd = t + c setting the carry, t = hi(a b) (IMAD without .CC keeps the carry), Rd+1 = t + c+1 + carry.
+        uint32_t t = S(l, 0);
+        if (t == rb) t = S(l, 1);   // b materialised in scratch 1 is never scratch 0; this is for safety only
+        emit(l, bw | l->pred | t | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39));
+        emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)c << 20) | ((uint64_t)1 << 47));
+        emit(l, bw | l->pred | t | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
+        emit(l, base(l, 0x5c10000000000000ull, rd + 1, t) | ((uint64_t)(c + 1) << 20) | ((uint64_t)1 << 43));
+        return;
+    }
+    uint32_t lo = direct ? rd : S(l, 2), hi = direct ? rd + 1 : S(l, 3);
+    emit(l, bw | l->pred | lo | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39));
+    emit(l, bw | l->pred | hi | ((uint64_t)a.reg << 8) | ((uint64_t)RZ << 39) | sign | ((uint64_t)1 << 54));
     if (c != RZ) {                                        // + c:c+1 with the carry through the condition code
         emit(l, base(l, 0x5c10000000000000ull, lo, lo) | ((uint64_t)c << 20) | ((uint64_t)1 << 47));
         emit(l, base(l, 0x5c10000000000000ull, hi, hi) | ((uint64_t)(c + 1) << 20) | ((uint64_t)1 << 43));
     }
+    if (direct) return;
     mov_reg(l, rd, lo);
     mov_reg(l, rd + 1, hi);
 }
@@ -1499,7 +1520,9 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
     if (op == 0x381) {
         if ((x->w[2] & ~0x2e00u) != 0x001e8100u || (address & 1)) return (void)fail(l, "LDG register mode");
     } else {
-        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair(l, bits(x, 32, 6), 2);
+        // k 0: the scratch pair a forwarded base lands in is also the pair the add below writes in place, so a run
+        // of two dead registers is enough (k 2 asked for four: vertex shaders near R255 had no such run).
+        uint32_t ubase = bits(x, 38, 2) ? NOREG : ur_pair(l, bits(x, 32, 6), 0);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c1e1100u || x->w[2] == 0x0c1ebd00u;
         if ((!descriptor && (x->w[2] & ~(0x04000000u | 0x3fu | 0xe00u | 0x2000u)) != 0x081e8100u) || ubase == NOREG)
             return (void)fail(l, "LDG uniform mode");
@@ -1526,7 +1549,7 @@ static void lower_stg(L *l, const Insn *x, uint32_t op) {
     if (size > 6 || bits(x, 16, 8)) return (void)fail(l, "STG mode");
     if (data == RZ && size > 4) return (void)fail(l, "STG of wide zeros");
     if (op == 0x986) {
-        uint32_t ubase = ur_pair(l, bits(x, 64, 6), 2);
+        uint32_t ubase = ur_pair(l, bits(x, 64, 6), 0);   // k 0 as in lower_ldg
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c101100u;
         if ((!descriptor && (x->w[2] & ~(0x04000000u | 0x3fu | 0xe00u)) != 0x0810a100u) || !bits(x, 72, 1))
             return (void)fail(l, "STG uniform mode");
@@ -2131,41 +2154,57 @@ static void lower_p2r_r2p(L *l, const Insn *x, int r2p) {
     else emit(l, base(l, 0x38e8000000000000ull, rd, ra) | ((uint64_t)x->w[1] << 20) | ((uint64_t)bits(x, 76, 2) << 41));
 }
 
+// Pd = LUT(a, b, c) over predicates a, b, c (bit 3 negates; the table indexes them as bits 2, 1, 0) by one Maxwell
+// PSETP, which computes (P[12-14] op P[29-31]) op2 P[39-41] (Ryujinx InstEmitPredicate.Psetp; op and op2 from
+// BoolOpAB 24-25 and BoolOpC 45-46: 0 and, 1 or, 2 xor), each input negatable, into Pd at 3-5 and the same with the
+// inner result inverted into 0-2. The search tries each input in the outer role, every negation and op pair and
+// both outputs: 114 of the 256 tables. (Before 2026-11-06 the outer slot held a while the tables were matched with c
+// outer, so an asymmetric table such as (a & b) | c came out as (c & b) | a.) 0: no PSETP computes it.
+static int plop3_psetp(L *l, uint32_t pd, uint32_t lut, const uint32_t in[3]) {
+    for (int z = 0; z < 3; z++) {
+        int x = z == 0 ? 1 : 0, y = z == 2 ? 1 : 2;
+        for (uint32_t n = 0; n < 8; n++)
+            for (uint32_t op = 0; op < 3; op++)
+                for (uint32_t op2 = 0; op2 < 3; op2++)
+                    for (uint32_t inv = 0; inv < 2; inv++) {
+                        uint32_t t = 0;
+                        for (uint32_t v = 0; v < 8; v++) {
+                            uint32_t u[3] = {(v >> 2 & 1) ^ (n >> 2 & 1), (v >> 1 & 1) ^ (n >> 1 & 1), (v & 1) ^ (n & 1)};
+                            uint32_t ab = (op == 0 ? u[x] & u[y] : op == 1 ? u[x] | u[y] : u[x] ^ u[y]) ^ inv;
+                            t |= (op2 == 0 ? ab & u[z] : op2 == 1 ? ab | u[z] : ab ^ u[z]) << v;
+                        }
+                        if (t != lut) continue;
+                        uint32_t neg[3] = {n >> 2 & 1, n >> 1 & 1, n & 1};
+                        uint32_t px = in[x] ^ (neg[x] << 3), py = in[y] ^ (neg[y] << 3), pz = in[z] ^ (neg[z] << 3);
+                        uint64_t dst = inv ? (uint64_t)pd | (7ull << 3) : 7ull | ((uint64_t)pd << 3);
+                        emit(l, 0x5090000000000000ull | l->pred | dst | ((uint64_t)(px & 7) << 12) | ((uint64_t)(px >> 3) << 15) |
+                                    ((uint64_t)op << 24) | ((uint64_t)(py & 7) << 29) | ((uint64_t)(py >> 3) << 32) |
+                                    ((uint64_t)(pz & 7) << 39) | ((uint64_t)(pz >> 3) << 42) | ((uint64_t)op2 << 45));
+                        return 1;
+                    }
+    }
+    return 0;
+}
+
 // PLOP3 (0x01c): Pd = LUT(Pa, Pb, Pc) with table bits 64-66 and 72-76, inputs at 87-90, 77-80, 68-71 (bit 3
-// negates), outputs 81-83 and 84-86; bit 67 makes the third a uniform predicate. Maxwell PSETP covers
-// (a op b) op2 c for and/or/xor; other tables are not lowered.
-static void lower_plop3(L *l, const Insn *x) {
+// negates), outputs 81-83 and 84-86; bit 67 makes the third a uniform predicate. UPLOP3 (uniform 0x09c) has the same
+// fields over uniform predicates only (uniform = 1).
+static void lower_plop3_any(L *l, const Insn *x, int uniform) {
     uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), lut = bits(x, 64, 3) | (bits(x, 72, 5) << 3);
     uint32_t a = bits(x, 87, 4), b = bits(x, 77, 4), c = bits(x, 68, 4);
-    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, "PLOP3 mode");
-    if (bits(x, 67, 1)) c = (c & 8) | up(l, c & 7);
-    if (pd == 7) return;
-    // Tables of (a & b) | c style: PSETP Pd, PT, Pa, Pb, Pc with BoolOpAB at 24-25 and BoolOpC at 45-46
-    // (0 and, 1 or, 2 xor). The 8-bit table indexes (a, b, c) as bits 2, 1, 0.
-    static const struct { uint32_t lut, op_ab, op_c; } tables[] = {
-        {0x80, 0, 0}, {0xfe, 1, 1}, {0xa8, 0, 1}, {0xea, 1, 0}, {0xf8, 0, 1}, {0xc0, 0, 0}, {0xfc, 1, 0}, {0x96, 2, 2},
-        {0x78, 0, 2}, {0x3c, 1, 2}, {0xe8, 2, 1}, {0xb8, 0, 0},
-    };
-    // The table of (a op_ab b) op_c c over inputs negated by n (bit 2 a, bit 1 b, bit 0 c) for each candidate.
-    for (uint32_t n = 0; n < 8; n++) {
-        for (unsigned i = 0; i < sizeof tables / sizeof tables[0]; i++) {
-            uint32_t t = 0;
-            for (uint32_t v = 0; v < 8; v++) {
-                uint32_t u = v ^ n, va = u >> 2 & 1, vb = u >> 1 & 1, vc = u & 1, ab, r;
-                ab = tables[i].op_ab == 0 ? (va & vb) : tables[i].op_ab == 1 ? (va | vb) : (va ^ vb);
-                r = tables[i].op_c == 0 ? (ab & vc) : tables[i].op_c == 1 ? (ab | vc) : (ab ^ vc);
-                t |= r << v;
-            }
-            if (t != lut) continue;
-            uint32_t na = a ^ ((n >> 2 & 1) << 3), nb = b ^ ((n >> 1 & 1) << 3), nc = c ^ ((n & 1) << 3);
-            emit(l, 0x5090000000000000ull | l->pred | 7 | ((uint64_t)pd << 3) | ((uint64_t)(nc & 7) << 12) | ((uint64_t)(nc >> 3) << 15) |
-                        ((uint64_t)tables[i].op_ab << 24) | ((uint64_t)(nb & 7) << 29) | ((uint64_t)(nb >> 3) << 32) |
-                        ((uint64_t)(na & 7) << 39) | ((uint64_t)(na >> 3) << 42) | ((uint64_t)tables[i].op_c << 45));
-            return;
-        }
+    if (pd2 != 7 || bits(x, 16, 8) || x->w[1]) return (void)fail(l, uniform ? "UPLOP3 mode" : "PLOP3 mode");
+    if (uniform) {
+        if (l->up_swap) return (void)fail(l, "UPLOP3 with uniform predicates swapped");
+        a = (a & 8) | up(l, a & 7), b = (b & 8) | up(l, b & 7), c = (c & 8) | up(l, c & 7);
+        if (pd != 7) pd = up(l, pd);
+    } else if (bits(x, 67, 1)) {
+        c = (c & 8) | up(l, c & 7);
     }
-    (void)fail(l, "PLOP3 table");
+    if (pd == 7) return;
+    uint32_t in[3] = {a, b, c};
+    if (!plop3_psetp(l, pd, lut, in)) (void)fail(l, "PLOP3 table");
 }
+static void lower_plop3(L *l, const Insn *x) { lower_plop3_any(l, x, 0); }
 
 // SHFL (0x189): modes at 58-59 (idx, up, down, bfly); lane in Rb (0x589) or an immediate at 53-57; the
 // clamp/segment mask as an immediate at 40-52 or in Rc (0x989); predicate output 81-83.
@@ -2274,6 +2313,7 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
                  (up(l, bits(x, 84, 3)) << 20) | (up(l, bits(x, 87, 3)) << 23);
         return lower_isetp(l, &y);
     }
+    case 0x09c: return lower_plop3_any(l, x, 1);              // UPLOP3 (the guard above is already in l->pred)
     case 0x087: {                                             // USEL: the condition is a uniform predicate
         Insn y = *x;
         y.w[0] = (x->w[0] & 0xffffu) | (ur_dst(l, bits(x, 16, 8)) << 16) | (ur_in(l, bits(x, 24, 8), 5) << 24);
@@ -2587,7 +2627,7 @@ static void lower_imad_hi(L *l, const Insn *x) {
     emit(l, base(l, 0x5a00000000000000ull, rd, a.reg) | ((uint64_t)rb << 20) | ((uint64_t)rc << 39) | sign | ((uint64_t)1 << 54));
 }
 
-// IABS (0x013): max(x, -x), signed.
+// IABS (0x013): max(x, -x), signed; b a register, an immediate or a constant (to_reg).
 static void lower_iabs(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8);
     if (x->w[2] || bits(x, 24, 8)) return (void)fail(l, "IABS mode");
@@ -2793,7 +2833,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x98e: return lower_red(l, x);
     case 0x3a8: case 0x9a8: return lower_atomg(l, x, op);
     case 0x227: case 0x827: case 0xa27: return lower_imad_hi(l, x);
-    case 0x213: return lower_iabs(l, x);
+    case 0x213: case 0x813: case 0xa13: return lower_iabs(l, x);   // register, immediate, constant b
     case 0x803: return lower_p2r_r2p(l, x, 0);
     case 0x804: return lower_p2r_r2p(l, x, 1);
     case 0x81c: return lower_plop3(l, x);
