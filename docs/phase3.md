@@ -310,6 +310,15 @@ texel offsets, LEA with a negated addend, stores of wide zeros, IABS with consta
 Left on the route: a fragment shader's TEX with bit 60 clear (NAK's `.scr`; its operand layout is not known here) and
 an unknown opcode 0x19f in a compute kernel.
 
+Update (2026-11-07): on the 14,363-program census plus the 123 programs the shader cache keeps as `.fail.*`, the
+lowering refuses 35 with 600e8d4 and 10 now (offline, `sm86_lower --batch`; no game run; no program lowered before is
+refused). Added over the work above: a wide LDG with a uniform base keeps the base in its own destination (the skinning
+vertex shaders near R255); TEX with bit 60 clear (Ra the coordinates, Rb the rest); IPA 0x526; PLOP3 tables matched
+only on the rows an input of PT / !PT leaves free; F2IP.U8.F32 (0x243 with an Rd; FCHK has none); SURED (0x59f); and a
+retry of the uniform predicates the other way (swapped through a register, or mapped to free predicates) when the
+count that picks one fails. Left: six programs with one more opcode, three short of a uniform register pair, one
+control section the parser rejects.
+
 **Then the frame dump** (`--dump 900`, `build/logs/dump-361`): the level is a forward renderer. Pass 136 is a depth
 prepass (217 draws, colour masked: `chmask 0`) that covers the whole view; pass 168 is the colour pass (112 draws,
 depth EQUAL without a write) into the r11g11b10f HDR target, and its draws look right where they land (bark and
