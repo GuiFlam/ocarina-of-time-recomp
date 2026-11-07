@@ -15,8 +15,9 @@ OOT_SKIP_CS=1a62084a --shot ...`) most of the scene is flat black or white. A fr
 
 The missing part is drawn with mesh shaders, which are stubs:
 
-- `nvnCommandBufferDrawMeshTasksIndirect` is called thousands of times a run, `DrawMeshTasks` too (both in
-  `runtime/nvn_procs_stub.inc`; `nvn_procs.c` logs a stub's call count at powers of two from 1024).
+- `nvnCommandBufferDrawMeshTasksIndirect` is called thousands of times a run, `DrawMeshTasks` too. Both were stubs;
+  since 2026-11-07 they are recorded as `OP_DRAW_MESH` (`nvn_api_cmd.c`) and the replay counts them and notes them in
+  frame dumps (`vk_exec_draw.c op_draw_mesh`) without drawing them: about 54 a level frame.
 - The game's programs come in four stage sets by NVN2's stage byte (control +0x56; `nvn_api_obj.c prog_set_shaders`
   logs each set once): vertex + fragment (0 1), compute (5), mesh + fragment (7 1) and task + mesh + fragment
   (6 7 1).
