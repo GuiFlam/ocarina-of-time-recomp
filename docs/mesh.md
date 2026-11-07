@@ -58,17 +58,19 @@ ISBERD.ATTR and ISBEWR.TASK besides the ordinary instruction set.
 
 **Vertex outputs**: one 0x80-byte line per output component (32 vertices of 4 bytes; the address register is the
 vertex's byte offset in its line, so `vertex * 4` for the first 32, a working assumption the culling arithmetic of
-`03_s7` does not contradict), lines in output-map order: line k is the k-th enabled component of the program's
+`03_s7` does not contradict; confirmed for groups in `01_s7`, below), lines in output-map order: line k is the k-th enabled component of the program's
 output map. Checked on all 12: the map is the code header's (a Maxwell VTG shader program header, the 0x80 bytes
 before the first instruction) output map from byte 0x34: 0x34 system values A, **0x35 system values B (0xf0 =
 position xyzw, lines 0-3)**, then a nibble per generic vector from 0x36 (low nibble first). `03_s7`: position +
 vector 5 .xyz = 7 lines, lines 0-6 written. `01_s7`: position + vectors 0.x 1.x 3.xyz 4.xyz 5.x 6.xyz 7.xyz 10.xyz
-11.xyz = 25 lines, lines 0-24 written. Where the second group of 32 vertices starts (presumably after the first
-group's lines) is not confirmed yet.
+11.xyz = 25 lines, lines 0-24 written. Vertices come in groups of 32, each group's lines after the previous
+group's: `01_s7` computes its address register as `(v >> 5) * 0xc80 + (v & 31) * 4` (SHF by 5, IMAD by 0xc80 = 25
+lines x 0x80). So component line k of vertex v is at `(v >> 5) * lines * 0x80 + k * 0x80 + (v & 31) * 4`.
 
-**Primitive map**: the count at byte offset 3 (a MAP.32 write, which is odd at an unaligned offset: perhaps only its
-low byte lands, or the offset counts differently in that mode: open), then three U8 vertex indices per triangle from
-byte 4 (`[R4 + 4..6]`, `[R4 + 7..9]`: R4 = 3 x the primitive index, presumably).
+**Primitive map**: the primitive count is the value of the MAP.32 write at byte offset 3 (one lane writes it, under
+a guard; whether only its low byte lands there does not matter to an emulation, which takes the value). Triangle p's
+three U8 vertex indices are at bytes `4 + 3p` to `6 + 3p` (`03_s7`: `LEA R4 = (R4 << 1) + R4` = 3p, then
+`[R4 + 4..6]`).
 
 **Mesh control section** (compared over the 12; meanings are guesses until a probe confirms them):
 
