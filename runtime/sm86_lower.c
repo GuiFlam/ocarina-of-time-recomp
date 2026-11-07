@@ -300,6 +300,7 @@ static uint32_t up(L *l, uint32_t n) {
 
 static int uniform_op(uint32_t op);
 static uint32_t up_fields(const Insn *x);
+static uint32_t up_register(L *l);
 static int successors(const L *l, uint32_t i, uint32_t *out, uint32_t cap);
 static void scratch_at(L *l, uint32_t i);
 
@@ -677,6 +678,7 @@ static uint32_t up_fields(const Insn *x) {
         case 0x087: fields = 0x10; break;
         case 0x086: fields = 0x04; break;
         case 0x09c: fields = 0x1f; break;
+        case 0x083: m |= x->w[1] & 0x7f; break;                   // UP2UR: the uniform predicates in its mask
         default: break;
         }
     } else if (op == 0x81c && bits(x, 67, 1)) {
@@ -2359,6 +2361,29 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
         y.w[2] = (x->w[2] & ~(0x7u << 23) & ~(1u << 27)) | (up(l, bits(x, 87, 3)) << 23);
         return lower_sel(l, &y, 0);
     }
+    case 0x083: {   // UP2UR URd, UPR, URZ, mask (0x883): bit k of URd is UPk for k in the mask (Lichii lower_to_maxwell.h
+                    // names it; behaviour only)
+        uint32_t mask = x->w[1] & 0x7f, rdr = ur_dst(l, bits(x, 16, 8));
+        if (bits(x, 24, 8) != 63 || (x->w[1] & ~0x7fu)) return (void)fail(l, "UP2UR mode");
+        if (rdr == RZ) return;
+        if (l->up_swap) {                                     // the uniform predicates are bits of up_reg already
+            uint32_t u = up_register(l);
+            if (u != NOREG) lop_imm(l, rdr, u, mask, 0);
+            return;
+        }
+        uint32_t t = S(l, 0), acc = S(l, 1);
+        mov_imm(l, acc, 0);
+        for (uint32_t k = 0; k < 7; k++) {
+            if (!(mask >> k & 1)) continue;
+            uint32_t pk = up(l, k);
+            emit(l, base(l, 0x38e8000000000000ull, t, RZ) | ((uint64_t)(1u << pk) << 20));   // P2R t, PR, RZ, 1 << pk
+            if (pk > k) emit(l, base(l, 0x3828000000000000ull, t, t) | ((uint64_t)(pk - k) << 20));        // SHR
+            else if (pk < k) emit(l, base(l, 0x3848000000000000ull, t, t) | ((uint64_t)(k - pk) << 20));   // SHL
+            emit(l, base(l, 0x5be0000000000000ull, acc, acc) | ((uint64_t)t << 20) | ((uint64_t)0xfc << 28) |
+                        ((uint64_t)RZ << 39) | ((uint64_t)7 << 48));                                    // LOP3 acc | t
+        }
+        return mov_reg(l, rdr, acc);
+    }
     case 0x082:                                               // UMOV: register (0xc82, UR at 32-37) or immediate (0x882)
         if (bits(x, 16, 8) == 63 || !ur_has_reg(l, bits(x, 16, 8))) return;   // URZ, or every use forwards
         if (op == 0x882) return mov_imm(l, ur(l, bits(x, 16, 8)), x->w[1]);
@@ -2726,15 +2751,47 @@ static void lower_bra(L *l, const Insn *x) {
     emit(l, 0xe24000000000000full | p);
 }
 
+// Task (6) and mesh (7) programs end in one epilogue the translator expands (docs/mesh.md): their outputs are copied
+// to the stage's outputs there, once per workgroup, so an EXIT becomes a branch to it (the end of the program, where
+// the marker is emitted before the final EXIT).
+static int mesh_stage(const L *l) { return l->stage == 6 || l->stage == 7; }
+
 static void lower_exit(L *l, const Insn *x) {
     uint32_t pc = bits(x, 87, 4);
     if (bits(x, 84, 2)) return (void)fail(l, "EXIT mode");
+    if (mesh_stage(l)) {
+        if (pc != 7) {   // @Pg EXIT Pc: both must hold, as in lower_bra
+            if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
+            reloc(l, l->n);
+            emit(l, 0xe24000000000000full | ((uint64_t)pc << 16));
+            return;
+        }
+        reloc(l, l->n);
+        emit(l, 0xe24000000000000full | l->pred);
+        return;
+    }
     if (pc != 7) {
         if (bits(x, 12, 4) != 7) { reloc(l, l->index + 1); emit(l, 0xe24000000000000full | ((uint64_t)(bits(x, 12, 4) ^ 8) << 16)); }
         emit(l, 0xe30000000000000full | ((uint64_t)pc << 16));
         return;
     }
     emit(l, 0xe30000000000000full | l->pred);
+}
+
+// ISBERD (0x923) / ISBEWR (0x927): the stage buffer of task and mesh programs (docs/mesh.md), passed to the
+// translator as one pseudo instruction (sm86_lower.h SM86_ISBE_*) that keeps every field: what a space means depends
+// on the stage (a TASK read at 0 is the mesh workgroup index, a TASK write at 4 the mesh count, ...), which only the
+// translator's expansion knows. ISBERD: Rd 16-23; ISBEWR: the data register in w1 & 0xff; both: the address register
+// 24-31, the byte offset w1 >> 8, the space 75-78.
+static void lower_isbe(L *l, const Insn *x, int write) {
+    uint32_t reg = write ? (x->w[1] & 0xff) : bits(x, 16, 8), ra = bits(x, 24, 8), offset = x->w[1] >> 8;
+    uint32_t space = bits(x, 75, 4);
+    if (!mesh_stage(l)) return (void)fail(l, "ISBE outside a task or mesh program");
+    if (space != 0xf && space != 7 && space != 1 && space != 0) return (void)fail(l, "ISBE space");
+    if (!write && (space == 1 || space == 0)) return (void)fail(l, "ISBERD from the primitive map");
+    if (write ? bits(x, 16, 8) != 0 : (x->w[1] & 0xff) != 0) return (void)fail(l, "ISBE mode");
+    emit(l, SM86_ISBE_OP | l->pred | (uint64_t)reg | ((uint64_t)ra << 8) | ((uint64_t)(offset & 0xffffff) << 20) |
+                ((uint64_t)space << 44) | ((uint64_t)write << 48));
 }
 
 // CALL.REL.NOINC pushes no return address: the compiler uses it predicated to skip the next instruction (a
@@ -2869,6 +2926,8 @@ static void lower_one_inner(L *l, const Insn *x) {
     switch (op) {
     case 0x947: return lower_bra(l, x);
     case 0x94d: return lower_exit(l, x);
+    case 0x923: return lower_isbe(l, x, 0);
+    case 0x927: return lower_isbe(l, x, 1);
     case 0x918: case 0x91a: case 0x945: case 0x941: case 0x942: case 0x948: return;   // NOP, DEPBAR, BSSY, BSYNC, BREAK, WARPSYNC
     case 0x95b:
         if (x->w[1] || x->w[2] != 0x03800000u) return (void)fail(l, "KILL mode");
@@ -3007,6 +3066,7 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         }
     }
     l.first_out[l.n] = l.nout;
+    if (!l.failed && mesh_stage(&l)) emit(&l, SM86_MESH_EPILOGUE);   // task and mesh EXITs branch here (lower_exit)
     if (!l.failed) emit(&l, 0xe30000000007000full);          // a branch past the end lands on an EXIT
     // Relocations.
     for (uint32_t i = 0; i < l.nreloc && !l.failed; i++) {

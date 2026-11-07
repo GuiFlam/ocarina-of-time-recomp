@@ -25,6 +25,11 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
   `NX2_NOTES.md` row 89.
 - First version: monolithic mesh pipelines (no graphics pipeline library), task and mesh shaders kept out of the
   pipeline-key prewarm until they work.
+- B2 (2026-11-07): ISBERD/ISBEWR pass through the lowering as one pseudo instruction, `SM86_ISBE_OP` (top byte 0x6c,
+  every field kept: register, address register, offset, space, read or write; `runtime/sm86_lower.h`), and every EXIT
+  branches to `SM86_MESH_EPILOGUE` (0x6d). Not shared-memory ops: what a space means depends on the stage (a TASK
+  read at 0 is the mesh workgroup index, a TASK write at 4 the mesh count, an ATTR read at 0 the workgroup index), and
+  only the translator's expansion (C1-C3) knows the stage and the output variables.
 
 ## Tasks
 
@@ -43,9 +48,9 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
 
 | ID | Task | Depends | Status | Done when |
 |---|---|---|---|---|
-| B1 | Accept task (6) and mesh (7) stages in `runtime/sm86_lower.c`: header handling as for graphics stages, the stage in `SM86` control parsing, and in `tools/sm86_lower_main.c`. | A4 | todo | The 12 captures get past the start of the program (they fail at the first ISBE instruction, not on the stage). |
-| B2 | Lower ISBERD/ISBEWR. Choose one: (a) a pseudo instruction the translator decodes (a reserved Maxwell encoding carrying the fields), or (b) shared-memory loads and stores into an emulated stage buffer at a fixed shared-memory base. Record the choice and why under "Decisions taken". | A2, A3 | todo | All captured task and mesh programs lower (the sweep script in the 2026-11-06 session: `sm86_lower` over every `build/logs/mesh/*_s[67]`). |
-| B3 | Route every EXIT of a task or mesh program to one epilogue marker the translator expands (EmitMeshTasks for task, SetMeshOutputs plus the output copy for mesh). | B2 | todo | The lowered programs end in the marker on every path; `tools/kernel.py lower` output checked on two captures. |
+| B1 | Accept task (6) and mesh (7) stages in `runtime/sm86_lower.c`: header handling as for graphics stages, the stage in `SM86` control parsing, and in `tools/sm86_lower_main.c`. | A4 | done (2026-11-07): nothing to change, `sm86_control_parse` takes stages up to 7 with the graphics header | The 12 captures get past the start of the program (they fail at the first ISBE instruction, not on the stage). |
+| B2 | Lower ISBERD/ISBEWR. Choose one: (a) a pseudo instruction the translator decodes (a reserved Maxwell encoding carrying the fields), or (b) shared-memory loads and stores into an emulated stage buffer at a fixed shared-memory base. Record the choice and why under "Decisions taken". | A2, A3 | done (2026-11-07), choice (a): 34 of the 36 captured stages lower; 2 fail on register pressure ("no register pair dead over a uniform pair's span", `mesh-task/10_s7`, `11_s7`) | All captured task and mesh programs lower (the sweep script in the 2026-11-06 session: `sm86_lower` over every `build/logs/mesh/*_s[67]`). |
+| B3 | Route every EXIT of a task or mesh program to one epilogue marker the translator expands (EmitMeshTasks for task, SetMeshOutputs plus the output copy for mesh). | B2 | done (2026-11-07): every EXIT of a task or mesh stage branches to `SM86_MESH_EPILOGUE` before the final EXIT | The lowered programs end in the marker on every path; `tools/kernel.py lower` output checked on two captures. |
 | B4 | Store task and mesh inputs in the shader cache like the other stages (`.in` files, `tools/kernel.py` list/stats/lower for them), so later work is offline. | B1 | todo | `tools/kernel.py list` shows task and mesh programs from a game run. |
 
 ### Phase C: translator (patches in `tools/xlate/patches`, made with `tools/xlate_patch.py`)
@@ -100,3 +105,7 @@ Baseline to compare with: `build/logs/level-lower2.png` (run 359) and `build/log
 - 2026-11-07: A4 done, so phase A is: +0x50 is the workgroup's local memory (32 x per-thread), the top byte of
   +0x58 the task payload (1 KiB per 4), +0x60 presumably the vertex and primitive maxima. Next: B1 (accept stages 6
   and 7 in the lowering) and D1 (enable VK_EXT_mesh_shader), which do not depend on each other.
+- 2026-11-07: D1, B1, B2, B3 done. The lowering emits the two pseudo instructions; UP2UR (uniform 0x883, the uniform
+  predicates as bits) is lowered too, which five mesh stages of task pipelines use. No regression over the stored
+  inputs (530) and the refused programs that lowered before (608). KEY_VERSION 17. Next: B4 (stored inputs of task
+  and mesh programs) needs the stages translated on demand, so C1 comes first.
