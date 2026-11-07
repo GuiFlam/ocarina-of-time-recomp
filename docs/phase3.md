@@ -296,6 +296,23 @@ Open, in order:
   quick route (`tools/run.py --replay build/logs/a-spam.txt --skip-movies`) reaches the level in about 75 s.
   The game has no button to skip the opening (the user).
 
+## Status (2026-11-06, evening): the level's programs lower, the scene is still black
+
+Worked offline: the cache keeps every refused program as `<key>.fail.ctl` / `.fail.code`, and lowering those (and the
+stored inputs `in/*.in`, to catch regressions) with `build/tools/sm86_lower` takes seconds, against minutes per game
+run. Of the 64 translation keys the level route refused (28 distinct programs), 62 lower now (commits 73ea4d7,
+913bbfb): IMAD.WIDE and uniform-base loads with less scratch (the six vertex shaders near R255), PLOP3 and UPLOP3
+over any PSETP-computable table (and a fix: the outer PSETP slot held the wrong input), RED and ATOMG on odd uniform
+pairs, PLOP3 against swapped uniform predicates through registers, indexed IPA, FCHK (always the fast path), TLD with
+texel offsets, LEA with a negated addend, stores of wide zeros, IABS with constant operands. The water renders now
+(`build/logs/level-lower2.png`, run 359); the rest of the geometry is still flat black or white.
+
+Left on the route: a fragment shader's TEX with bit 60 clear (NAK's `.scr`; its operand layout is not known here) and
+an unknown opcode 0x19f in a compute kernel. With almost every program lowering, the black materials are not missing
+shaders any more: next, a frame dump of the level to see whether the G-buffer or the lighting comes out at 0 and 1
+(a lowered instruction computing wrongly would look like this), and why only 14 pool texture ids are ever sampled
+(`docs/bindless.md`).
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
