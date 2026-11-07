@@ -73,29 +73,20 @@ a guard; whether only its low byte lands there does not matter to an emulation, 
 three U8 vertex indices are at bytes `4 + 3p` to `6 + 3p` (`03_s7`: `LEA R4 = (R4 << 1) + R4` = 3p, then
 `[R4 + 4..6]`).
 
-**Mesh control section** (compared over the 12; meanings are guesses until a probe confirms them):
+**Task and mesh control sections** (compared over the 24 captured stages, 12 stand-alone mesh, 12 task + mesh;
+"checked" means it agrees with the code of every capture):
 
-| offset | values | likely |
+| offset | values | meaning |
 |---|---|---|
-| +0x38, +0x40, +0x44 | code end and size | as for the other stages |
-| +0x4c | 0x28-0xff | registers used |
-| +0x50 | 0, 0x200, 0x1a00 | shared memory bytes |
-| +0x58 | 0x00800020 in all | 32 threads per workgroup (low half); 0x80 (high half) unknown |
-| +0x5c | 0x03000000 in all | output topology: triangles |
-| +0x60 | 0x00400080 or 0x00400060 | maximum vertices 128 or 96 (low half), maximum primitives 64 (high half) |
-| +0xe0-+0xf0 | non-zero in the three large programs | unknown (local memory?) |
-
-**The draw calls** (`OOT_STUB_LOG=60` logs a stub's first 60 calls with x0-x5, and for `*Indirect` the 16 bytes at
-x1; run of 2026-11-07):
-
-- `nvnCommandBufferDrawMeshTasks(cmd, first, count)`: x1 is 0 and x2 12 or 1 in every call; x3-x5 vary by caller
-  (left over). Fewer than 1024 calls in the run, from two call sites (`main+0x273690`, `main+0x273d20`).
-- `nvnCommandBufferDrawMeshTasksIndirect(cmd, address)`: x1 a GPU address; successive calls of one site step it by
-  0x10 (records of 16 bytes), and the bytes there are zero when the CPU calls: the culling kernels write them on the
-  GPU. At least 8192 calls in the run, from about ten call sites. x2 is 0 or 1 or garbage; x3 and x4 look like the
-  enclosing buffer's address and size (x1 falls inside), probably left over too. The record's layout (presumably
-  workgroup counts x, y, z, 16-byte aligned) is to be read from GPU-written memory when the replay draws them (D3).
-- The Multi*/3D variants were not called in the runs so far.
+| +0x38, +0x40, +0x44 | | code end and size, as for the other stages |
+| +0x4c | 0x28-0xff | registers used (guess) |
+| +0x50 | 0, 0x200, 0x800, 0x1a00 | **local memory of the 32-thread workgroup**, checked: non-zero exactly in the programs with LDL/STL, and 32 x (their highest offset + its width): 32 x 0xd0 = 0x1a00, 32 x 0x40 = 0x800, 32 x 0x10 = 0x200 |
+| +0x58 bits 0-15 | 0x20 in all | threads per workgroup (32; guess, the vertex groups are 32 wide) |
+| +0x58 bits 16-23 | 0x80 in all | unknown |
+| +0x58 bits 24-31 | 0x00 (stand-alone mesh), 0x04, 0x0c (task pipelines; the same in a pipeline's task and mesh stage) | **the task payload size, 1 KiB per 4** (0x04: the task writes up to 0x1c; 0x0c: up to 0x81c), from two values |
+| +0x5c | 0x03000000 in all | output topology: triangles (guess) |
+| +0x60 | mesh stages 0x00400080, 0x00400060, 0x00200060, 0x00600060; task stages 0 | maximum vertices (bits 0-15: 128 or 96) and primitives (bits 16-31: 32, 64 or 96), guess: zero exactly in task stages |
+| +0xe0-+0xf0 | non-zero in the three largest stand-alone mesh programs | unknown |
 
 ## Layout, from Lichii's notes (GPL-3.0: behaviour only, write our own code)
 
