@@ -78,4 +78,6 @@ target GPUs (RTX 4070, RX 9070), so the native way is the recommendation.
 
 ## Status
 
+The task list with its status is `docs/mesh-tracker.md`.
+
 - 2026-11-06: findings above; diagnostics `OOT_MESH_DUMP`, the stub call counts and the stage-set log in place.
