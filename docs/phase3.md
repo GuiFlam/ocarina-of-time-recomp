@@ -321,7 +321,8 @@ once each by `nvn_api_obj.c prog_set_shaders`): vertex + fragment (0 1), compute
 **6 + 7 + fragment**: mesh (7) and task (6) programs. So the next piece is the mesh stages, not more of the lowering.
 Neither the translator (Ryujinx 1.3.2 has no mesh or task stage) nor the replay supports them today; the two ways are
 VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the translator) or running task and mesh
-programs as compute that write vertex and index buffers drawn with a pass-through vertex shader.
+programs as compute that write vertex and index buffers drawn with a pass-through vertex shader. `docs/mesh.md` is the
+hand-off for it.
 
 ## Where the port stands
 

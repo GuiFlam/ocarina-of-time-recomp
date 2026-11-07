@@ -21,6 +21,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "platform/platform.h"
 #include "nvn_tex.h"
 
 // ---------- Descriptor pools
@@ -538,6 +539,24 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
             rt_log("nvn: a program with %d stages, NVN2 stage numbers%s", n, buf);
         }
         ReleaseSRWLockExclusive(&lk);
+        // OOT_MESH_DUMP=<dir> (diagnostic): the control block (0x400 bytes) and code of every stage of the first 12
+        // programs with a task (6) or mesh (7) stage, as <k>_s<stage>.ctl / .code, for tools/sm86_dis.py.
+        static volatile LONG dumped;
+        const char *dir = cfg_get("OOT_MESH_DUMP");
+        int mesh = 0;
+        for (int i = 0; i < n; i++) mesh |= sd[i].control && (((const uint8_t *)sd[i].control)[0x56] & 0xe) == 6;
+        LONG k = mesh && dir && *dir ? InterlockedIncrement(&dumped) : 0;
+        for (int i = 0; k && k <= 12 && i < n; i++) {
+            const uint8_t *ctl = sd[i].control;
+            if (!ctl || !sd[i].data) continue;
+            uint32_t len;
+            memcpy(&len, ctl + 0x44, 4);
+            char path[600];
+            snprintf(path, sizeof path, "%s\\%02ld_s%u.ctl", dir, (long)k, ctl[0x56]);
+            plat_file_write(path, ctl, 0x400);
+            snprintf(path, sizeof path, "%s\\%02ld_s%u.code", dir, (long)k, ctl[0x56]);
+            if (len < (16u << 20)) plat_file_write(path, (const void *)(uintptr_t)sd[i].data, len);
+        }
     }
     if (getenv("OOT_PROG_DUMP")) {   // DIAG: the memory around a compute program's control section (NVN2 bank 0 layout)
         static volatile LONG shown;
