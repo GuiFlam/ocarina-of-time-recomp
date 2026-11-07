@@ -521,6 +521,24 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     prog_release(o);
     o->nstage = (uint32_t)n;
     if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
+    {   // Each distinct combination of the stages' control byte +0x56 (NVN2 stage numbers) is logged once, to see
+        // which stage kinds the game's programs carry (the level draws with mesh tasks, 2026-11-06).
+        static uint32_t seen[64];
+        static int nseen;
+        static SRWLOCK lk = SRWLOCK_INIT;
+        uint32_t key = (uint32_t)n;
+        for (int i = 0; i < n && i < 6; i++) key |= (uint32_t)(sd[i].control ? ((const uint8_t *)sd[i].control)[0x56] & 0xf : 0xf) << (4 + 4 * i);
+        AcquireSRWLockExclusive(&lk);
+        int found = 0;
+        for (int i = 0; i < nseen; i++) found |= seen[i] == key;
+        if (!found && nseen < 64) {
+            seen[nseen++] = key;
+            char buf[64] = {0};
+            for (int i = 0; i < n && i < 6; i++) snprintf(buf + strlen(buf), sizeof buf - strlen(buf), " %u", key >> (4 + 4 * i) & 0xf);
+            rt_log("nvn: a program with %d stages, NVN2 stage numbers%s", n, buf);
+        }
+        ReleaseSRWLockExclusive(&lk);
+    }
     if (getenv("OOT_PROG_DUMP")) {   // DIAG: the memory around a compute program's control section (NVN2 bank 0 layout)
         static volatile LONG shown;
         for (int i = 0; i < n; i++) {

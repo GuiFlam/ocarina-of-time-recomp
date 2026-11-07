@@ -308,10 +308,20 @@ texel offsets, LEA with a negated addend, stores of wide zeros, IABS with consta
 (`build/logs/level-lower2.png`, run 359); the rest of the geometry is still flat black or white.
 
 Left on the route: a fragment shader's TEX with bit 60 clear (NAK's `.scr`; its operand layout is not known here) and
-an unknown opcode 0x19f in a compute kernel. With almost every program lowering, the black materials are not missing
-shaders any more: next, a frame dump of the level to see whether the G-buffer or the lighting comes out at 0 and 1
-(a lowered instruction computing wrongly would look like this), and why only 14 pool texture ids are ever sampled
-(`docs/bindless.md`).
+an unknown opcode 0x19f in a compute kernel.
+
+**Then the frame dump** (`--dump 900`, `build/logs/dump-361`): the level is a forward renderer. Pass 136 is a depth
+prepass (217 draws, colour masked: `chmask 0`) that covers the whole view; pass 168 is the colour pass (112 draws,
+depth EQUAL without a write) into the r11g11b10f HDR target, and its draws look right where they land (bark and
+moss textured, `pass_0168_t0_..._tm.png`), but most of the scene, the ground among it, is missing there. Relaxing
+EQUAL to LEQUAL changed nothing visible, so it is not depth invariance. The missing geometry is drawn with **mesh
+shaders**: the run calls `nvnCommandBufferDrawMeshTasksIndirect` thousands of times (a stub; `nvn_procs.c` now logs a
+stub's call count at powers of two) and the game's programs come in four stage sets by control byte +0x56 (now logged
+once each by `nvn_api_obj.c prog_set_shaders`): vertex + fragment (0 1), compute (5), and **7 + fragment** and
+**6 + 7 + fragment**: mesh (7) and task (6) programs. So the next piece is the mesh stages, not more of the lowering.
+Neither the translator (Ryujinx 1.3.2 has no mesh or task stage) nor the replay supports them today; the two ways are
+VK_EXT_mesh_shader (the 4070 and RX 9070 have it; a mesh execution model in the translator) or running task and mesh
+programs as compute that write vertex and index buffers drawn with a pass-through vertex shader.
 
 ## Where the port stands
 

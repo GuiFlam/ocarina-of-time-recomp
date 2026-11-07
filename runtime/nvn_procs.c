@@ -31,12 +31,14 @@
 void nvnp_nvnDeviceGetProcAddress(Cpu *c);
 
 // NVN2 names the game loads that have no implementation (nvn_procs_stub.inc): a stub logs its first three calls with
-// the caller and the first arguments and returns 0, so the game runs on and the log shows which procs it uses.
+// the caller and the first arguments, and its call count at every power of two from 1024, and returns 0, so the game
+// runs on and the log shows which procs it uses and how often.
 #define NVN_STUB(n)                                                                                                  \
     static void nvnp_stub_##n(Cpu *c) {                                                                               \
         static volatile LONG seen;                                                                                   \
         LONG k = InterlockedIncrement(&seen);                                                                         \
         char at[128];                                                                                                \
+        if (k >= 1024 && !(k & (k - 1))) rt_log("nvn2 stub " #n ": %ld calls", (long)k);                              \
         if (k <= 3) rt_log("nvn2 stub " #n " from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx (returns 0)",                \
                            ldr_describe(c->x[30] - 4, at, sizeof at), (unsigned long long)c->x[0],                      \
                            (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);      \
