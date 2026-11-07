@@ -84,6 +84,18 @@ three U8 vertex indices are at bytes `4 + 3p` to `6 + 3p` (`03_s7`: `LEA R4 = (R
 | +0x60 | 0x00400080 or 0x00400060 | maximum vertices 128 or 96 (low half), maximum primitives 64 (high half) |
 | +0xe0-+0xf0 | non-zero in the three large programs | unknown (local memory?) |
 
+**The draw calls** (`OOT_STUB_LOG=60` logs a stub's first 60 calls with x0-x5, and for `*Indirect` the 16 bytes at
+x1; run of 2026-11-07):
+
+- `nvnCommandBufferDrawMeshTasks(cmd, first, count)`: x1 is 0 and x2 12 or 1 in every call; x3-x5 vary by caller
+  (left over). Fewer than 1024 calls in the run, from two call sites (`main+0x273690`, `main+0x273d20`).
+- `nvnCommandBufferDrawMeshTasksIndirect(cmd, address)`: x1 a GPU address; successive calls of one site step it by
+  0x10 (records of 16 bytes), and the bytes there are zero when the CPU calls: the culling kernels write them on the
+  GPU. At least 8192 calls in the run, from about ten call sites. x2 is 0 or 1 or garbage; x3 and x4 look like the
+  enclosing buffer's address and size (x1 falls inside), probably left over too. The record's layout (presumably
+  workgroup counts x, y, z, 16-byte aligned) is to be read from GPU-written memory when the replay draws them (D3).
+- The Multi*/3D variants were not called in the runs so far.
+
 ## Layout, from Lichii's notes (GPL-3.0: behaviour only, write our own code)
 
 `/mnt/c/dev/Lichii/NX2_NOTES.md`, row 89 (the same scheme in another Switch 2 title):
