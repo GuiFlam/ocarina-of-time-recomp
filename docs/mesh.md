@@ -34,6 +34,54 @@ the instruction set the vertex, fragment and compute programs already use:
 
 All 12 stop in `sm86_lower` at the first ISBERD/ISBEWR ("opcode"). Bank 4 constants appear too (`c[4][0x5c]`).
 
+## Decoded from our captures (2026-11-07)
+
+`tools/sm86_dis.py` prints both ops by these fields (12 mesh stages, `build/logs/mesh`).
+
+**ISBERD** (0x923): `Rd` at 16-23, address register at 24-31, byte offset `w1 >> 8`, the space in bits 75-78 as for
+ISBEWR below. Task programs and stand-alone mesh programs read their workgroup index with `ISBERD.ATTR Rd, [RZ + 0]`
+once at the start; the mesh programs of task pipelines read `ISBERD.TASK [RZ + 0]` and the payload the task wrote
+(`[RZ + 0x10]`, `[RZ + 0x14]`, `[Rn + 0x18]`, `[Rn + 0x418]`, `[Rn + 0x818]`).
+
+**ISBEWR** (0x927): address register at 24-31; word 1 holds the data register in bits 0-7 and the byte offset above
+them (`w1 >> 8`); bits 75-78 select what is written; bit 79 is set in every capture.
+
+| bits 75-78 | written | count in the captures | example |
+|---|---|---|---|
+| 0xf | a vertex output component (attribute space) | 716 | `ISBEWR.ATTR [R7 + 0x280], R6` |
+| 0x1 | a 32-bit value into the primitive map | 12 (one per program) | `@!P4 ISBEWR.MAP.32 [RZ + 0x3], R11`: the primitive count |
+| 0x0 | a byte into the primitive map | 72 | `ISBEWR.MAP.U8 [R4 + 0x4..0x6], R3 R21 R7`: one triangle's vertex indices |
+| 0x7 | the task's output (task programs only) | 76 over 12 task stages | `ISBEWR.TASK [RZ + 0x4], R0` before the last EXIT: the mesh workgroup count; `[RZ + 0x10]`, `[RZ + 0x14]` and arrays `[R16 + 0x18 / 0x418 / 0x818]` (0x400 apart): the payload |
+
+Task programs (12 captured in `build/logs/mesh-task`, `OOT_MESH_DUMP_STAGE=6`; 650-1280 instructions) use only
+ISBERD.ATTR and ISBEWR.TASK besides the ordinary instruction set.
+
+**Vertex outputs**: one 0x80-byte line per output component (32 vertices of 4 bytes; the address register is the
+vertex's byte offset in its line, so `vertex * 4` for the first 32, a working assumption the culling arithmetic of
+`03_s7` does not contradict), lines in output-map order: line k is the k-th enabled component of the program's
+output map. Checked on all 12: the map is the code header's (a Maxwell VTG shader program header, the 0x80 bytes
+before the first instruction) output map from byte 0x34: 0x34 system values A, **0x35 system values B (0xf0 =
+position xyzw, lines 0-3)**, then a nibble per generic vector from 0x36 (low nibble first). `03_s7`: position +
+vector 5 .xyz = 7 lines, lines 0-6 written. `01_s7`: position + vectors 0.x 1.x 3.xyz 4.xyz 5.x 6.xyz 7.xyz 10.xyz
+11.xyz = 25 lines, lines 0-24 written. Where the second group of 32 vertices starts (presumably after the first
+group's lines) is not confirmed yet.
+
+**Primitive map**: the count at byte offset 3 (a MAP.32 write, which is odd at an unaligned offset: perhaps only its
+low byte lands, or the offset counts differently in that mode: open), then three U8 vertex indices per triangle from
+byte 4 (`[R4 + 4..6]`, `[R4 + 7..9]`: R4 = 3 x the primitive index, presumably).
+
+**Mesh control section** (compared over the 12; meanings are guesses until a probe confirms them):
+
+| offset | values | likely |
+|---|---|---|
+| +0x38, +0x40, +0x44 | code end and size | as for the other stages |
+| +0x4c | 0x28-0xff | registers used |
+| +0x50 | 0, 0x200, 0x1a00 | shared memory bytes |
+| +0x58 | 0x00800020 in all | 32 threads per workgroup (low half); 0x80 (high half) unknown |
+| +0x5c | 0x03000000 in all | output topology: triangles |
+| +0x60 | 0x00400080 or 0x00400060 | maximum vertices 128 or 96 (low half), maximum primitives 64 (high half) |
+| +0xe0-+0xf0 | non-zero in the three large programs | unknown (local memory?) |
+
 ## Layout, from Lichii's notes (GPL-3.0: behaviour only, write our own code)
 
 `/mnt/c/dev/Lichii/NX2_NOTES.md`, row 89 (the same scheme in another Switch 2 title):

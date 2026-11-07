@@ -541,11 +541,35 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
         ReleaseSRWLockExclusive(&lk);
         // OOT_MESH_DUMP=<dir> (diagnostic): the control block (0x400 bytes) and code of every stage of the first 12
         // programs with a task (6) or mesh (7) stage, as <k>_s<stage>.ctl / .code, for tools/sm86_dis.py.
+        // OOT_MESH_DUMP_STAGE=<n>: only programs with stage n (6: task programs). A program whose stages' code is
+        // the same as one dumped before (the first 16 bytes after the header and the length) is not dumped again.
         static volatile LONG dumped;
-        const char *dir = cfg_get("OOT_MESH_DUMP");
-        int mesh = 0;
-        for (int i = 0; i < n; i++) mesh |= sd[i].control && (((const uint8_t *)sd[i].control)[0x56] & 0xe) == 6;
-        LONG k = mesh && dir && *dir ? InterlockedIncrement(&dumped) : 0;
+        static uint64_t done_sig[64];
+        static int ndone;
+        const char *dir = cfg_get("OOT_MESH_DUMP"), *want = cfg_get("OOT_MESH_DUMP_STAGE");
+        int mesh = 0, wanted = !(want && *want);
+        uint64_t sig = 0xcbf29ce484222325ull;
+        for (int i = 0; i < n; i++) {
+            const uint8_t *ctl = sd[i].control;
+            if (!ctl) continue;
+            mesh |= (ctl[0x56] & 0xe) == 6;
+            if (want && *want && ctl[0x56] == (uint8_t)atoi(want)) wanted = 1;
+            uint32_t len;
+            memcpy(&len, ctl + 0x44, 4);
+            sig = (sig ^ len) * 0x100000001b3ull;
+            if (sd[i].data && len >= 0x90) {
+                uint64_t w;
+                memcpy(&w, (const uint8_t *)(uintptr_t)sd[i].data + 0x80, 8);
+                sig = (sig ^ w) * 0x100000001b3ull;
+            }
+        }
+        if (mesh && wanted && dir && *dir) {
+            AcquireSRWLockExclusive(&lk);
+            for (int i = 0; i < ndone; i++) wanted &= done_sig[i] != sig;
+            if (wanted && ndone < 64) done_sig[ndone++] = sig;
+            ReleaseSRWLockExclusive(&lk);
+        }
+        LONG k = mesh && wanted && dir && *dir ? InterlockedIncrement(&dumped) : 0;
         for (int i = 0; k && k <= 12 && i < n; i++) {
             const uint8_t *ctl = sd[i].control;
             if (!ctl || !sd[i].data) continue;
